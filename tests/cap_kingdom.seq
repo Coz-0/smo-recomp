@@ -1,0 +1,59 @@
+# A scripted Cap Kingdom run from an empty save to Mario's first capture (tests/run_cap_kingdom.py runs it and checks it).
+# SMO_SEQ steps (runtime/nnhid.c), one per line; '#' starts a comment. The run waits on the game's own states (nerves,
+# runtime/smo_nerve.c) and steers to world points with the game's camera (@goto), so it does not depend on the frame
+# rate or on loading times. Points are positions measured in earlier runs (Cappy's path, boot144-146) or the stage's
+# route guide (the arrows the game shows); no game data is kept here.
+
+# New game: mode select, then skip the prologue through the game's own menu (Plus twice, then Skip)
+@nerve:SceneStateSelectModeNrvWait 30:Z
+@nerve:DemoSceneNrvPlay 200:! 60:!
+@nerve:DemoSceneStateSkipDemoNrvSkipConfirm 40:Z
+
+# Cap Kingdom opening: the camera tutorial ends when the camera looks more than 60 degrees away from straight down
+# (OpeningStageStartDemo::exeCameraTutorial): right stick up; then any UI decide button stands Mario up
+@nerve:OpeningStageStartDemoNrvCameraTutorial 200:8/320
+@nerve:OpeningStageStartDemoNrvWaitStandUp 60:Z
+@nerve:StageSceneNrvPlay
+
+# Chase Cappy over his three runs (his path, logged with SMO_ACTORPOS); the last step ends when his talk begins
+@goto:-2155,24372,150
+@goto:-1726,23707,150 @goto:-777,23590,150 @goto:79,23185,150 @goto:658,22309,150 @goto:1271,21460,150
+@goto:2135,20835,150 @goto:2812,20018,150 @goto:3124,19004,150 @goto:3102,17960,150 @goto:2634,17270,150
+@goto:2536,17173,150
+@goto:1694,16875,150 @goto:1175,15970,150 @goto:708,15076,150 @goto:-159,14546,150 @goto:-876,13828,150
+@goto:-1622,13121,150
+
+# Cappy's talk on the bridge (A advances it) and his turning into Mario's cap; then the cap-throw tutorial: Y twice
+@until-nerve:StageSceneNrvPlay:Z/30
+@nerve:InformationWindowCapMsgRequesterNrvAppearCapMsgCapThrow 60:V 120:V 120
+
+# Through Bonneton along the route guide; the stuck rule jumps up the stairs
+@goto:-1273,13435,150/600 @goto:-2100,12600,150/600 @goto:-2970,11738,150/600 @goto:-2934,11420,150/600
+@goto:-3076,10713,150/600 @goto:-3748,10536,150/600 @goto:-4066,10642,150/600 @goto:-4702,10147,150/600
+@goto:-5515,9899,150/600 @goto:-5551,8803,150/600 @goto:-6116,7955,150/600 @goto:-6046,7106,150/600
+@goto:-5657,6718,150/600 @goto:-5233,6293,150/600 @goto:-4879,5940,150/600 @goto:-4738,5303,150/600
+@goto:-4313,5728,150/600 @goto:-3995,5409,150/600 @goto:-3889,4879,150/600
+
+# The cap switch makes the path down to the tower rise (a short cutscene); wait until play resumes
+@goto:-3041,4031,260/600 10:V
+@nerve:CapSwitchNrvOnWait 30
+
+# Down to the foot of Top-Hat Tower (mini Goombas on the way)
+@goto:-2828,3818,150/600 @goto:-2546,3536,150/600 @goto:-2298,3288,150/600 @goto:-2051,3041,150/600
+@goto:-1803,2793,150/600 @goto:-1584,2574,150/600 @goto:-1344,2333,150/600 @goto:-1127,2117,150/600
+@goto:-880,1870,150/600 @goto:-672,1662,150/600 @goto:-389,1379,150/600 @goto:-141,1131,150/600
+@goto:141,849,150/600 @goto:460,530,150/600 @goto:831,159,150/600 @goto:1237,-247,150/600
+@goto:3783,-2793,150/600 @goto:3924,-2934,150/600 @goto:4172,-3182,150/600 @goto:4313,-3323,150/600
+
+# The tower door opens when the cap hits it (DoorAreaChange::receiveMsg); walking through starts the tower stage
+4:V
+@nerve:DoorAreaChangeNrvOpenWait 20
+@goto:4631,-3641,80/900
+@at:-500,0,13950,800
+@nerve:PlayerActorHakoniwaNrvWait 30
+
+# Inside Top-Hat Tower: to the frogs, then capture the nearest one with the cap
+@goto:-500,13800,150/600 @goto:-500,10550,150/600 @goto:250,10550,150/600 @goto:250,9150,150/600
+@near:FrogNrv,250/900 4:V
+@nerve:PlayerActorHakoniwaNrvHack
+300:Z 120:Z 600

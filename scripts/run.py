@@ -1,12 +1,17 @@
 """Run the built game for a while and summarise what happened.
 
-    python tools/run.py <name> [--seconds 30] [--exe smo_test.exe] [--env NAME=VALUE ...] [--full]
+    python scripts/run.py <name> [--seconds 30] [--exe smo_test.exe] [--env NAME=VALUE ...] [--full]
+                          [--seq <file.seq>] [--userdata <folder>]
 
 Copies build/bin/smo_native.exe (+ its .map) to the test name (only smo_native.exe / smo_user.exe open a visible window
 and play sound; SMO_SHOW=1 shows a test exe), runs it from build/bin with the converted dump's main.elf and the time
 limit, writes everything to build/run/<name>.log, then prints: the boot phases reached, the unimplemented imports
 (name and call count), the do-nothing audit line, frames presented, and a crash with its host frames named from the
 linker map. --full prints the whole log instead.
+
+--seq plays an input sequence file (SMO_SEQ, runtime/nnhid.c; one or more steps per line, '#' starts a comment), e.g.
+tests/cap_kingdom.seq. --userdata gives the game its own save folder (SMO_USERDATA; created if missing): a new, empty
+folder starts a new game, a copy of an earlier run's folder continues from there. Without it saves go to build/userdata.
 """
 import argparse
 import os
@@ -29,9 +34,17 @@ def main():
     ap.add_argument('--exe', default='smo_test.exe')
     ap.add_argument('--env', action='append', default=[])
     ap.add_argument('--full', action='store_true')
+    ap.add_argument('--seq', help='input sequence file (SMO_SEQ)')
+    ap.add_argument('--userdata', help='save folder for this run (SMO_USERDATA)')
     a = ap.parse_args()
     os.makedirs(RUN, exist_ok=True)
     os.makedirs(os.path.join(REPO, 'build', 'userdata'), exist_ok=True)
+    if a.seq:
+        steps = [line.split('#', 1)[0].strip() for line in open(a.seq, encoding='utf-8')]
+        a.env.append('SMO_SEQ=' + ' '.join(s for s in steps if s))
+    if a.userdata:
+        os.makedirs(a.userdata, exist_ok=True)
+        a.env.append('SMO_USERDATA=' + os.path.abspath(a.userdata))
     src = os.path.join(BIN, 'smo_native.exe')
     exe = os.path.join(BIN, a.exe)
     if a.exe != 'smo_native.exe':

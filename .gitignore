@@ -1,11 +1,17 @@
-# Everything derived from the game dump stays local. Never commit any of it.
+# The firewall: nothing derived from the game or from the console's software is ever committed.
+# Everything below is produced on your PC from your own dump.
+
+# everything scripts/setup.py produces from your dump, and tools you put in deps/
 /build/
+/deps/
 /dump/
 /work/
 /cache/
-/userdata/
-/deps/
+/userdata*/
+
+# dumps, keys, firmware
 *.nsp
+*.xci
 *.nca
 *.nso
 *.nro
@@ -17,6 +23,8 @@
 *.keys
 prod.keys
 title.keys
+
+# game files and archives
 *.bin
 *.sarc
 *.szs
@@ -25,7 +33,8 @@ title.keys
 *.bnsh
 *.bfsha
 *.pack
-# generated lifter output and binaries
+
+# lifted (recompiled) code and everything built from it
 gen*/
 *.obj
 *.o
@@ -35,11 +44,20 @@ gen*/
 *.pdb
 *.map
 *.spv
-# reference repos are cloned next to this repo, never inside it
-/ref/
-# function lists carry addresses/names derived from the dump and the decomp
+
+# function lists carry addresses and names derived from the dump (and the decompilation, when given)
 functions*.tsv
 functions*.json
+
+# captures, sound and logs of runs
+*.bmp
+*.png
+*.wav
+*.log
+
+# reference repositories are cloned next to this one, never inside it
+/ref/
+
 # python
 __pycache__/
 *.pyc

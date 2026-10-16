@@ -1,112 +1,119 @@
 # smo-recomp
 
-**A static recompilation of _Super Mario Odyssey_ (Nintendo Switch, version 1.0.0) into a native Windows x64 executable.**
+A **static recompilation** of *Super Mario Odyssey* (version 1.0.0) from the Nintendo Switch to a native Windows x64
+program, with its own runtime and a Vulkan renderer.
 
-> **No game code, assets, keys or firmware are included in this repository, and none ever will be.**
-> You need your own legally obtained copy of the game, and keys and firmware dumped from your own console.
-> Everything derived from the game is generated locally on your machine at build time, under `build/` (git-ignored).
+It is **not an emulator**: there is no CPU interpreter and no JIT. The game's AArch64 machine code is translated to C
+ahead of time and compiled for the PC; the console's system libraries, graphics API, audio, video, input and file
+system are re-implemented by this project's runtime.
 
-This is an unofficial, non-commercial research and preservation project. It is not affiliated with or endorsed by Nintendo.
+> **This repository contains no game code, no game assets, no keys and no firmware.**
+> You need your own legally obtained copy of the game (1.0.0) and keys and firmware dumped from your own console.
+> Everything derived from them is generated on your PC, from your dump, under `build/`, and never leaves it.
 
----
+## Status (October 2026)
 
-## Status
+Early, playable in parts with scripted input, not finished. What is written here was measured on the development PC
+(Windows 11, RTX 4090); where something was not checked, it says so.
 
-Work in progress. It boots, plays the opening cutscene, shows the title screen and the save-file screens, and loads into
-Cap Kingdom. It is **not playable end to end yet**. Every claim below was measured.
-
-**Measured (October 2026):**
-- **System calls reached** (title → file select): 261 SDK imports, every one with a host implementation (0 stubs).
-- **Differential test** against Unicorn: 23,068 / 23,068 sampled instructions identical, 0 untranslated (main executable plus the lifted SDK functions).
-- **Function boundaries** for `main`: 74,822 functions, from `.eh_frame` and the binary's own symbol table.
-- **Stability:** 9,224 frames in a 200-second run (title → Resume → Cap Kingdom), 0 Vulkan call failures.
-- **Speed:** 28–31 fps in Cap Kingdom on an RTX 4090; not optimized yet.
+| Area | State |
+|---|---|
+| Boot → title screen → file select | works |
+| New game → prologue → Cap Kingdom → Bonneton → into Top-Hat Tower, up to Mario's first capture (a frog) | plays with scripted input: `tests/run_cap_kingdom.py` checks 13 checkpoints against the game's own state, from an empty save, without a crash (3 of 3 runs passed; 15,016 frames in the last). Not yet played through by hand |
+| The rest of Cap Kingdom (Topper), the other kingdoms | not tested |
+| Renderer | Vulkan. Every shader stage the scripted run meets is translated (Maxwell machine code → GLSL → SPIR-V; 0 untranslated or rejected). The structured control flow of the translator was checked against its reference form on the GPU: 1,519 of 1,519 stages equal over 6.2 million invocations. 0 Vulkan call failures and 0 dropped command lists in the scripted run |
+| Audio | the game's own audio renderer runs (lifted from its system library); the final mix plays through the Windows audio device (6 → 2 channel downmix, 48 kHz): 0 dropped samples, 0 underruns in the scripted run |
+| Video | H.264 through Windows Media Foundation; the tutorial videos open and close without error, their picture is not checked |
+| Controllers | keyboard, XInput, and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, gyro): passes its automated tests with virtual devices (49 of 49); **not yet confirmed in play with physical pads** |
+| Save data | journalled like the console's (two-phase commit); the game's autosave and Resume work |
+| Speed | 26-42 fps in Cap Kingdom until Cappy joins (mostly 29-34); after that a median of about 13 fps in Bonneton at night and in Top-Hat Tower (6-31 fps per 300-frame window). Measured causes: every occlusion-query report waits for the GPU (about 37 a frame), and in the tower most of the frame time is spent in the game's own code. Not optimized yet |
+| Online | not available (the network services answer as an offline console) |
 
 ## How it works
 
-- **Extraction** (`tools/extract`): reads your NSP in place (NCA/PFS0/RomFS readers, keys from your own `prod.keys`) and writes the ELF images, RomFS and system fonts to `build/`.
-- **Function boundaries** come from the executable's `.eh_frame` unwind data and its own symbol table, never from guesses. That yields 74,822 functions in `main`.
+- **Extraction** (`tools/extract`): reads your NSP in place (NCA/PFS0/RomFS readers, keys from your own `prod.keys`) and writes the ELF images, the RomFS and the system fonts to `build/`.
+- **Function boundaries** come from the executable's `.eh_frame` unwind data and its own symbol table, never from guesses: 74,822 functions in `main`.
 - **Lifter** (`tools/lifter/recomp.py`): translates each AArch64 function into one C function operating on a register context. The output is compiled with clang into a game DLL; nothing is interpreted at run time.
-- **Differential testing** (`tools/lifter/difftest.py`):
-  - Sampled instruction shapes are executed both by the lifted C and by the Unicorn CPU emulator, over random, special floating-point, branch and trap inputs.
-  - Any difference is a failure. A mutation test checks that the harness catches planted bugs.
-- **SDK lifting** (`tools/lifter/sdklift.py`): parts of the game's own SDK, such as the audio renderer and DSP, are lifted the same way. The host then only provides the bottom layer: timers, events, memory.
-- **Host runtime** (`runtime/`), adapted from ssbu-recomp:
-  - Horizon OS services: `nn::os` threads and events, `nn::fs` with save-data journaling, hid, settings, an offline network stack.
-  - An NVN → Vulkan graphics backend.
-  - A Maxwell shader → GLSL → SPIR-V translator (`mx_translate.c`).
-  - Texture de-swizzling, verified against all 19,325 textures in the RomFS.
+- **Differential testing** (`tools/lifter/difftest.py`): sampled instruction shapes run both as lifted C and in the Unicorn CPU emulator, over random, special floating-point, branch and trap inputs; any difference is a failure (23,068 of 23,068 equal). A mutation test checks that the harness catches planted bugs.
+- **System-library lifting** (`tools/lifter/sdklift.py`): parts of the game's own SDK, such as the audio renderer and its DSP, are lifted the same way, so the host only provides the bottom layer (timers, events, memory, the audio device).
+- **Host runtime** (`runtime/`), adapted from [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp):
+  - Horizon OS services: `nn::os` threads and events, `nn::fs` with save-data journalling, hid, settings, an offline network stack.
+  - An NVN → Vulkan graphics back end. Command lists are recorded on the game's threads and replayed on a render thread; a recorded list lives until the game finalizes it or records over its memory, as on the console.
+  - A Maxwell shader → GLSL → SPIR-V translator (`mx_translate.c`) with structured control flow.
+  - Texture de-swizzling, checked against all 19,325 textures in the RomFS.
   - Movie playback on Windows Media Foundation.
+- **Scripted runs** (`runtime/smo_nerve.c`, `runtime/nnhid.c`, `tests/`): the runtime can report which state each of the game's state machines is in. Input sequences wait for those states and steer Mario to map coordinates through the game's camera, so a run does not depend on frame rate or loading times. See [`docs/SCRIPTED_RUNS.md`](docs/SCRIPTED_RUNS.md).
 - **Strict audit:** every unimplemented system call is logged with its name and call count; `SMO_STRICT=report` lists every call to a placeholder handler.
+
+## Plans
+
+- Speed: occlusion-query results without a GPU wait per report; profile the game side in Top-Hat Tower.
+- Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
+- Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`).
+- Play with physical controllers, other GPUs (AMD, Intel).
 
 ## Requirements
 
-- Windows 10/11 x64, a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* 1.0.0 dump (base NSP), and `prod.keys` plus firmware dumped from your own Switch.
-- [LLVM/clang 9.0.0](https://releases.llvm.org/) (the lifted code is compiled with it), Visual Studio 2019 Build Tools (16.11) and Windows SDK 10.0.19041.
-- [Vulkan SDK](https://vulkan.lunarg.com/) 1.4 (headers and `shaderc_shared.dll`), [SDL3](https://github.com/libsdl-org/SDL) 3.4.18 in `deps/` (or `SDL3_ROOT`).
-- Python 3.13.
+- Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
+- Your own *Super Mario Odyssey* 1.0.0 dump (the base NSP), and `prod.keys` and firmware dumped from your own Switch.
+- [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041, the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, Python 3.13.
 
-## Building
+## Building and running
 
-Everything is generated under `build/`. `<dump>` is the folder holding your NSP.
+[`BUILDING.md`](BUILDING.md) has the details. In short, from a fresh clone:
 
 ```bat
 py -3.13 -m venv .venv
 .venv\Scripts\python -m pip install pycryptodome lz4 zstandard capstone unicorn numpy Pillow pyyaml
-
-rem 1. extraction (keys: --keys, %SMO_KEYS%, ~/.switch/prod.keys, or Ryujinx's folder)
-.venv\Scripts\python tools\extract\extract.py --dir <dump>
-.venv\Scripts\python tools\extract\functions.py
-.venv\Scripts\python tools\extract\romfs.py --dir <dump>
-.venv\Scripts\python tools\extract\fw_fonts.py --fw <folder with your firmware .nca files>
-
-rem 2. lifting, verification, compilation
-.venv\Scripts\python tools\lifter\difftest.py all          & rem must report 0 different
-.venv\Scripts\python tools\lifter\recomp.py full
-.venv\Scripts\python tools\lifter\build_main.py 28
-.venv\Scripts\python tools\lifter\gen_tables.py
-.venv\Scripts\python tools\lifter\gen_sdktest.py
-.venv\Scripts\python tools\lifter\sdklift.py gen
-.venv\Scripts\python tools\lifter\build_exe.py           & rem -> build\bin\smo_game.dll + smo_native.exe
-
-rem 3. run (from build\bin; log in build\run\<name>.log)
-.venv\Scripts\python tools\run.py first --seconds 120
+.venv\Scripts\python scripts\setup.py --dump <folder with your NSP>
+.venv\Scripts\python scripts\run.py first --seconds 300
 ```
 
-If loading stalls on a very large shader, add `--env SMO_VK_NOHOLD=1 --env SMO_VK_BARRIER=0` (draws whose shader is not
-ready yet are skipped instead of waited for). Settings live in `build/config/graphics.ini` and
-`build/config/controllers.ini` (created on first run). Saves go to `build/userdata/save`. The runtime's switches
-(`SMO_*`) are described in the comments of the runtime files that read them.
+Debugging aids (frame and per-pass captures, shader dumps, guest call stacks on crashes, heap write watches, state
+logs) are described in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
 
 ## Repository layout
 
 ```
+runtime/         host runtime: OS services, NVN -> Vulkan, shader translator, audio, input, movies, state tracker
+scripts/         setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
 tools/extract/   NSP/NCA/RomFS readers, function list, RomFS and font extraction
-tools/lifter/    AArch64 -> C lifter, SDK lifter, differential test, build scripts
-tools/dev/       disassembler, caller finder, SARC lister, Maxwell instruction namer
+tools/lifter/    AArch64 -> C lifter, system-library lifter, differential test, build steps
+tools/dev/       disassembler, caller finder, SARC and stage-placement listers, Maxwell instruction namer
 tools/port/      idempotent adaptation of the ssbu-recomp runtime sources
-tools/test/      texture layout verification
-tools/run.py     runs the built game and summarises the log
-runtime/         host runtime: OS services, NVN -> Vulkan, shader translator, audio, input, movies
+tests/           scripted Cap Kingdom run, shader translator equivalence harness, texture layout check
+docs/            debugging aids, scripted runs
 ```
+
+## Related work
+
+- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp): the static recompilation of *Super Smash Bros. Ultimate* this project is built on; its design, lifter and runtime were adapted here (GPL-3.0).
+- [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp): the decompilation project of *Super Mario Odyssey*, read as a reference only; none of its code is included.
+- yuzu/suyu and Ryujinx: documentation and sources consulted for console behaviour (cited where used).
+
+## How this was made
+
+Most of the code was written by AI coding agents (Claude) working under the maintainer's direction, starting from
+ssbu-recomp's design. Two rules kept it honest: every claim comes from a test or a measurement (this README says what
+was measured and what was not), and nothing derived from the game goes into the repository. Expect rough edges.
+
+## Contributing
+
+Testers with other GPUs and controllers, and people who know the game's internals, are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) first: three rules (nothing derived from the game in the repository, clean sources
+only, every claim measured) apply to every contribution.
 
 ## Legal
 
-- This repository contains only original source code and documentation, licensed GPL-3.0.
-- It contains no Nintendo code, binaries, assets, keys or firmware.
-- Function names and addresses in comments identify locations in the game's own executable, for interoperability; they are not game code.
-- `.gitignore` excludes every file derived from a game dump. Please keep it that way in contributions.
-- *Super Mario Odyssey* and Nintendo Switch are trademarks of Nintendo.
+This project is not affiliated with, endorsed or sponsored by Nintendo. *Super Mario Odyssey* and *Nintendo Switch*
+are trademarks of Nintendo and are named only to say what the software works with. The repository contains only
+original source code and documentation (GPL-3.0-or-later, see [LICENSE](LICENSE)): no game code, binaries, assets,
+console keys or firmware, and it does not help anyone obtain them. Function names and addresses in comments identify
+locations in the game's own executable, for interoperability; they are not game code. You must own the game and dump
+it yourself.
 
 ## Credits
 
-- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) by Denkishi: the design and runtime this project builds on (GPL-3.0).
-- [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp): used as a reading reference only; none of its code is included.
+- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) by Denkishi: the design and runtime this project builds on.
 - [Unicorn](https://www.unicorn-engine.org/) and [Capstone](https://www.capstone-engine.org/): reference CPU emulation and disassembly.
 - [SDL3](https://github.com/libsdl-org/SDL), [glslang/shaderc](https://github.com/KhronosGroup/glslang), the Vulkan SDK.
-- yuzu/suyu and Ryujinx documentation and sources, consulted as references for console behaviour (cited where used).
-
-## License
-
-[GPL-3.0-or-later](LICENSE).

@@ -1,0 +1,94 @@
+# Contributing
+
+Thank you for helping. Testers with other GPUs and controllers, people who know the game's internals, and anyone who
+wants to carry the scripted runs further through the game are welcome. Three rules apply to every contribution.
+
+## The three rules
+
+### 1. Nothing derived from the game goes into the repository
+
+- No game code, binaries, assets, keys, firmware or save data, and none of what the build makes from them: lifted C,
+  function lists, shaders, extracted files, captures, logs. All of it lives in `build/`, which git ignores; the
+  `.gitignore` is the firewall, keep it that way.
+- Screenshots and captures of the game stay out of the repository too.
+- Names are fine: function, class and state names from the game's own executable, used to find places in it
+  (interoperability), and coordinates measured in play for the input sequences in `tests/`.
+
+### 2. Clean sources only
+
+- [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp) has no licence. Read it as a reference; never copy
+  its code, its lists or its files into the repository. The build may read a local clone you point it at
+  (`--decomp`), into `build/`.
+- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) (GPL-3.0) is the base of the runtime and the lifter; its code
+  is adapted under its licence.
+- Emulator sources and documentation (yuzu/suyu, Ryujinx) consulted for console behaviour are cited where used; copy
+  nothing their licences do not allow.
+
+### 3. Every claim is measured
+
+- A claim in a comment, a document or a pull request comes from a test or a measurement, and says how it was
+  measured; what was not checked is said too.
+- Never change a test or its reference data to make something pass. If a test is wrong, say why in the pull request
+  and fix it as a change of its own.
+
+## Using AI
+
+This project was built with AI coding agents directed by its maintainer, and says so. AI-assisted contributions are
+welcome on the same terms as any other: you understand what you submit, you ran it, and the three rules hold. Say in
+the pull request what was AI-written and how you checked it. An unverified AI answer about how the game or the console
+works is not evidence; a test is.
+
+## Ways to help
+
+- Run the scripted Cap Kingdom test (`tests/run_cap_kingdom.py`) on an AMD or Intel GPU and report its result lines
+  and the log.
+- Play with a physical controller and report what does not work.
+- Carry the scripted runs further: the rest of Cap Kingdom (Topper), then the other kingdoms
+  ([`docs/SCRIPTED_RUNS.md`](docs/SCRIPTED_RUNS.md) shows how a route is found).
+- Speed: occlusion-query results without a GPU wait per report; profiling the game side in Top-Hat Tower.
+- Check the shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`) against hardware.
+
+## Building
+
+See [BUILDING.md](BUILDING.md).
+
+## Reporting a problem
+
+Give the commit, your GPU and driver version, what you did (or the input sequence), and the run's log
+(`build\run\<name>.log`): its last lines name the crash, the missing feature or the stuck state. Never attach game files
+or your keys.
+
+## Code
+
+- `runtime/` is C (clang 9), one file per area of the console it stands in for. Comments say why, and cite the source of
+  any behaviour taken from documentation or another project.
+- `tools/` and `scripts/` are Python 3.13; `tools/<area>/` for build tools, `tools/dev/` for lookups while debugging.
+- Runtime switches use the `SMO_` prefix and are described in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+- No game address is written into the runtime: what it needs is generated per build into `build/gen` (for example
+  `GAME_SYMS` in `tools/lifter/gen_tables.py` for game functions the runtime calls by name).
+- A change to the shader translator's output must bump `MX_VK_VERSION` in `runtime/nvn_vk_m4.c` and
+  `runtime/nvn_vk_draw.c`, so that cached stages are translated again.
+
+## Testing
+
+Say in the pull request which of these you ran:
+
+- **Lifter changes:** `tools\lifter\difftest.py all` (0 different) and `tools\lifter\difftest_mutation.py` (the
+  harness still catches planted bugs).
+- **Shader translator changes:** `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of dumped
+  stages>` (0 different); stages are dumped with `SMO_SHADERDUMP=<folder>` and `SMO_VK_DUMP_MINBYTES=<n>`.
+- **Texture layout changes:** `tests\bntx_layout_check.py` (every texture of the RomFS equal).
+- **Anything that can change game behaviour, rendering or timing:** `tests\run_cap_kingdom.py <new run name>` must
+  print `RESULT: PASS`.
+- **Input changes:** `scripts\run.py padtest --env SMO_PAD_SELFTEST=1` (every check passes).
+
+Known: `SMO_SDK_SELFTEST=1`, inherited from ssbu-recomp, stops at `log2f`, a function *Super Mario Odyssey* does not
+import; the test, not the runtime, needs adapting.
+
+## Commits and licence
+
+Contributions are licensed GPL-3.0-or-later, like the project. A commit message says what changed and what was measured.
+
+## Legal
+
+This project is not affiliated with Nintendo. Do not contribute anything you do not have the right to share.
