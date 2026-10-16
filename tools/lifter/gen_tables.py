@@ -28,7 +28,8 @@ OUT = os.path.join(REPO, 'build', 'gen')
 GUEST_BASE = 0x7100000000
 SDK_BASE = 0x7500000000
 # game functions the runtime calls by name (the console's own allocator lives in main for this game)
-GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain']
+GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
+             '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
 
 
 def layout(m):

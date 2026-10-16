@@ -30,7 +30,7 @@ HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nv
                 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'display.c',
                 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c',
                 'nncxxlib.c', 'nnlibc2.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c',
-                'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c',
+                'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c', 'smo_nerve.c',
                 'gamedll.c']
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', RT, '-I', GEN, '-I', LIFT,

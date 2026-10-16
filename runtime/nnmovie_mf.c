@@ -100,7 +100,7 @@ void os_signal_event(uint64_t key);                   /* os_threads.c */
 #define FLAG_EOS 4
 #define MAX_TRACKS 8
 #define SLOT_BYTES 64
-#define GAME_FREE GAME_SYM_free                     /* the game's free, as in libcxx.c */
+#define GAME_DELETE GAME_SYM__ZdlPv              /* the game's operator delete(void *) */
 #define TOKEN_MAGIC 0x4d4f564945544f4bULL             /* "MOVIETOK" */
 
 /* ---------------------------------------------------------------- small helpers */
@@ -569,7 +569,8 @@ static void ext_dtor_common(Ctx *c, int deleting) {
         free(e);
         wr64(A0 + 8, 0);
     }
-    if (deleting) gcall(c, GAME_FREE, A0, 0, 0, 0, 0);       /* the game allocated the 16-byte object with f_710392dce0 [game 0x71036f1ccc] */
+    if (deleting) gcall(c, GAME_DELETE, A0, 0, 0, 0, 0);     /* SMO: the game allocated the 16-byte object with its operator new
+                                                               (_Znwm, sead heaps: MovieDecoderPlayer::CreateDecoders / CreateExtractor) */
 }
 static void ext_dtor(Ctx *c) { ext_dtor_common(c, 0); }
 static void ext_deleting_dtor(Ctx *c) { ext_dtor_common(c, 1); }
@@ -823,7 +824,8 @@ static void dec_dtor_common(Ctx *c, int deleting) {
         free(d);
         wr64(A0 + 8, 0);
     }
-    if (deleting) gcall(c, GAME_FREE, A0, 0, 0, 0, 0);       /* the game allocated the 16-byte object with f_710392dce0 [game 0x71036f1ccc] */
+    if (deleting) gcall(c, GAME_DELETE, A0, 0, 0, 0, 0);     /* SMO: the game allocated the 16-byte object with its operator new
+                                                               (_Znwm, sead heaps: MovieDecoderPlayer::CreateDecoders / CreateExtractor) */
 }
 static void dec_dtor(Ctx *c) { dec_dtor_common(c, 0); }
 static void dec_deleting_dtor(Ctx *c) { dec_dtor_common(c, 1); }

@@ -24,7 +24,7 @@ typedef struct VStage {
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SMO_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
 } VStage;
-#define MX_VK_VERSION 6u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
@@ -233,6 +233,11 @@ static void vstage_build(VStage *v, const SSrc *src) {
         }
         snprintf(what, sizeof what, "program #%d %s stage", src->serial, s == 5 ? "compute" : s ? "fragment" : "vertex");
         if (s == 1 && RS_ON) in.screen_scale = 1;
+        {   /* SMO debug aid: SMO_VK_DUMP_SERIAL=<n> writes the machine code of program n's stages (vk_prog_<n>_<stage>.bin in SMO_SHADERDUMP or the run folder) */
+            static int want = -2; if (want == -2) want = getenv("SMO_VK_DUMP_SERIAL") ? atoi(getenv("SMO_VK_DUMP_SERIAL")) : -1;
+            static long minb = -2; if (minb == -2) minb = getenv("SMO_VK_DUMP_MINBYTES") ? atol(getenv("SMO_VK_DUMP_MINBYTES")) : -1;
+            if ((want >= 0 && src->serial == want) || (minb >= 0 && src->code_len >= minb)) { const char *dir = getenv("SMO_SHADERDUMP"); char path[300]; snprintf(path, sizeof path, "%s%svk_prog_%05d_%d.bin", dir ? dir : "", dir ? "/" : "", src->serial, s); FILE *f = fopen(path, "wb"); if (f) { fwrite(src->code, 1, (size_t)src->code_len, f); fclose(f); } }
+        }
         if (!mx_translate(&in, &out)) {
             printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout);
             {   /* SMO debug aid: SMO_SHADERDUMP=<dir> also writes the machine code of a stage the translator refuses (as the OpenGL path's b*.bin) */
@@ -1967,6 +1972,10 @@ static int cont_stage(uint64_t control, uint64_t data, SSrc *o) {      /* as nvn
         for (int k = 0; k < 3; k++) o->local[k] = g32(control + 0x748 + (uint64_t)k * 4);
         o->smem = g32(control + 0x754); o->lmem = g32(control + 0x758);
         if (ctl[3] && ctl[4]) { o->cdata = o->code + ctl[4]; o->cdata_size = ctl[3]; }
+        {   static int nl; if (getenv("SMO_VK_CSLOG") && nl++ < 40) {      /* SMO debug aid: the compute control section as read */
+                printf("nvn_vk_cs: compute %d bytes: group %u x %u x %u, smem %u, lmem %u | control +0x740..+0x760:", len, o->local[0], o->local[1], o->local[2], o->smem, o->lmem);
+                for (int k = 0; k < 8; k++) printf(" %08x", g32(control + 0x740 + (uint64_t)k * 4));
+                printf("\n"); } }
         return 2;
     }
     if (g32(data) != 0x12345678u) return -1;

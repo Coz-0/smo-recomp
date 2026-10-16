@@ -87,6 +87,17 @@ typedef struct {
 
 /* Returns 1 on success. out->glsl must be freed by the caller. */
 int mx_translate(const MxIn *in, MxOut *out);
+/* SMO: a compute work group larger than Vulkan's 1024 invocations (SMO has 1536 x 1 x 1 groups; NVN on the console takes
+ * them) runs as k groups along x: the translator gives each invocation the local and group ids it would have had, the
+ * back end dispatches k times as many groups in x. Only without shared memory (the translator has no barrier, so no
+ * translated stage has one). 1 = no split; 0 = cannot be split. */
+static inline unsigned mx_split_x(const uint32_t local[3], uint32_t smem_bytes) {
+    uint64_t lx = local[0] ? local[0] : 1, ly = local[1] ? local[1] : 1, lz = local[2] ? local[2] : 1;
+    if (lx * ly * lz <= 1024) return 1;
+    if (smem_bytes) return 0;
+    for (unsigned k = 2; k <= lx; k++) if (lx % k == 0 && (lx / k) * ly * lz <= 1024) return k;
+    return 0;
+}
 /* Name of the Maxwell opcode of an instruction word (suyu's opcode table). */
 const char *mx_opcode_name(uint64_t insn);
 

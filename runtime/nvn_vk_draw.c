@@ -237,11 +237,27 @@ static struct {
 } R;
 
 static void pass_shot(void);
+/* SMO debug aid SMO_VK_PASSSHOT=<frame> or <first>-<last>[/<step>]: the frames whose render passes pass_shot saves and
+ * whose draws are logged (a range finds a defect that shows in some frames only; its files carry the frame number). */
+static long long g_ps_lo = -2, g_ps_hi, g_ps_step = 1;
+static void passshot_parse(void) {
+    const char *e = getenv("SMO_VK_PASSSHOT"), *d;
+    g_ps_lo = -1;
+    if (!e) return;
+    g_ps_lo = g_ps_hi = atoll(e);
+    if ((d = strchr(e, '-')) != NULL) { g_ps_hi = atoll(d + 1); if ((d = strchr(d, '/')) != NULL && atoll(d + 1) > 0) g_ps_step = atoll(d + 1); }
+}
+static int passshot_frame(void) {
+    if (g_ps_lo == -2) passshot_parse();
+    long long f = nvn_front_frame_next();
+    return g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
+}
+static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_ps_hi > g_ps_lo; }
 /* SMO port: NVN counter type 1, SAMPLES_PASSED (occlusion). Between nvnCommandBufferResetCounter and ReportCounter the
  * samples of every draw are counted. A Vulkan occlusion query begun inside a render pass must end in it, so the count is
  * made of segments: one query from the first draw of a pass while counting until the pass (or the counting) ends. A report
  * submits, waits for the GPU and adds the segments since the last reset (as nvn_gl.c's counter_stop / acc). */
-#define OCC_MAX 4096
+#define OCC_MAX 65536
 static VkQueryPool g_occ_pool;
 static int g_occ_on, g_occ_open, g_occ_n, g_occ_base;      /* counting; a segment is open; segments used; first segment of this count */
 static LONG64 g_occ_reports, g_occ_syncs;
@@ -859,7 +875,7 @@ typedef struct VStage {
 } VStage;
 /* M4 (design section 5): what a stage needs to become a module again without the translator and glslang, in
  * ..\cache\vk\stage\<stage>_<hash of machine code, constants, variant, translator version>.st */
-#define MX_VK_VERSION 4u                           /* part of the stage hash: change it when mx_translate's Vulkan text changes */
+#define MX_VK_VERSION 8u                           /* part of the stage hash: change it when mx_translate's Vulkan text changes */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 static CRITICAL_SECTION g_sh_lock;                 /* the stage and pipeline tables while the start-up workers run */
 static VkPipelineCache g_pcache;
@@ -1257,8 +1273,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
     int r = u < 32 ? nvn_front_handle(R.tpool, R.spool, R.nvn_tex[s][u], &t, &view, &sp) : 0;
     {   /* SMO port, with SMO_VK_PASSSHOT: what each draw of that frame samples (pass_shot's frame) */
         static int want = -2;
-        if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-        if (want >= 0 && nvn_front_frame_next() == want) {
+        want = passshot_frame() ? 1 : -1;
+        if (want >= 0) {
             Tex *c0 = R.ncol ? R.col[0].tex : NULL;
             printf("nvn_vk_bind: stage %d unit %u handle %llx -> %s tex %p fmt 0x%x %dx%d mem %p gpu_written %d | target tex %p fmt 0x%x mem %p\n",
                    s, u, (unsigned long long)(u < 32 ? R.nvn_tex[s][u] : 0), (r & 1) ? "live" : "NO TEXTURE", (void *)((r & 1) ? t : NULL),
@@ -1298,8 +1314,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||
                  ((dim == DIM_CUBE || dim == DIM_CUBEA) && (have == DIM_2DA) && e.nlay >= 6 && vt->w == vt->h);
         {   static int want2 = -2;
-            if (want2 == -2) want2 = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-            if (want2 >= 0 && nvn_front_frame_next() == want2)
+            want2 = passshot_frame() ? 1 : -1;
+            if (want2 >= 0)
                 printf("nvn_vk_bind:   shader wants dim %d, view gives dim %d (view target %d, %d layers, levels %d+%d), samples %d, attached %d -> %s\n",
                        dim, have, e.target, e.nlay, e.lvl0, e.nlvl, vt->samples, attached, ok && vt->samples == 1 ? "BOUND" : "DUMMY (black)");
         }
@@ -1490,12 +1506,31 @@ static void occ_recycle(void) {                    /* all segments have run: the
 }
 static void occ_draw(void) {                       /* after draw_prepare, inside a pass */
     if (!g_occ_on || g_occ_open || !R.in_pass) return;
-    if (g_occ_n == OCC_MAX) {                      /* the pool is full: sum what this count has so far into a carry */
-        nvn_vk_missing("more than 4096 render passes in one occlusion count");
+    if (g_occ_n == OCC_MAX) {                      /* full within one batch (occ_fold empties it between batches) */
+        nvn_vk_missing("an occlusion count open over more than 32768 render passes of one batch");
         return;
     }
     vkCmdBeginQuery(R.cmd, g_occ_pool, (uint32_t)g_occ_n++, D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);   /* NVN counts samples */
     g_occ_open = 1;
+}
+/* A count that stays open over many passes (SMO's Top-Hat Tower stage: about 136 segments a frame, a 4096-query pool
+ * was full 30 frames after the stage started in boot155): at the end of a batch, when half of the pool is used, the
+ * segments of this count are read back into the carry and the pool starts again, as a report does. The submission ends
+ * the open pass (and its segment); the next draw begins both again, as after a ring wrap. Segments before g_occ_base
+ * belong to counts that were reset without a report and are dropped. */
+static LONG64 g_occ_folds;
+static void occ_fold(void) {
+    if (!g_occ_pool || g_occ_n < OCC_MAX / 2) return;
+    uint64_t sum = 0;
+    occ_wait_all();                                /* submits (ending the pass); the queries must have run before they are read or reset */
+    if (g_occ_on && g_occ_n > g_occ_base) {
+        static uint64_t res[OCC_MAX];
+        VKC(vkGetQueryPoolResults(V.device, g_occ_pool, (uint32_t)g_occ_base, (uint32_t)(g_occ_n - g_occ_base), sizeof res, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        for (int i = 0; i < g_occ_n - g_occ_base; i++) sum += res[i];
+    }
+    occ_recycle();
+    g_occ_carry += sum;
+    g_occ_folds++;
 }
 static void occ_reset(void) { occ_pool(); occ_end(); g_occ_on = 1; g_occ_base = g_occ_n; g_occ_carry = 0; }
 static uint64_t occ_report(void) {
@@ -1701,7 +1736,10 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     if (nw) vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL);
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cp);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cl, 0, 2, sets, 0, NULL);
-    vkCmdDispatch(R.cmd, gx, gy, gz);
+    {   unsigned k = mx_split_x(st->local, st->smem_bytes);      /* SMO: a work group over 1024 invocations runs as k groups along x (mx_translate.h) */
+        if (!k) { nvn_vk_missing("a compute work group over 1024 invocations that uses shared memory"); return; }
+        vkCmdDispatch(R.cmd, gx * k, gy, gz);
+    }
     if (v->ssbo_w) {                               /* what the dispatch wrote is read by later dispatches and draws of this command buffer */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
@@ -1714,15 +1752,15 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
 static int draw_prepare(unsigned prim) {
     {   /* SMO port, with SMO_VK_PASSSHOT: the state of each draw of that frame (every draw kind passes here) */
             static int want = -2;
-            if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-            if (want >= 0 && nvn_front_frame_next() == want)
+            want = passshot_frame() ? 1 : -1;
+            if (want >= 0)
                 printf("nvn_vk_draw: prim %u programs vs #%d fs #%d | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x blend0 %u %u %u %u %u %u | ds %llx\n",
                        prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
                        R.have_scissor ? "set" : "default", R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.pass_w, R.pass_h, R.in_pass,
                        (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on,
                        R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], (unsigned long long)R.ds);
-                if (want >= 0 && nvn_front_frame_next() == want) printf("nvn_vk_draw:   depth target %p fmt 0x%x %dx%d drange %g..%g polyoff %g %g %g poly %u %u %u %u\n", (void *)R.depth.tex, R.depth.tex ? R.depth.tex->b.format : 0, R.depth.tex ? R.depth.tex->b.width : 0, R.depth.tex ? R.depth.tex->b.height : 0, R.drange[0], R.drange[1], R.polyoff[0], R.polyoff[1], R.polyoff[2], R.poly[0], R.poly[1], R.poly[2], R.poly[3]);
-            if (want >= 0 && nvn_front_frame_next() == want) {
+                if (want >= 0) printf("nvn_vk_draw:   depth target %p fmt 0x%x %dx%d drange %g..%g polyoff %g %g %g poly %u %u %u %u\n", (void *)R.depth.tex, R.depth.tex ? R.depth.tex->b.format : 0, R.depth.tex ? R.depth.tex->b.width : 0, R.depth.tex ? R.depth.tex->b.height : 0, R.drange[0], R.drange[1], R.polyoff[0], R.polyoff[1], R.polyoff[2], R.poly[0], R.poly[1], R.poly[2], R.poly[3]);
+            if (want >= 0) {
                 float ar; memcpy(&ar, &R.alpha_ref, 4);
                 printf("nvn_vk_draw:   alpha func %u ref %g | vertex ubo0 (c3) addr %llx size %llx:", (unsigned)R.alpha_func, ar,
                        (unsigned long long)R.ubo[0][0].addr, (unsigned long long)R.ubo[0][0].size);
@@ -1798,8 +1836,8 @@ static int draw_prepare(unsigned prim) {
     {   /* SMO debug aid, with SMO_VK_PASSSHOT: each attribute of the draw (format, stream, offset, stride) and the first two
          * vertices of attribute 0 as floats, read from guest memory */
         static int want = -2;
-        if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-        if (want >= 0 && nvn_front_frame_next() == want) {
+        want = passshot_frame() ? 1 : -1;
+        if (want >= 0) {
             for (int i = 0; i < 4 && i < R.nattr; i++) {
                 uint32_t a = R.vattr[i]; int st = (int)((a >> 8) & 31);
                 if (!(a & 0xff)) continue;
@@ -2271,8 +2309,8 @@ static void exec(const Cmd *m, int depth) {
         if (a[0] == 1) {
             uint64_t n = occ_report();
             if (a[1]) { uint64_t d[2] = {n, vk_now_ns()}; memcpy(P(a[1]), d, 16); R.gen++; }
-            {   static int want = -2; if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;      /* SMO debug aid */
-                if (want >= 0 && nvn_front_frame_next() >= want && nvn_front_frame_next() < want + 2) printf("nvn_vk_occ: frame %lld report %llu samples to %llx (segments %d..%d)\n", nvn_front_frame_next(), (unsigned long long)n, (unsigned long long)a[1], g_occ_base, g_occ_n); }
+            {   static int want = -2; want = passshot_frame() ? 1 : -1;      /* SMO debug aid */
+                if (want >= 0) printf("nvn_vk_occ: frame %lld report %llu samples to %llx (segments %d..%d)\n", nvn_front_frame_next(), (unsigned long long)n, (unsigned long long)a[1], g_occ_base, g_occ_n); }
             break;
         }
         if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferReportCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); break; }
@@ -2328,8 +2366,8 @@ static void exec(const Cmd *m, int depth) {
         if (sw > R.pass_w - sx) sw = R.pass_w - sx; if (sh > R.pass_h - sy) sh = R.pass_h - sy;
         if (sw <= 0 || sh <= 0 || !vt) break;
         memset(&ca, 0, sizeof ca); memset(&cr, 0, sizeof cr);
-        {   static int want = -2; if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-            if (want >= 0 && nvn_front_frame_next() == want) { float dv; memcpy(&dv, &a[3], 4); printf("nvn_vk_ds: clear depth %d (value %g) stencil mask %x value %u on depth tex %p fmt 0x%x %dx%d\n", (int)(a[0] & 1), dv, (unsigned)a[2], (unsigned)a[1], (void *)R.depth.tex, R.depth.tex->b.format, R.depth.tex->b.width, R.depth.tex->b.height); } }
+        {   static int want = -2; want = passshot_frame() ? 1 : -1;
+            if (want >= 0) { float dv; memcpy(&dv, &a[3], 4); printf("nvn_vk_ds: clear depth %d (value %g) stencil mask %x value %u on depth tex %p fmt 0x%x %dx%d\n", (int)(a[0] & 1), dv, (unsigned)a[2], (unsigned)a[1], (void *)R.depth.tex, R.depth.tex->b.format, R.depth.tex->b.width, R.depth.tex->b.height); } }
         ca.aspectMask = ((a[0] & 1) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | ((uint32_t)a[2] ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
         if ((ca.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && (vt->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && ((uint32_t)a[2] & 0xff) != 0xff) {
             stencil_clear_masked((uint32_t)a[2] & 0xff, (uint32_t)a[1], sx, sy, sw, sh);
@@ -2423,7 +2461,7 @@ static void exec(const Cmd *m, int depth) {
 static void replay(uint64_t handle, int depth) {
     size_t len = 0;
     uint8_t *data = nvn_front_list(handle, &len);
-    if (!data) { static int n; const char *nvn_front_list_why(uint64_t h); if (n++ < 10) printf("nvn_vk: command handle %llx is unknown or expired: %s\n", (unsigned long long)handle, nvn_front_list_why(handle)); return; }
+    if (!data) { static int n; const char *nvn_front_list_why(uint64_t h); void nvn_front_list_stale(void); nvn_front_list_stale(); if (n++ < 10) printf("nvn_vk: command handle %llx is unknown or expired: %s\n", (unsigned long long)handle, nvn_front_list_why(handle)); return;}
     for (size_t off = 0; off + sizeof(Cmd) <= len;) {
         const Cmd *m = (const Cmd *)(data + off);
         if (m->size < sizeof(Cmd)) break;
@@ -2446,6 +2484,7 @@ static void vk_submit(void *arg) {
     if (g_scan_on) { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }      /* session 4: what this batch will need goes to the workers before it is replayed */
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     cb_batch_end();
+    occ_fold();
     g_tm[7] += t1 - t0; g_tm[3] += tk() - t1;
     nvn_front_count(3, 1);
 }
@@ -2535,13 +2574,17 @@ static void save_bmp_vk(const char *path, VTex *vt) {
     }
     free(px);
 }
-/* SMO port, debug aid SMO_VK_PASSSHOT=<frame>: at the end of every render pass of that frame, colour target 0 is read
- * back (read_region, the ReadTexels path) and saved as pass_<n>_<format>.bmp in SMO_SHOT_DIR, with one line of figures
+/* SMO port, debug aid SMO_VK_PASSSHOT=<frame> (or a range, passshot_frame): at the end of every render pass of that frame,
+ * colour target 0 is read back (read_region, the ReadTexels path) and saved as pass_[<frame>_]<n>_<format>.bmp in SMO_SHOT_DIR, with one line of figures
  * (pixels not black, mean of each channel). RGB10A2 (0x3d) is decoded to 8 bits per channel; 8-bit RGBA as is. */
 static void pass_shot(void) {
     static int want = -2, n, busy;
-    if (want == -2) want = getenv("SMO_VK_PASSSHOT") ? atoi(getenv("SMO_VK_PASSSHOT")) : -1;
-    if (want < 0 || busy || nvn_front_frame_next() != want || !R.ncol || !R.col[0].tex || !R.col[0].tex->vk) return;
+    want = passshot_frame() ? 1 : -1;
+    if (want < 0 || busy || !R.ncol || !R.col[0].tex || !R.col[0].tex->vk) return;
+    static long long last_frame = -1;
+    char pre[24] = "";                             /* "<frame>_" before the pass number when a range is captured */
+    if (nvn_front_frame_next() != last_frame) { last_frame = nvn_front_frame_next(); n = 0; }
+    if (passshot_range()) snprintf(pre, sizeof pre, "%lld_", last_frame);
     Tex *t = R.col[0].tex;
     VTex *vt = t->vk;
     int half4 = t->b.format == 0x29 && vt->bpb == 8;      /* SMO: RGBA16F, shown clamped to 0..1 (alpha too) */
@@ -2553,7 +2596,7 @@ static void pass_shot(void) {
             double mn = 1e30, mx = -1e30, sm = 0;
             for (size_t k = 0; k < (size_t)w1 * h1; k++) { uint16_t hv = hp[k]; int ex = (hv >> 10) & 31, man = hv & 1023; float f = ex == 0 ? ldexpf((float)man, -24) : ex == 31 ? 65504.0f : ldexpf(1.0f + man / 1024.0f, ex - 15); if (hv & 0x8000) f = -f; if (f < mn) mn = f; if (f > mx) mx = f; sm += f; }
             printf("nvn_vk_pass: pass %d: %dx%d R16F min %g max %g mean %g\n", n, w1, h1, mn, mx, sm / ((double)w1 * h1));
-            if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%03d_05_%dx%d.half", dd ? dd : "", dd ? "/" : "", n, w1, h1); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 2, (size_t)w1 * h1, fr); fclose(fr); } }
+            if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%s%03d_05_%dx%d.half", dd ? dd : "", dd ? "/" : "", pre, n, w1, h1); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 2, (size_t)w1 * h1, fr); fclose(fr); } }
         }
         free(hp); n++; return;
     }
@@ -2572,7 +2615,7 @@ static void pass_shot(void) {
                 if (hv & 0x8000) f = -f;
                 px[k] = (uint8_t)(f <= 0 ? 0 : f >= 1 ? 255 : f * 255.0f + 0.5f);
             }
-            if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%03d_29_%dx%d.half", dd ? dd : "", dd ? "/" : "", n, w, h); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 8, (size_t)w * h, fr); fclose(fr); } }
+            if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%s%03d_29_%dx%d.half", dd ? dd : "", dd ? "/" : "", pre, n, w, h); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 8, (size_t)w * h, fr); fclose(fr); } }
         }
         free(hp);
     } else if (px) got = read_region(t, NULL, rr, px, 0, 0) != 0;
@@ -2584,7 +2627,7 @@ static void pass_shot(void) {
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
-        snprintf(path, sizeof path, "%s%spass_%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", n, (unsigned)t->b.format);
+        snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format);
         FILE *f = fopen(path, "wb");
         uint8_t head[54] = {'B', 'M'}, *rowb = calloc(1, row);
         memcpy(head + 2, &size, 4); v = 54; memcpy(head + 10, &v, 4); v = 40; memcpy(head + 14, &v, 4); memcpy(head + 18, &w, 4); memcpy(head + 22, &h, 4); head[26] = 1; head[28] = 24;
@@ -2603,7 +2646,7 @@ static void pass_shot(void) {
         if (f) fclose(f);
         free(rowb);
         if (getenv("SMO_VK_PASSSHOT_RAW")) {         /* SMO debug aid: the texels as read (4 bytes each, rows top first), for alpha and exact values */
-            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", n, (unsigned)t->b.format, w, h);
+            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format, w, h);
             FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(px, 4, (size_t)w * h, fr); fclose(fr); }
         }
         printf("nvn_vk_pass: pass %d: %dx%d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, (unsigned)t->b.format,
@@ -3079,4 +3122,5 @@ static void vkd_shutdown(void) {
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;
     printf("nvn_vk: drawing part shut down: %lld images, %lld pipelines, %lld shader modules, %d samplers destroyed; %lld bytes of block space lost to fragmentation records\n", (long long)R.images, (long long)R.pipelines, (long long)R.modules, g_nsmp, (long long)g_mem_leak);
+    if (g_occ_reports || g_occ_folds) printf("nvn_vk: occlusion counts: %lld reports, %lld waits for the GPU, %lld long counts folded into their carry\n", (long long)g_occ_reports, (long long)g_occ_syncs, (long long)g_occ_folds);
 }

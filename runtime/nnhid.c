@@ -46,7 +46,7 @@ static int scripted(int vk) {
 /* Test aid: SMO_SCRIPT is a timed input sequence, independent of window focus. Space-separated steps
  * "<second>[+<duration>]:<keys>", duration 0.15 s by default, keys held together. Key characters are the
  * keyboard keys of the mapping above (Z X C V Q E A S I J K L), '!' = Enter (Plus), '-' = Backspace (Minus),
- * and lower-case u d l r = the arrow keys (left stick). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
+ * lower-case u d l r = the arrow keys (left stick) and the digits 8 2 4 6 = right stick up, down, left, right (SMO). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
  * Each step is announced on stdout when it starts, so it can be matched against the frame log. */
 #define SCRIPT_MAX 256
 static struct { double at, len; char keys[12]; int said; } g_script[SCRIPT_MAX];
@@ -94,6 +94,23 @@ static int script_key(int vk) {
  * so it does not depend on how long this run took to start. Space-separated steps, executed in order:
  *   @movie            wait until the opening movie is created (input_mark("movie") from nnmovie_mf.c)
  *   @module:<name>    wait until nn::ro has loaded that script module (input_mark("module:lua2cpp_mario") from nnro.c)
+ *   @nerve:<name>     SMO: wait until the game runs that nerve state, e.g. @nerve:OpeningStageStartDemoNrvWaitStandUp
+ *                     (smo_nerve.c; SMO_NERVELOG=* prints the names as they change)
+ *   @goto:<x>,<z>[,<r>][/<n>]  SMO: steer the left stick (analog) toward the world point (x, z) until the player is
+ *                     within r (default 100) of it, at most n polls (default 3600); the stick follows the camera
+ *                     every poll (smo_nerve.c nerve_steer). Keys of the step after it are not held meanwhile. Ends
+ *                     early when a cutscene has had the player (PlayerActorHakoniwaNrvDemo or Bind) for 10 polls, or
+ *                     when another stage has started (a new player object). Stuck rule: when the player moved less
+ *                     than 30 units in 12 polls, A is held for 14 polls (a jump, e.g. up a step), then not again for
+ *                     10 polls
+ *   @until-nerve:<name>:<keys>/<period>  SMO: press the keys (8 polls) every <period> polls until the nerve <name>
+ *                     runs, e.g. @until-nerve:StageSceneNrvPlay:Z/30 to advance a talk until play resumes
+ *   @chase:<prefix>[,<r>]/<n>  SMO, exploration aid: for n polls, steer toward the actor whose nerve name starts with
+ *                     prefix (its position now), standing still while within r (default 300) of it
+ *   @at:<x>,<y>,<z>[,<r>]  SMO: wait until the player is within r (default 300) of the point, e.g. where a new stage
+ *                     puts him after a door
+ *   @near:<prefix>[,<r>][/<n>]  SMO: steer toward that actor until the player is within r (default 250) of it, at most
+ *                     n polls (default 1200); the player then faces it, e.g. "@near:FrogNrv 4:V" throws the cap at a frog
  *   @draws:<lo>-<hi>[/<n>]  wait until the presented frames had between lo and hi draw calls for n polls in a
  *                     row (default 20): a screen is recognised by its draw count (nvn_gl.c reports it per frame),
  *                     whatever the loading time was
@@ -103,11 +120,14 @@ static int script_key(int vk) {
  *   <n>               wait n polls
  *   <n>:<keys>[/<h>]  wait n polls, then hold the keys for h polls (default 8); keys as in SMO_SCRIPT
  * Example: "@movie 90:Z 120:Z @draws:150-200 300:u/40 10:Z". Each step is announced with the poll number and the
- * draw count of the last frame. tests\seq_battle.txt is the sequence from boot to a battle (tests\run_battle.sh). */
+ * draw count of the last frame. SMO: tests\cap_kingdom.seq is the scripted Cap Kingdom run (tests\run_cap_kingdom.py). */
 #define SEQ_MAX 256
 #define MARK_MAX 128
-enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL };
-static struct { int wait, hold, kind, lo, hi, need; char keys[12]; char mark[40]; } g_seq[SEQ_MAX];
+enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL, SEQ_GOTO, SEQ_CHASE, SEQ_UNTIL_NERVE, SEQ_NEAR, SEQ_AT };
+static struct { int wait, hold, kind, lo, hi, need; char keys[12]; char mark[96]; float gx, gy, gz, gr; } g_seq[SEQ_MAX];
+static int g_steer_on;                                    /* SEQ_GOTO: the left stick of player 1 is g_steer_x, g_steer_y */
+static float g_steer_x, g_steer_y;
+static int g_jump_left, g_jump_cool;                      /* SEQ_GOTO stuck rule: A held while g_jump_left > 0 */
 static int g_seq_count = -1, g_seq_index, g_seq_left, g_seq_holding, g_seq_run;
 static char g_marks[MARK_MAX][40];
 static volatile LONG g_mark_count, g_frame_draws_seen = -1;
@@ -137,9 +157,9 @@ static void seq_tick(void) {                              /* once per poll of pl
         const char *s = getenv("SMO_SEQ");
         g_seq_count = 0;
         while (s && *s && g_seq_count < SEQ_MAX) {
-            char tok[60];
+            char tok[128];
             int used = 0;
-            if (sscanf(s, " %59[^ \t\r\n]%n", tok, &used) < 1) break;
+            if (sscanf(s, " %127[^ \t\r\n]%n", tok, &used) < 1) break;
             s += used;
             memset(&g_seq[g_seq_count], 0, sizeof g_seq[0]);
             g_seq[g_seq_count].hold = 8;
@@ -154,6 +174,35 @@ static void seq_tick(void) {                              /* once per poll of pl
                 g_seq[g_seq_count].kind = SEQ_DRAWS;
                 g_seq[g_seq_count].need = 20;
                 if (sscanf(tok + 7, "%d-%d/%d", &g_seq[g_seq_count].lo, &g_seq[g_seq_count].hi, &g_seq[g_seq_count].need) < 2) { printf("input sequence: bad step %s\n", tok); break; }
+            } else if (!strncmp(tok, "@goto:", 6)) {
+                g_seq[g_seq_count].kind = SEQ_GOTO;
+                g_seq[g_seq_count].gr = 100;
+                g_seq[g_seq_count].wait = 3600;
+                const char *sl = strchr(tok + 6, '/');
+                if (sscanf(tok + 6, "%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 2 ||
+                    (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
+            } else if (!strncmp(tok, "@until-nerve:", 13)) {
+                g_seq[g_seq_count].kind = SEQ_UNTIL_NERVE;
+                const char *k = strchr(tok + 13, ':');
+                if (sscanf(tok + 13, "%95[^:]", g_seq[g_seq_count].mark) < 1 || !k ||
+                    sscanf(k + 1, "%11[^/]/%d", g_seq[g_seq_count].keys, &g_seq[g_seq_count].wait) < 2 || g_seq[g_seq_count].wait < 9) {
+                    printf("input sequence: bad step %s\n", tok); break;
+                }
+            } else if (!strncmp(tok, "@at:", 4)) {
+                g_seq[g_seq_count].kind = SEQ_AT;
+                g_seq[g_seq_count].gr = 300;
+                if (sscanf(tok + 4, "%f,%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gy, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 3) {
+                    printf("input sequence: bad step %s\n", tok); break;
+                }
+            } else if (!strncmp(tok, "@chase:", 7) || !strncmp(tok, "@near:", 6)) {
+                int is_near = tok[1] == 'n';
+                const char *b = tok + (is_near ? 6 : 7);
+                g_seq[g_seq_count].kind = is_near ? SEQ_NEAR : SEQ_CHASE;
+                g_seq[g_seq_count].gr = is_near ? 250.0f : 300.0f;
+                g_seq[g_seq_count].wait = 1200;
+                const char *cm = strchr(b, ','), *sl = strchr(b, '/');
+                if (sscanf(b, "%95[^,/]", g_seq[g_seq_count].mark) < 1 || (!sl && !is_near) || (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1) ||
+                    (cm && (!sl || cm < sl) && sscanf(cm + 1, "%f", &g_seq[g_seq_count].gr) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
             } else if (tok[0] == '@') {
                 g_seq[g_seq_count].kind = SEQ_MARK;
                 strncpy(g_seq[g_seq_count].mark, tok + 1, sizeof g_seq[0].mark - 1);
@@ -169,9 +218,114 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (every < 0) every = getenv("SMO_SEQ_LOG") ? atoi(getenv("SMO_SEQ_LOG")) : 0;
         if (every > 0 && g_seq_polls % every == 0) printf("input sequence: poll %lld: %ld draws\n", (long long)g_seq_polls, g_frame_draws_seen);
     }
+    g_steer_on = 0;
+    if (g_jump_left > 0 && --g_jump_left == 0) g_jump_cool = 10;
+    else if (g_jump_cool > 0) g_jump_cool--;
     if (g_seq_index >= g_seq_count) return;
+    if (g_seq[g_seq_index].kind == SEQ_GOTO) {
+        int nerve_steer(float tx, float tz, float r, float *sx, float *sy, float *dist);      /* smo_nerve.c */
+        int nerve_player(float pos[3]);
+        long long nvn_front_frame_next(void);
+        float sx = 0, sy = 0, d = 0, p[3] = {0, 0, 0};
+        static float last[3];                             /* stuck rule: the position 12 polls ago */
+        static int since, jumps;
+        static uint64_t actor;                            /* the player object when the step began: another one = a new stage */
+        uint64_t nerve_player_actor(void);
+        int r = nerve_steer(g_seq[g_seq_index].gx, g_seq[g_seq_index].gz, g_seq[g_seq_index].gr, &sx, &sy, &d);
+        if (g_seq_run == 0) {
+            nerve_player(p);
+            memcpy(last, p, sizeof last); since = 0; jumps = 0; actor = nerve_player_actor();
+            printf("input sequence: poll %lld step %d: goto %.0f %.0f from %.1f %.1f %.1f (%.0f away)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].gx, g_seq[g_seq_index].gz, p[0], p[1], p[2], d);
+        }
+        g_seq_run++;
+        const char *nerve_player_nerve(void);
+        static int in_demo;                               /* polls in a row the player has been in a cutscene or bound (walking in at a door) */
+        const char *pn = nerve_player_nerve();
+        in_demo = g_seq_run == 1 ? 0 : !strcmp(pn, "PlayerActorHakoniwaNrvDemo") || !strcmp(pn, "PlayerActorHakoniwaNrvBind") ? in_demo + 1 : 0;
+        int new_stage = nerve_player_actor() != actor;
+        if (r == 1 || g_seq_run > g_seq[g_seq_index].wait || in_demo >= 10 || new_stage) {
+            nerve_player(p);
+            printf("input sequence: poll %lld step %d: goto %.0f %.0f %s after %d polls (%d jumps) at %.1f %.1f %.1f (frame %lld)\n", (long long)g_seq_polls, g_seq_index,
+                   g_seq[g_seq_index].gx, g_seq[g_seq_index].gz, r == 1 ? "reached" : new_stage ? "ended by a new stage" : in_demo >= 10 ? "ended by a cutscene" : "GAVE UP",
+                   g_seq_run, jumps, p[0], p[1], p[2], nvn_front_frame_next());
+            g_jump_left = 0;
+            seq_begin(g_seq_index + 1);
+            return;
+        }
+        if (r == 0) {
+            g_steer_on = 1; g_steer_x = sx; g_steer_y = sy;
+            if (++since >= 12) {
+                nerve_player(p);
+                if (hypotf(p[0] - last[0], p[2] - last[2]) < 30 && !g_jump_left && !g_jump_cool) { g_jump_left = 14; jumps++; }
+                memcpy(last, p, sizeof last); since = 0;
+            }
+        }
+        return;
+    }
+    if (g_seq[g_seq_index].kind == SEQ_UNTIL_NERVE) {
+        int nerve_active(const char *name);               /* smo_nerve.c */
+        long long nvn_front_frame_next(void);
+        if (nerve_active(g_seq[g_seq_index].mark)) {
+            printf("input sequence: poll %lld step %d: nerve:%s seen after %d polls (frame %lld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].mark, g_seq_run, nvn_front_frame_next());
+            seq_begin(g_seq_index + 1);
+            return;
+        }
+        if (g_seq_run == 0) printf("input sequence: poll %lld step %d: keys %s every %d polls until nerve:%s\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, g_seq[g_seq_index].wait, g_seq[g_seq_index].mark);
+        g_seq_holding = g_seq_run % g_seq[g_seq_index].wait < 8;      /* seq_key holds the step's keys while this is set */
+        g_seq_run++;
+        return;
+    }
+    if (g_seq[g_seq_index].kind == SEQ_AT) {
+        int nerve_player(float pos[3]);
+        long long nvn_front_frame_next(void);
+        float p[3];
+        if (nerve_player(p)) {
+            float dx = p[0] - g_seq[g_seq_index].gx, dy = p[1] - g_seq[g_seq_index].gy, dz = p[2] - g_seq[g_seq_index].gz;
+            if (sqrtf(dx * dx + dy * dy + dz * dz) <= g_seq[g_seq_index].gr) {
+                printf("input sequence: poll %lld step %d: player at %.1f %.1f %.1f, within %.0f of %.0f %.0f %.0f after %d polls (frame %lld)\n", (long long)g_seq_polls, g_seq_index,
+                       p[0], p[1], p[2], g_seq[g_seq_index].gr, g_seq[g_seq_index].gx, g_seq[g_seq_index].gy, g_seq[g_seq_index].gz, g_seq_run, nvn_front_frame_next());
+                seq_begin(g_seq_index + 1);
+                return;
+            }
+        }
+        g_seq_run++;
+        return;
+    }
+    if (g_seq[g_seq_index].kind == SEQ_CHASE || g_seq[g_seq_index].kind == SEQ_NEAR) {
+        int nerve_steer(float tx, float tz, float r, float *sx, float *sy, float *dist);      /* smo_nerve.c */
+        int nerve_actor_pos(const char *prefix, float pos[3]);
+        int nerve_player(float pos[3]);
+        long long nvn_front_frame_next(void);
+        int is_near = g_seq[g_seq_index].kind == SEQ_NEAR;
+        float t[3], p[3] = {0, 0, 0}, sx = 0, sy = 0, d = 0;
+        int have = nerve_actor_pos(g_seq[g_seq_index].mark, t), r = have ? nerve_steer(t[0], t[2], g_seq[g_seq_index].gr, &sx, &sy, &d) : -1;
+        if (g_seq_run == 0) printf("input sequence: poll %lld step %d: %s %s for at most %d polls (%s)\n", (long long)g_seq_polls, g_seq_index, is_near ? "near" : "chase",
+                                   g_seq[g_seq_index].mark, g_seq[g_seq_index].wait, have ? "found" : "not running yet");
+        if (is_near && r == 1) {
+            nerve_player(p);
+            printf("input sequence: poll %lld step %d: near %s reached after %d polls: player %.1f %.1f %.1f, actor %.1f %.1f %.1f (frame %lld)\n", (long long)g_seq_polls, g_seq_index,
+                   g_seq[g_seq_index].mark, g_seq_run, p[0], p[1], p[2], t[0], t[1], t[2], nvn_front_frame_next());
+            seq_begin(g_seq_index + 1);
+            return;
+        }
+        if (++g_seq_run > g_seq[g_seq_index].wait) {
+            nerve_player(p);
+            printf("input sequence: poll %lld step %d: %s %s %s at %.1f %.1f %.1f\n", (long long)g_seq_polls, g_seq_index, is_near ? "near" : "chase", g_seq[g_seq_index].mark,
+                   is_near ? "GAVE UP" : "ended", p[0], p[1], p[2]);
+            seq_begin(g_seq_index + 1);
+            return;
+        }
+        if (r == 0) { g_steer_on = 1; g_steer_x = sx; g_steer_y = sy; }
+        return;
+    }
     if (g_seq[g_seq_index].kind == SEQ_MARK) {
-        if (mark_seen(g_seq[g_seq_index].mark)) { printf("input sequence: poll %lld step %d: %s seen\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].mark); seq_begin(g_seq_index + 1); }
+        int nerve_active(const char *name);               /* smo_nerve.c */
+        const char *mk = g_seq[g_seq_index].mark;
+        if (!strncmp(mk, "nerve:", 6) ? nerve_active(mk + 6) : mark_seen(mk)) {
+            long long nvn_front_frame_next(void);
+            printf("input sequence: poll %lld step %d: %s seen (frame %lld)\n", (long long)g_seq_polls, g_seq_index, mk, nvn_front_frame_next());
+            seq_begin(g_seq_index + 1);
+        }
         return;
     }
     if (g_seq[g_seq_index].kind == SEQ_UNTIL) {
@@ -215,6 +369,7 @@ static void seq_tick(void) {                              /* once per poll of pl
 }
 
 static int seq_key(int vk) {
+    if (g_jump_left > 0 && vk == 'Z') return 1;           /* SEQ_GOTO stuck rule: jump */
     if (g_seq_count <= 0 || g_seq_index >= g_seq_count || !g_seq_holding) return 0;
     for (const char *k = g_seq[g_seq_index].keys; *k; k++) if (script_vk(*k) == vk) return 1;
     return 0;
@@ -536,7 +691,8 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (key_for(id, map[i].vk, map[i].bit)) buttons |= 1ull << map[i].bit;
         lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
         ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
-        if (sdl_on()) { rx = (key_for(id, 0, 22) - key_for(id, 0, 20)) * STICK_MAX; ry = (key_for(id, 0, 21) - key_for(id, 0, 23)) * STICK_MAX; }
+        if (sdl_on() || id == 0) { rx = (key_for(id, '6', 22) - key_for(id, '4', 20)) * STICK_MAX; ry = (key_for(id, '8', 21) - key_for(id, '2', 23)) * STICK_MAX; }      /* SMO: digits 8 2 4 6 = right stick in the test scripts */
+        if (id == 0 && g_steer_on) { lx = (int)(g_steer_x * STICK_MAX); ly = (int)(g_steer_y * STICK_MAX); }     /* SMO_SEQ @goto */
     }
     int slot = g_source[id];
     if (sdl_on()) {
@@ -627,6 +783,14 @@ static void npad_states(Ctx *c, int style) {
     if (r->n < NPAD_RING) r->n++;
     wr64((uint64_t)(uintptr_t)now, (uint64_t)++r->sampling);
     memcpy(r->rec[r->head], now, 0x28);
+    {   static int on = -1, said; if (on < 0) on = getenv("SMO_HIDLOG") != NULL;      /* SMO debug aid: what the game is given, when buttons or sticks change */
+        static uint8_t last[10][5][0x20];
+        if (on && said < 200 && memcmp(last[slot][style], now + 8, 0x20)) {
+            memcpy(last[slot][style], now + 8, 0x20); said++;
+            printf("hidlog: GetNpadStates(style %d, id %x, count %d) buttons %016llx L %d %d R %d %d attr %x\n", style, id, count, (unsigned long long)rd64((uint64_t)(uintptr_t)now + 8),
+                   (int)rd32((uint64_t)(uintptr_t)now + 0x10), (int)rd32((uint64_t)(uintptr_t)now + 0x14), (int)rd32((uint64_t)(uintptr_t)now + 0x18), (int)rd32((uint64_t)(uintptr_t)now + 0x1c), rd32((uint64_t)(uintptr_t)now + 0x20));
+        }
+    }
     int k = count < r->n ? count : r->n;
     for (int i = 0; i < k; i++) memcpy((void *)(uintptr_t)(out + (uint64_t)i * 0x28), r->rec[(r->head - i + NPAD_RING) % NPAD_RING], 0x28);
     RET(k);

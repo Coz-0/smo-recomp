@@ -136,6 +136,88 @@ static void rs_Stop(Ctx *c) {
     ReleaseSRWLockExclusive(&g_sys_lock);
     stop(c);
 }
+/* ---- THE SOUND: the device sink's channels go to the PC through waveOut (48 kHz, 16-bit, stereo).
+ * DeviceSinkCommand [sdk 0x18aab8 GenerateDeviceSinkCommand]: magic 0xcafebabe, u16 size 0x130, u16 type 0xf, +0x10 enabled,
+ * +0x14 device name (256), +0x114 session, +0x118 sample buffer (the upsampler's output when the renderer does not run at
+ * 48 kHz; 0 otherwise), +0x120 input count, +0x124 mix buffer index per channel (u8, already offset). Mix buffers are int32
+ * samples, buffer i at GetMixBuffers() + i * sample count; the device takes them as 16-bit (clamped). Frames of 5 ms are
+ * gathered into blocks of 40 ms; 16 blocks in flight at most (the oldest pending audio is dropped and counted if the
+ * device falls behind; a block the device finished before the next one was ready is counted as an underrun). */
+#include <mmsystem.h>
+static float g_dev_volume[3];                    /* defined with its values below (the device layer) */
+#define SINK_BLOCK 1920                           /* frames per waveOut block (40 ms at 48 kHz) */
+#define SINK_NBLK 16
+static HWAVEOUT g_wo;
+static WAVEHDR g_wh[SINK_NBLK];
+static int16_t g_wbuf[SINK_NBLK][SINK_BLOCK * 2];
+static int g_wcur, g_wfill, g_wopen = -1, g_wstarted;
+static LONG64 g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
+static uint32_t g_sink_peak;
+static FILE *g_wav;                               /* SMO_AUDIO_WAV=<file>: what goes to the device, as a WAV file (header completed at exit) */
+static uint32_t g_wav_frames;
+static void wav_header(void) {
+    uint32_t data = g_wav_frames * 4, riff = 36 + data, fmt = 16, rate = 48000, bps = 48000 * 4;
+    uint16_t pcm = 1, ch = 2, align = 4, bits = 16;
+    fseek(g_wav, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, g_wav); fwrite(&riff, 4, 1, g_wav); fwrite("WAVEfmt ", 1, 8, g_wav); fwrite(&fmt, 4, 1, g_wav);
+    fwrite(&pcm, 2, 1, g_wav); fwrite(&ch, 2, 1, g_wav); fwrite(&rate, 4, 1, g_wav); fwrite(&bps, 4, 1, g_wav); fwrite(&align, 2, 1, g_wav); fwrite(&bits, 2, 1, g_wav);
+    fwrite("data", 1, 4, g_wav); fwrite(&data, 4, 1, g_wav);
+    fseek(g_wav, 0, SEEK_END); fflush(g_wav);
+}
+static void sink_open(void) {
+    if (getenv("SMO_AUDIO_WAV")) { g_wav = fopen(getenv("SMO_AUDIO_WAV"), "wb"); if (g_wav) wav_header(); }
+    WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
+    if (getenv("SMO_AUDIO") && !atoi(getenv("SMO_AUDIO"))) { g_wopen = 0; printf("smo_audio: sound output off (SMO_AUDIO=0)\n"); return; }
+    MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
+    g_wopen = r == MMSYSERR_NOERROR;
+    printf("smo_audio: sound output: %s\n", g_wopen ? "waveOut, 48000 Hz, 16-bit stereo, 40 ms blocks" : "waveOutOpen FAILED: no sound");
+    if (g_wopen) waveOutPause(g_wo);
+}
+static void sink_submit(void) {                   /* the block g_wcur is full */
+    WAVEHDR *h = &g_wh[g_wcur];
+    if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(g_wo, h, sizeof *h);
+    memset(h, 0, sizeof *h);
+    h->lpData = (LPSTR)g_wbuf[g_wcur]; h->dwBufferLength = SINK_BLOCK * 4;
+    waveOutPrepareHeader(g_wo, h, sizeof *h);
+    waveOutWrite(g_wo, h, sizeof *h);
+    g_sink_blocks++;
+    if (!g_wstarted && g_sink_blocks >= 3) { waveOutRestart(g_wo); g_wstarted = 1; }      /* 120 ms queued before playing */
+    else if (g_wstarted) {                       /* everything before this one already played: the device waited for us */
+        int busy = 0;
+        for (int i = 0; i < SINK_NBLK; i++) if (i != g_wcur && (g_wh[i].dwFlags & WHDR_PREPARED) && !(g_wh[i].dwFlags & WHDR_DONE)) busy = 1;
+        if (!busy) g_sink_underruns++;
+    }
+    g_wcur = (g_wcur + 1) % SINK_NBLK; g_wfill = 0;
+}
+static void audio_sink_out(const uint8_t *cmd, uint64_t mb, uint32_t ns) {
+    uint32_t nin; uint64_t sbuf;
+    memcpy(&nin, cmd + 0x120, 4); memcpy(&sbuf, cmd + 0x118, 8);
+    if (g_wopen < 0) {
+        sink_open();
+        printf("smo_audio: device sink \"%.32s\": %u channels, mix buffers %u %u %u %u %u %u, %u samples per frame, sample buffer %llx\n",
+               (const char *)(cmd + 0x14), nin, cmd[0x124], cmd[0x125], cmd[0x126], cmd[0x127], cmd[0x128], cmd[0x129], ns, (unsigned long long)sbuf);
+    }
+    if (!g_wopen || !mb || !ns || nin == 0 || nin > 6) return;
+    if (ns != 240) { static int said; if (!said++) printf("smo_audio: the renderer does not run at 48 kHz (%u samples per 5 ms frame): its upsampler output is NOT IMPLEMENTED, no sound\n", ns); return; }
+    /* +0x118 is always filled ([sdk 0x18ad4c]: the translated upsampler buffer, or the caller's argument): at 48 kHz the sink reads the mix buffers */
+    const int32_t *L = (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x124] * ns * 4), *R = (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x124 + (nin > 1)] * ns * 4);
+    const int32_t *C = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x126] * ns * 4) : NULL;      /* 6 channels: FL FR FC LFE BL BR; FC and the backs folded in */
+    const int32_t *BL = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x128] * ns * 4) : NULL, *BR = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x129] * ns * 4) : NULL;
+    float vol = g_dev_volume[0];
+    for (uint32_t i = 0; i < ns; i++) {
+        float l = (float)L[i], r = (float)R[i];
+        if (C) { l += 0.707f * (float)C[i] + 0.707f * (float)BL[i]; r += 0.707f * (float)C[i] + 0.707f * (float)BR[i]; }
+        l *= vol; r *= vol;
+        int32_t li = (int32_t)(l < -32768.f ? -32768.f : l > 32767.f ? 32767.f : l), ri = (int32_t)(r < -32768.f ? -32768.f : r > 32767.f ? 32767.f : r);
+        uint32_t a = (uint32_t)(li < 0 ? -li : li); if (a > g_sink_peak) g_sink_peak = a;
+        if (g_wfill == 0 && (g_wh[g_wcur].dwFlags & WHDR_PREPARED) && !(g_wh[g_wcur].dwFlags & WHDR_DONE)) { g_sink_dropped += ns - i; return; }    /* all 16 blocks still queued */
+        g_wbuf[g_wcur][g_wfill * 2] = (int16_t)li; g_wbuf[g_wcur][g_wfill * 2 + 1] = (int16_t)ri;
+        if (g_wav) { int16_t fr[2] = {(int16_t)li, (int16_t)ri}; fwrite(fr, 4, 1, g_wav); g_wav_frames++; }
+        if (++g_wfill == SINK_BLOCK) sink_submit();
+    }
+    g_sink_frames++;
+}
+
 /* dsp::SendCommandBuffer(int session, DspAddr list, size_t size, int ?, bool ?, u64 ?) */
 static void dsp_SendCommandBuffer(Ctx *c) {
     static ImportFn tmax, setup, process;
@@ -147,6 +229,22 @@ static void dsp_SendCommandBuffer(Ctx *c) {
     c->x[0] = p; c->x[1] = 0xffffffffu; tmax(c);
     c->x[0] = p; c->x[1] = list; c->x[2] = size; setup(c);
     c->x[0] = p; process(c);
+    {   /* the device sink: skipped by this SDK's processor (jump table [sdk 0x77c38c] entry 0xf -> next command); on a
+         * console the audio DSP firmware outputs it. Here: its channels, read from the mix buffers after the list ran. */
+        static ImportFn mixbufs, scount;
+        if (!scount) { mixbufs = lifted("_ZNK2nn5audio3dsp20CommandListProcessor13GetMixBuffersEv"); scount = lifted("_ZNK2nn5audio3dsp20CommandListProcessor14GetSampleCountEv"); }
+        c->x[0] = p; mixbufs(c); uint64_t mb = c->x[0];
+        c->x[0] = p; scount(c); uint32_t ns = (uint32_t)c->x[0];
+        for (uint64_t o = 0; o + 0x10 <= size;) {           /* the list: a header, then commands {magic 0xcafebabe, u16 size, u16 type, ...} */
+            const uint8_t *cmd = (const uint8_t *)(uintptr_t)(list + o);
+            uint32_t magic; uint16_t csz, type;
+            memcpy(&magic, cmd, 4); memcpy(&csz, cmd + 4, 2); memcpy(&type, cmd + 6, 2);
+            if (magic != 0xcafebabeu) { o += 4; continue; }
+            if (type == 0xf && cmd[0x10]) audio_sink_out(cmd, mb, ns);
+            if (csz < 0x10) break;
+            o += csz;
+        }
+    }
     c->x[30] = lr;
     InterlockedIncrement64(&g_lists);
     InterlockedAdd64(&g_commands_bytes, (LONG64)size);
@@ -195,9 +293,12 @@ static void dev_event_output(Ctx *c) { dev_event(c, 2); }
 static void dev_channels(Ctx *c) { c->x[0] = 2; }
 
 void smo_audio_report(FILE *out) {
+    if (g_wav) { wav_header(); fclose(g_wav); g_wav = NULL; fprintf(out, "audio: %u frames (%.1f s) written to %s\n", g_wav_frames, g_wav_frames / 48000.0, getenv("SMO_AUDIO_WAV")); }
     if (g_mgr_by_hipc) fprintf(out, "audio: renderer manager requests answered in-process: %llu\n", g_mgr_by_hipc);
     fprintf(out, "audio: renderers running %d, frames clocked %lld, command lists processed %lld (%lld bytes)\n",
             g_nsys, (long long)g_frames, (long long)g_lists, (long long)g_commands_bytes);
+    fprintf(out, "audio: device sink: %lld frames output, %lld blocks of 40 ms queued, %lld samples dropped (device behind), %lld underruns (device waited), peak level %u of 32767\n",
+            (long long)g_sink_frames, (long long)g_sink_blocks, (long long)g_sink_dropped, (long long)g_sink_underruns, g_sink_peak);
 }
 
 void register_smo_audio(void) {

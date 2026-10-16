@@ -5,7 +5,7 @@
  * 1 function list); the console supplied the driver. So nothing can be lifted, and the answers come from the layout
  * engine of tex_decode.c (tex_layout), the same rules ssbu-recomp's own texture code used.
  *
- * Verified (tools/test/bntx_layout_check.py, 2026-10-15): for all 19,325 textures in SMO's RomFS (4,335 archives) the
+ * Verified (tests/bntx_layout_check.py, 2026-10-15): for all 19,325 textures in SMO's RomFS (4,335 archives) the
  * storage size, the block height and the offset of every mip level computed here are equal to the values Nintendo's
  * tools stored in the BNTX texture records. What that check does NOT cover, and how it is answered:
  *   - alignment: BNTX stores 512 for every texture (the container's data alignment), so it is no reference. The value
@@ -74,6 +74,6 @@ int nvn_sdk_tex_storage_size(Ctx *c, const NvnSdkTexBuilder *b, uint32_t *out) {
 
 int nvn_sdk_selftest(Ctx *c) {
     (void)c;
-    printf("  nvn storage: computed for SMO (no lifted driver); verified offline by tools/test/bntx_layout_check.py\n");
+    printf("  nvn storage: computed for SMO (no lifted driver); verified offline by tests/bntx_layout_check.py\n");
     return 0;
 }

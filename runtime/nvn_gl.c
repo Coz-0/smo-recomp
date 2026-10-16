@@ -1986,11 +1986,12 @@ static const char *const k_op_name[OP_COUNT] = {
     "DispatchComputeIndirect", "SetRenderEnable", "ResetCounter", "ReportCounter", "ReportValue", "FenceSync", "WaitSync", "SignalEvent", "WaitEvent",
     "BindCoverageModulationTable", "DebugGroup", "DrawTexture"};
 
-typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used; } List;
+typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used, seq; uint64_t blk[4][3]; int nblk; } List;
 static List *g_lists;
 static int g_list_count, g_list_cap, *g_list_free, g_list_free_n;
-static size_t g_list_bytes;                    /* recorded command lists held, bytes (list_collect's budget) */
-static LONG64 g_list_budget_drops;
+static size_t g_list_bytes, g_list_bytes_max;  /* recorded command lists held, bytes (list_collect's budget), and the most held */
+static LONG64 g_list_budget_drops, g_list_final_drops, g_list_reuse_drops, g_list_reuse_events;
+static volatile LONG64 g_list_seq;             /* lists registered so far: a list's seq orders it against command memory reuse */
 static SRWLOCK g_list_lock = SRWLOCK_INIT;
 
 static CmdBuf *cb_get(uint64_t g) {
@@ -2026,7 +2027,7 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
     return m;
 }
 
-static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches) {
+static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches, const CmdBuf *cb, LONG64 *seq) {
     AcquireSRWLockExclusive(&g_list_lock);
     int i;
     if (g_list_free_n) i = g_list_free[--g_list_free_n];
@@ -2041,7 +2042,12 @@ static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uin
     }
     if (!data) { data = malloc(8); len = 0; }      /* SMO port: an empty recording is a valid handle (replays nothing); before, it read as "unknown or expired" */
     g_lists[i].data = data; g_lists[i].len = len; g_lists[i].created = g_st.frames; g_lists[i].used = -1; g_list_bytes += len;
+    if (g_list_bytes > g_list_bytes_max) g_list_bytes_max = g_list_bytes;
     g_lists[i].model_cmd = model_cmd; g_lists[i].model_ctrl = model_ctrl; g_lists[i].dispatches = dispatches; g_lists[i].finalized = 0;
+    g_lists[i].seq = InterlockedIncrement64(&g_list_seq);
+    if (seq) *seq = g_lists[i].seq;
+    g_lists[i].nblk = cb ? cb->rec_nblk : 0;
+    if (cb) memcpy(g_lists[i].blk, cb->rec_blk, sizeof g_lists[i].blk);
     uint64_t h = ((uint64_t)(g_lists[i].gen & 0x7fffffff) << 32) | (uint32_t)(i + 1);
     ReleaseSRWLockExclusive(&g_list_lock);
     InterlockedIncrement64(&g_st.lists);
@@ -2055,12 +2061,33 @@ static uint8_t *list_lookup(uint64_t h, size_t *len) {
     ReleaseSRWLockShared(&g_list_lock);
     return data;
 }
-/* Render thread, once per frame: drop lists not submitted for a while (NVN has no call that frees a command handle). */
-/* SMO port: a handle the game never finalized is NOT dropped for age alone any more. SMO records command lists once at
- * loading (the title screen's Mario among them) and replays them first much later; dropping them after 120 unused frames
- * made those draws vanish ("command handle ... unknown or expired"; boot107: no colour draw of the title Mario at all).
- * Unfinalized lists are kept until all lists together exceed a memory budget (SMO_LIST_BUDGET_MB, default 768); then the
- * least recently used ones that have been idle for 120 frames go first, down to three quarters of the budget. */
+/* When a recorded list is over. In NVN a command handle names commands in the game's own command memory: it stays valid
+ * until the game finalizes it (nvnDeviceFinalizeCommandHandle) or records new commands over that memory. SMO hands the
+ * same blocks out again every frame (a 4 MB block in two pools taken in turn, a 512 KB block every frame; SMO_CMDMEMLOG)
+ * and a new recording overwrites only as far as it reaches, so lists further into a block live on and are submitted
+ * again: killing every list of a block handed out again left 1,665,359 unknown handles in boot162. So each list keeps
+ * where it was written (pool offsets: block start + the model's write position, see rec), and a new list ends the older
+ * lists it overlaps. Both rules are applied in submission order (queued behind the submits already issued, which may
+ * still name the list) and list_collect frees those lists. SMO also records lists once at loading and replays them only
+ * when their part of the world is in view, so a list unused for long is not over (boot107: the title Mario; boot160:
+ * scenery at Top-Hat Tower's door gone in every other frame after a budget rule had dropped "idle" lists). A memory
+ * budget (SMO_LIST_BUDGET_MB, default 4096) stays as a last resort and says when it drops lists, as they can be live. */
+typedef struct { uint64_t seg[4][3]; int nseg; LONG64 seq; } Overwrite;
+static void job_list_overwrite(void *arg) {            /* lists registered before seq that overlap one of the pieces are over */
+    const Overwrite *w = arg;
+    AcquireSRWLockExclusive(&g_list_lock);
+    g_list_reuse_events++;
+    for (int i = 0; i < g_list_count; i++) {
+        List *l = &g_lists[i];
+        if (!l->data || l->finalized || l->seq >= w->seq) continue;
+        int hit = 0;
+        for (int k = 0; k < l->nblk && k < 4 && !hit; k++)
+            for (int j = 0; j < w->nseg && j < 4 && !hit; j++)
+                hit = l->blk[k][0] == w->seg[j][0] && l->blk[k][1] < w->seg[j][2] && w->seg[j][1] < l->blk[k][2];
+        if (hit) { l->finalized = 2; g_list_reuse_drops++; }
+    }
+    ReleaseSRWLockExclusive(&g_list_lock);
+}
 static int list_lru_cmp(const void *a, const void *b) {
     const List *x = &g_lists[*(const int *)a], *y = &g_lists[*(const int *)b];
     LONG64 lx = x->used >= 0 ? x->used : x->created, ly = y->used >= 0 ? y->used : y->created;
@@ -2069,9 +2096,10 @@ static int list_lru_cmp(const void *a, const void *b) {
 static void list_drop(int i) { List *l = &g_lists[i]; g_list_bytes -= l->len; free(l->data); l->data = NULL; l->gen++; g_list_free[g_list_free_n++] = i; }
 static void list_collect(void) {
     static size_t budget;
-    if (!budget) { const char *e = getenv("SMO_LIST_BUDGET_MB"); budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 768) << 20; }
+    if (!budget) { const char *e = getenv("SMO_LIST_BUDGET_MB"); budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 4096) << 20; }
     AcquireSRWLockExclusive(&g_list_lock);
-    for (int i = 0; i < g_list_count; i++) if (g_lists[i].data && g_lists[i].finalized) list_drop(i);      /* finalized by the game */
+    for (int i = 0; i < g_list_count; i++)
+        if (g_lists[i].data && g_lists[i].finalized) { if (g_lists[i].finalized == 1) g_list_final_drops++; list_drop(i); }      /* finalized by the game, or its memory reused */
     if (g_list_bytes > budget) {
         int *cand = malloc(sizeof *cand * (size_t)g_list_count), nc = 0;
         for (int i = 0; i < g_list_count; i++) {
@@ -2082,7 +2110,7 @@ static void list_collect(void) {
         qsort(cand, (size_t)nc, sizeof *cand, list_lru_cmp);
         LONG64 d0 = g_list_budget_drops;
         for (int k = 0; k < nc && g_list_bytes > budget / 4 * 3; k++) { list_drop(cand[k]); g_list_budget_drops++; }
-        { static int nl; if (nl++ < 20) printf("nvn: command lists over the budget (%zu MB): %lld idle lists dropped, %zu MB kept\n", budget >> 20, (long long)(g_list_budget_drops - d0), g_list_bytes >> 20); }
+        { static int nl; if (nl++ < 20) printf("nvn: command lists over the budget (%zu MB): %lld idle lists dropped, %zu MB kept (WARNING: the game may still submit some of them)\n", budget >> 20, (long long)(g_list_budget_drops - d0), g_list_bytes >> 20); }
         free(cand);
     }
     ReleaseSRWLockExclusive(&g_list_lock);
@@ -3739,6 +3767,8 @@ void nvn_gl_start(void *hwnd) {
 void nvn_gl_report(FILE *out) {
     fprintf(out, "\nnvn_gl: %lld frames, %lld batches, %lld command lists (%lld unknown handles), %lld draws (+%lld skipped), %lld clears, %lld copies\n", (long long)g_st.frames,
             (long long)g_st.submits, (long long)g_st.lists, (long long)g_st.stale, (long long)g_st.draws, (long long)g_st.draws_skipped, (long long)g_st.clears, (long long)g_st.copies);
+    fprintf(out, "nvn: command lists freed: %lld finalized by the game, %lld written over by newer lists (%lld recordings checked), %lld by the budget; most held %zu MB, at exit %zu MB\n",
+            (long long)g_list_final_drops, (long long)g_list_reuse_drops, (long long)g_list_reuse_events, (long long)g_list_budget_drops, g_list_bytes_max >> 20, g_list_bytes >> 20);
     fprintf(out, "nvn_gl: textures %lld (uploads %lld, %lld MB, views %lld, bindless handles %lld, unmapped formats %lld), framebuffers %lld (%lld incomplete)\n", (long long)g_st.tex_created,
             (long long)g_st.tex_uploads, (long long)(g_st.tex_bytes >> 20), (long long)g_st.views, (long long)g_st.handles, (long long)g_st.unknown_fmt, (long long)g_st.fbo_made, (long long)g_st.fbo_bad);
     fprintf(out, "nvn_gl: nvnProgramSetShaders calls %ld, stages compiled %lld, rejected %lld, GL errors %lld, streamed %lld MB\n", (long)g_setshaders_calls, (long long)g_st.prog_ok,
@@ -3963,6 +3993,10 @@ static void prog_set_shaders_(Ctx *c) {
                          rd32(data), rd32(data + 4), rd32(data + 8), rd32(data + 12), rd32(data + 0x30), rd32(data + 0x34), rd32(data + 0x38), rd32(data + 0x3c));
             for (int k = 0; k < 3; k++) p->st[5].local[k] = rd32(control + 0x748 + (uint64_t)k * 4);      /* work group size */
             p->st[5].smem_bytes = rd32(control + 0x754); p->st[5].lmem_bytes = rd32(control + 0x758);
+            {   static int on = -1, nl; if (on < 0) on = getenv("SMO_VK_CSLOG") != NULL;      /* SMO debug aid: the compute control words as read */
+                if (on && (uint64_t)p->st[5].local[0] * p->st[5].local[1] * p->st[5].local[2] > 1024 && nl++ < 30) { printf("nvn_cs: program #%d compute %d bytes: group %u x %u x %u smem %u lmem %u | control +0x700..+0x760:", p->serial, len, p->st[5].local[0], p->st[5].local[1], p->st[5].local[2], p->st[5].smem_bytes, p->st[5].lmem_bytes);
+                    for (int k = 0; k < 24; k++) printf(" %08x", rd32(control + 0x700 + (uint64_t)k * 4));
+                    printf("\n"); } }
             if (len > 0 && len < (4 << 20)) { p->st[5].code = P(data); p->st[5].code_len = len; p->st[5].state = 4; p->st[5].dumped = 0; p->st[5].glsl_state = 0; memcpy(p->st[5].ctl, P(control + 0x6f0), 32); }
             continue;
         }
@@ -4243,16 +4277,51 @@ static void vstream_divisor(Ctx *c) { wr32(A0 + 4, (uint32_t)A1); }
 /* ---- command buffers: recording */
 static void cmd_initialize(Ctx *c) { hnew(A0, K_CMD, sizeof(CmdBuf)); RET(1); }
 static void cmd_finalize(Ctx *c) { CmdBuf *cb = hobj(A0, K_CMD); if (cb) { free(cb->data); free(cb); wr32(A0 + 8, 0); } }
-static void cmd_add_command_memory(Ctx *c) { CmdBuf *cb = cb_get(A0); cb->cmd_size = A3; cb->cmd_used = 0; }       /* (cmdbuf, pool, offset, size): a new block replaces the current one */
+static void rec_open_piece(CmdBuf *cb) {             /* the recording continues at the current write position of the current block */
+    if (!cb->blk_hi) return;
+    if (cb->rec_nblk >= 4) { cb->rec_nblk = 5; return; }
+    uint64_t at = cb->blk_lo + cb->cmd_used;
+    cb->rec_blk[cb->rec_nblk][0] = cb->blk_pool; cb->rec_blk[cb->rec_nblk][1] = at; cb->rec_blk[cb->rec_nblk][2] = at;
+    cb->rec_nblk++;
+}
+static void rec_close_piece(CmdBuf *cb) {            /* the current piece ends at the write position */
+    if (cb->rec_nblk >= 1 && cb->rec_nblk <= 4) cb->rec_blk[cb->rec_nblk - 1][2] = cb->blk_lo + cb->cmd_used;
+}
+static void cmd_add_command_memory(Ctx *c) {         /* (cmdbuf, pool, offset, size): a new block replaces the current one */
+    CmdBuf *cb = cb_get(A0);
+    if (cb->recording) rec_close_piece(cb);
+    cb->cmd_size = A3; cb->cmd_used = 0;
+    cb->blk_pool = A1; cb->blk_lo = A2; cb->blk_hi = A2 + A3;
+    if (cb->recording) rec_open_piece(cb);
+    {   static int on = -1, n;                         /* SMO_CMDMEMLOG=1: the first 400 blocks handed out, to see how the game reuses its memory */
+        if (on < 0) on = getenv("SMO_CMDMEMLOG") != NULL;
+        if (on && n++ < 400) printf("nvn_cmdmem: frame %lld cmdbuf %llx pool %llx offset %llx size %llx%s\n", (long long)g_st.frames, (unsigned long long)A0,
+                                    (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A3, cb->recording ? " (while recording)" : "");
+    }
+}
 static void cmd_add_control_memory(Ctx *c) { CmdBuf *cb = cb_get(A0); cb->ctrl_size = A2; cb->ctrl_used = 0; }     /* (cmdbuf, memory, size) */
 static void cmd_get_command_size(Ctx *c) { RET(cb_get(A0)->cmd_size); }
 static void cmd_get_control_size(Ctx *c) { RET(cb_get(A0)->ctrl_size); }
 static void cmd_is_recording(Ctx *c) { RET(cb_get(A0)->recording); }
-static void cmd_begin(Ctx *c) { CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; }
+static void cmd_begin(Ctx *c) {
+    CmdBuf *cb = cb_get(A0);
+    cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0;
+    cb->rec_nblk = 0;
+    rec_open_piece(cb);
+}
 static void cmd_end(Ctx *c) {
     CmdBuf *cb = cb_get(A0);
     cb->ctrl_used += 32; cb->rec_ctrl += 32;
-    uint64_t h = list_register(cb->data, cb->len, (uint32_t)cb->rec_cmd, (uint32_t)cb->rec_ctrl, (uint32_t)cb->dispatches);
+    rec_close_piece(cb);
+    LONG64 seq = 0;
+    uint64_t h = list_register(cb->data, cb->len, (uint32_t)cb->rec_cmd, (uint32_t)cb->rec_ctrl, (uint32_t)cb->dispatches, cb, &seq);
+    if (cb->rec_nblk >= 1 && cb->rec_nblk <= 4) {     /* older lists this one was written over are over (job_list_overwrite), after the queued submits */
+        Overwrite w;
+        memcpy(w.seg, cb->rec_blk, sizeof w.seg); w.nseg = cb->rec_nblk; w.seq = seq;
+        int any = 0;
+        for (int k = 0; k < w.nseg; k++) any |= w.seg[k][2] > w.seg[k][1];
+        if (any) { if (gl_async_on() && g_async_pending) gl_post(job_list_overwrite, &w, sizeof w); else job_list_overwrite(&w); }
+    }
     cb->data = NULL; cb->len = cb->cap = 0; cb->recording = 0;
     RET(h);
 }
@@ -5048,6 +5117,7 @@ const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_pre
 int nvn_front_fmt(int nvn_format, Fmt *f) { return fmt_get(nvn_format, f); }
 uint8_t *nvn_front_list(uint64_t handle, size_t *len) { return list_lookup(handle, len); }
 /* SMO debug aid: why a command handle has no list */
+void nvn_front_list_stale(void) { InterlockedIncrement64(&g_st.stale); }      /* the Vulkan back end met an unknown handle */
 const char *nvn_front_list_why(uint64_t h) {
     static char b[160];
     uint32_t i = (uint32_t)h - 1;

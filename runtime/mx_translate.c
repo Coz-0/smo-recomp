@@ -34,11 +34,13 @@ typedef struct {
     uint8_t regs[256], preds[8], in_comp[32], in_mode[32];
     int uses_gmem, uses_gstore, uses_cc, uses_layer_out, uses_vp_out, uses_psize, uses_lmem, insns, blocks, any_jump, uses_alpha;
     uint8_t *reach, *leader;
+    int structured;                           /* SMO: jumps emitted as guarded blocks + real loops (plan_structured) instead of the pc switch */
+    unsigned *loop_end;                       /* structured: loop_end[T] = last word of the loop whose head is T (0: no loop starts at T) */
     const uint8_t *base;                      /* instruction word 0 (a scheduling word) */
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
     unsigned smem_words;
     int uses_smem;
-    int uses_fcs, uses_tf;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
+    int uses_fcs, uses_tf, uses_shfl;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
     uint32_t images, images_read, images_written;
     uint16_t image_fmt[8]; uint8_t image_type[8];
     uint32_t *jt;                             /* static jump target of SYNC / BRK / CONT */
@@ -731,11 +733,11 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x1c: v = "0u"; break;                              /* affinity */
         case 0x1d: v = "0x00ff0000u"; break;                     /* invocation info (suyu: patch vertices << 16 in tessellation; 0x00ff0000 otherwise) */
         case 0x1e: case 0x1f: v = "0x3f800000u"; break;          /* viewport w scale factors: 1.0 */
-        case 0x20: v = "(gl_LocalInvocationID.x | (gl_LocalInvocationID.y << 16) | (gl_LocalInvocationID.z << 26))"; break;
-        case 0x21: v = "gl_LocalInvocationID.x"; break;
+        case 0x20: v = "(MX_LID_X | (gl_LocalInvocationID.y << 16) | (gl_LocalInvocationID.z << 26))"; break;
+        case 0x21: v = "MX_LID_X"; break;
         case 0x22: v = "gl_LocalInvocationID.y"; break;
         case 0x23: v = "gl_LocalInvocationID.z"; break;
-        case 0x25: v = "gl_WorkGroupID.x"; break;
+        case 0x25: v = "MX_GID_X"; break;
         case 0x26: v = "gl_WorkGroupID.y"; break;
         case 0x27: v = "gl_WorkGroupID.z"; break;
         case 0x38: v = "uint(gl_SubGroupEqMaskARB)"; break;
@@ -1127,10 +1129,50 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         for (unsigned k = 0; k < n; k++) attr_out(e, a + k * 4, X(e, rs == 255 ? 255 : rs + k));
         break;
     }
+    case MXOP_SHFL: {                                              /* SMO: warp shuffle on a Vulkan subgroup (NVIDIA: 32 lanes, as a Maxwell warp) */
+        /* fields (decoded from SMO's own SHFL.DOWN r10, r8, 1, 0x1f; [doc] yuzu warp_shuffle.cpp): mode bits 30-31 (0 IDX, 1 UP,
+         * 2 DOWN, 3 BFLY), lane operand b = imm bits 20-24 when bit 28 is set else register bits 20-27, clamp/segment
+         * operand c = imm bits 34-46 when bit 29 is set else register bits 39-46, predicate out bits 48-50. Lane rules as
+         * PTX shfl: maxLane = (lane & seg) | (c & ~seg), minLane = lane & seg, seg = c bits 8-12; out of range: own value. */
+        if (e->in->target != 1) { fail(e, "SHFL", "warp shuffle in the OpenGL text"); break; }
+        unsigned mode = MXB(i, 30, 2), pd = MXB(i, 48, 3);
+        const char *b = MXB(i, 28, 1) ? S(e, "%uu", MXB(i, 20, 5)) : R20, *cc = MXB(i, 29, 1) ? S(e, "%uu", MXB(i, 34, 13)) : X(e, MXB(i, 39, 8));
+        e->uses_shfl = 1;
+        emit(e, "uint ln = gl_SubgroupInvocationID, bv = (%s) & 31u, cv = (%s) & 31u, sg = ((%s) >> 8) & 31u, mx = (ln & sg) | (cv & ~sg), j; bool pv;", b, cc, cc);
+        if (mode == 0) emit(e, " j = (ln & sg) | (bv & ~sg); pv = j <= mx;");
+        else if (mode == 1) emit(e, " j = ln - bv; pv = int(j) >= int(mx);");
+        else if (mode == 2) emit(e, " j = ln + bv; pv = j <= mx;");
+        else emit(e, " j = ln ^ bv; pv = j <= mx;");
+        emit(e, " if (!pv) j = ln; uint sv = subgroupShuffle(%s, j);", A8);
+        if (MXB(i, 0, 8) != 255) emit(e, " %s = sv;", DST);
+        if (pd != 7) emit(e, " %s = pv;", PD(e, pd));
+        break;
+    }
+    case MXOP_AL2P: {                                              /* SMO: attribute address = Ra + signed 11-bit offset ([doc] yuzu attribute_logical_to_physical: an add) */
+        int off = (int)(MXB(i, 20, 11) << 21) >> 21;
+        emit(e, "%s = %s + 0x%08xu;", DST, A8, (uint32_t)off);
+        break;
+    }
     case MXOP_IPA: {
         unsigned a = MXB(i, 30, 8) * 4, mode = MXB(i, 54, 2);
         if (e->in->stage != MX_FRAGMENT) { fail(e, "IPA", "IPA outside a fragment shader"); break; }
-        if (MXB(i, 38, 1) && MXB(i, 8, 8) != 255) { fail(e, "IPA.IDX", "indexed IPA"); break; }
+        if (MXB(i, 38, 1) && MXB(i, 8, 8) != 255) {
+            /* SMO: indexed IPA, the address in Ra + the immediate (its Ra comes from AL2P). The inputs that can be read are
+             * the ones the program header declares (an interpolation mode at +0x18 + n); each is selected at run time and
+             * gets the same perspective handling as a fixed IPA ([doc] yuzu ipa.cpp: indexed reads of generic attributes). */
+            emit(e, "uint ad = %s + %uu; float f = 0.0;", A8, a);
+            for (unsigned n = 0; n < 32; n++) {
+                unsigned m = e->in->code[0x18 + n], eff = 0;
+                if (!m) continue;
+                for (int k = 0; k < 4; k++) if ((m >> (k * 2)) & 3) eff = (m >> (k * 2)) & 3;
+                e->in_attr |= 1u << n; e->in_comp[n] |= (uint8_t)m ? 15 : 0;
+                emit(e, " if ((ad >> 4) == %uu) f = in_attr%u[(ad >> 2) & 3u]%s;", (0x80 >> 4) + n, n, (eff == 2 || eff == 0) ? " * gl_FragCoord.w" : "");
+            }
+            if (mode == 1) emit(e, " f *= F(%s);", R20);
+            if (MXB(i, 51, 1)) emit(e, " f = clamp(f, 0.0, 1.0);");
+            emit(e, " %s = U(f);", DST);
+            break;
+        }
         const char *v = attr_in(e, a, 0);
         emit(e, "float f = F(%s);", v);
         if (a >= 0x80 && a < 0x280) {
@@ -1350,13 +1392,15 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned tgt = (unsigned)((int)pc + 1 + off / 8);
         if ((tgt & 3) == 0) tgt++;
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;       /* never taken (the analysis did not follow it either) */
-        emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), tgt);
+        if (e->structured) emit(e, "if (%s) { go = %uu; }", FLOW(e, MXB(i, 0, 5)), getenv("SMO_MX_MUTATE") ? 0u : tgt);      /* SMO_MX_MUTATE: a planted bug for tools/test/mx_equiv.c's self-check (jumps ignored) */
+        else emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), tgt);
         break;
     }
     case MXOP_SYNC: case MXOP_BRK: case MXOP_CONT:
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;
         if (!e->jt[pc]) { fail(e, mx_op_name[op], "%s without a matching token at word %u", mx_op_name[op], pc); break; }
-        emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), e->jt[pc]);
+        if (e->structured) emit(e, "if (%s) { go = %uu; }", FLOW(e, MXB(i, 0, 5)), getenv("SMO_MX_MUTATE") ? 0u : e->jt[pc]);
+        else emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), e->jt[pc]);
         break;
     case MXOP_BRX: {
         int off = (int)(MXB(i, 20, 24) << 8) >> 8;
@@ -1497,6 +1541,38 @@ static void analyze(Mx *e) {
     free(wpc); free(wst);
 }
 
+/* SMO: STRUCTURED EMISSION. The pc switch inside for(;;) makes every register loop-carried across all blocks; on a
+ * 35,000-instruction SMO fragment stage (4,944 forward branches, 1 backward) the NVIDIA compiler did not finish in
+ * minutes. Instead: code in address order; a jump to T sets "go = T"; every run of instructions is guarded by
+ * "if (go == 0u)" and ends after a jump; label T clears go ("if (go == T) go = 0u;"). A backward jump to T makes
+ * [T, last backward jump to T] a loop: "for (;;) { ... if (go == T) { go = 0u; continue; } break; }"; a jump out of a
+ * loop leaves it through the guards and the break; a jump into a loop is skipped up to its label as anywhere else.
+ * Not planned (the pc switch stays): BRX, and loops that overlap without nesting. SMO_MX_NOSTRUCT=1: always the switch. */
+static int is_jump_op(int op) { return op == MXOP_BRA || op == MXOP_SYNC || op == MXOP_BRK || op == MXOP_CONT; }
+static unsigned jump_target(Mx *e, unsigned pc, uint64_t i, int op) {
+    if (op == MXOP_BRA) { int off = (int)(MXB(i, 20, 24) << 8) >> 8; unsigned tgt = (unsigned)((int)pc + 1 + off / 8); if ((tgt & 3) == 0) tgt++; return tgt; }
+    return e->jt[pc];
+}
+static int plan_structured(Mx *e) {
+    if (getenv("SMO_MX_NOSTRUCT")) return 0;
+    e->loop_end = calloc(e->words + 8, sizeof *e->loop_end);
+    for (unsigned pc = 1; pc < e->words; pc++) {
+        if (!e->reach[pc]) continue;
+        uint64_t i = MXW(pc);
+        int op = decode(i);
+        if (MXB(i, 16, 3) == 7 && MXB(i, 19, 1)) continue;          /* never executed */
+        if (op == MXOP_BRX) return 0;
+        if (!is_jump_op(op) || MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) continue;
+        unsigned t = jump_target(e, pc, i, op);
+        if (!t || t >= e->words) return 0;
+        if (t <= pc && pc > e->loop_end[t]) e->loop_end[t] = pc;    /* a backward jump: loop [t, pc] */
+    }
+    for (unsigned a = 1; a < e->words; a++) {                       /* loops must nest */
+        if (!e->loop_end[a]) continue;
+        for (unsigned b = a + 1; b <= e->loop_end[a]; b++) if (e->loop_end[b] && e->loop_end[b] > e->loop_end[a]) return 0;
+    }
+    return 1;
+}
 /* ---------------------------------------------------------------- whole shader */
 static const char *const k_prelude =
     "#define F(x) uintBitsToFloat(x)\n#define U(x) floatBitsToUint(x)\n"
@@ -1566,6 +1642,29 @@ int mx_translate(const MxIn *in, MxOut *out) {
     }
 
     if (!e->fail) analyze(e);
+    if (!e->fail && e->any_jump && plan_structured(e)) e->structured = 1;
+    if (e->structured) {
+        unsigned stack[64]; int ns = 0, open = 0;
+        for (unsigned pc = 1; pc < e->words && !e->fail; pc++) {
+            if ((e->loop_end[pc] || (e->leader[pc] && e->reach[pc])) && open) { emit(e, "}\n"); open = 0; }
+            if (e->loop_end[pc]) {
+                if (ns == 64) { fail(e, "loops", "loops nested deeper than 64"); break; }
+                stack[ns++] = pc; emit(e, "for (;;) {\n"); e->blocks++;
+            }
+            if (e->reach[pc]) {
+                if (e->leader[pc]) { emit(e, "if (go == %uu) go = 0u;\n", pc); e->blocks++; }
+                if (!open) { emit(e, "if (go == 0u) {\n"); open = 1; }
+                uint64_t i = MXW(pc);
+                insn(e, pc, i);
+                if (is_jump_op(decode(i))) { emit(e, "}\n"); open = 0; }
+            }
+            while (ns && e->loop_end[stack[ns - 1]] == pc) {
+                if (open) { emit(e, "}\n"); open = 0; }
+                emit(e, "if (go == %uu) { go = 0u; continue; } break; }\n", stack[ns - 1]); ns--;
+            }
+        }
+        if (open) emit(e, "}\n");
+    } else
     for (unsigned pc = 1; pc < e->words && !e->fail; pc++) {
         if (!e->reach[pc]) continue;
         if (e->leader[pc] && e->any_jump) { emit(e, "case %uu:\n", pc); e->blocks++; }
@@ -1585,11 +1684,12 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (in->stage == MX_VERTEX) e->out_attr |= in->force_out;      /* declared and set to (0, 0, 0, 1) below */
         const int vk = in->target == 1;
         const char *set0 = vk ? "set = 0, " : "", *set1 = vk ? "set = 1, " : "";
-        if (vk) emit(&h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
+        if (vk) emit(&h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n#extension GL_EXT_texture_shadow_lod : enable\n#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n");
         else
         emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
+        if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SMO: SHFL */
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
         else
@@ -1628,7 +1728,11 @@ int mx_translate(const MxIn *in, MxOut *out) {
             }
         }
         if (in->stage == MX_COMPUTE) {
-            emit(&h, "layout(local_size_x = %u, local_size_y = %u, local_size_z = %u) in;\n", in->local_size[0] ? in->local_size[0] : 1, in->local_size[1] ? in->local_size[1] : 1, in->local_size[2] ? in->local_size[2] : 1);
+            {   unsigned k = mx_split_x(in->local_size, in->smem_bytes), lx = in->local_size[0] ? in->local_size[0] : 1;      /* SMO: a split group (mx_translate.h) */
+                emit(&h, "layout(local_size_x = %u, local_size_y = %u, local_size_z = %u) in;\n", k > 1 ? lx / k : lx, in->local_size[1] ? in->local_size[1] : 1, in->local_size[2] ? in->local_size[2] : 1);
+                if (k > 1) emit(&h, "#define MX_LID_X (gl_LocalInvocationID.x + (gl_WorkGroupID.x %% %uu) * %uu)\n#define MX_GID_X (gl_WorkGroupID.x / %uu)\n", k, lx / k, k);
+                else emit(&h, "#define MX_LID_X gl_LocalInvocationID.x\n#define MX_GID_X gl_WorkGroupID.x\n");
+            }
             if (e->uses_smem) emit(&h, "shared uint smem[%u];\n", e->smem_words);
         }
         for (unsigned k = 0; k < 8; k++) {
@@ -1665,13 +1769,14 @@ int mx_translate(const MxIn *in, MxOut *out) {
         any = 0;
         for (unsigned p = 0; p < 7; p++) if (e->preds[p]) { emit(&h, "%s p%u = false", any ? "," : " bool", p); any = 1; }
         if (any) emit(&h, ";\n");
-        if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
+        if (e->structured) emit(&h, " uint go = 0u;\n");
+        else if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
         size_t need = h.len + e->len + strlen(e->exitcode) + 256;
         res = malloc(need);
         memcpy(res, h.s, h.len);
         memcpy(res + h.len, e->s, e->len);
         size_t n = h.len + e->len;
-        if (e->any_jump) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
+        if (e->any_jump && !e->structured) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
         else n += (size_t)sprintf(res + n, " %s\n}\n", e->exitcode);
         res[n] = 0;
         free(h.s);
@@ -1685,7 +1790,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
     out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha;
     out->nsmp = e->nsmp; memcpy(out->smp, e->smp, sizeof out->smp);
 done:
-    free(e->s); free(e->reach); free(e->leader); free(e->jt); free(e->stk_of); free(e->stks);
+    free(e->s); free(e->reach); free(e->leader); free(e->loop_end); free(e->jt); free(e->stk_of); free(e->stks);
     free(e);
     return res != NULL;
 }

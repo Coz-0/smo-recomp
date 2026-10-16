@@ -61,6 +61,10 @@ typedef struct {
     uint64_t callback, callback_data, rec_cmd, rec_ctrl;   /* out-of-memory callback; bytes of the current recording */
     int64_t row_stride, image_stride;
     int recording, callback_off, in_callback, dispatches;
+    uint64_t blk_pool, blk_lo, blk_hi;                     /* SMO: the command memory block added last (pool object, offset range) */
+    uint64_t rec_blk[4][3]; int rec_nblk;                  /* where the current recording was written: {pool, from, to} as offsets in
+                                                              the pool (from the block's start + the model's write position, see rec);
+                                                              rec_nblk 5 = more than 4 pieces */
 } CmdBuf;
 typedef struct { int count, interval, nactive; Tex *tex[8]; int crop[4]; uint64_t native; } Window;
 typedef struct { void *s; volatile LONG dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */

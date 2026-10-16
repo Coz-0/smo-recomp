@@ -193,8 +193,12 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
                     (unsigned long long)g_icall[i].x0, (unsigned long long)g_icall[i].x1, (unsigned long long)g_icall[i].x2);
 }
 
+extern int g_nerve_mode;                              /* smo_nerve.c */
+void nerve_call(Ctx *c, uint64_t addr);
+
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
+    if (g_nerve_mode) nerve_call(c, addr);             /* smo_nerve.c: SMO_NERVELOG, SMO_ACTORPOS, SMO_SEQ @nerve: */
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
         void (*fn)(Ctx *) = lookup_guest(addr);
         if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
@@ -494,6 +498,7 @@ void report_and_exit(int code) {
     os_thread_report(stdout);
     { void smo_heap_report(FILE *out); smo_heap_report(stdout); }   /* smo_nn.c */
     { void smo_audio_report(FILE *out); smo_audio_report(stdout); }   /* smo_audio.c */
+    { void nerve_report(FILE *out); nerve_report(stdout); }   /* smo_nerve.c */
     module_coverage_report(stdout);
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }
     fflush(stdout);
