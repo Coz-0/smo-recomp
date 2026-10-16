@@ -1,0 +1,46 @@
+# Everything derived from the game dump stays local. Never commit any of it.
+/build/
+/dump/
+/work/
+/cache/
+/userdata/
+/deps/
+*.nsp
+*.nca
+*.nso
+*.nro
+*.elf
+*.npdm
+*.nacp
+*.tik
+*.cert
+*.keys
+prod.keys
+title.keys
+*.bin
+*.sarc
+*.szs
+*.bfres
+*.bntx
+*.bnsh
+*.bfsha
+*.pack
+# generated lifter output and binaries
+gen*/
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.pdb
+*.map
+*.spv
+# reference repos are cloned next to this repo, never inside it
+/ref/
+# function lists carry addresses/names derived from the dump and the decomp
+functions*.tsv
+functions*.json
+# python
+__pycache__/
+*.pyc
+.venv/
