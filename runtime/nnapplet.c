@@ -143,29 +143,45 @@ static void web_fill_tlv(uint64_t ret, uint32_t shim_kind) {   /* 0x2000 bytes *
  * reason is 0x14 or 0xc and 1 for anything else -- so the unknown exit reason IS visible to the game there;
  * [game] 0x71017634cc / 0x7103341bac ShowYouTubeVideo: reads IsMediaPlayerAutoClosedByCompletion (TLV 9, absent here =
  * false). */
-/* SMO port: ShowOfflineHtmlPage with the game's own offline document: SMO's Help (al::HtmlViewer::call asks for
- * "htmlcontents.htdocs/html/<region and language>/index.html<query>"). On the console the browser applet shows the page
- * full screen and the game waits until the player closes it. Here the page opens in the PC's web browser from the
- * extracted document (scripts/setup.py step `manual` -> build\manual, read as ..\manual from the exe's folder, or
- * SMO_MANUAL=<folder>), and the call returns at once as closed by the player.
+/* SMO port: ShowOfflineHtmlPage with the game's own offline document: SMO's Help, its Action Guide (al::HtmlViewer::call
+ * asks for "htmlcontents.htdocs/html/<region and language>/index.html<query>"). On the console the browser applet shows
+ * the page full screen and the game waits until the player closes it. Here the page, from the extracted document
+ * (scripts/setup.py step `manual` -> build\manual, read as ..\manual from the exe's folder, or SMO_MANUAL=<folder>), is
+ * shown INSIDE the game window by smo_guide.c (Microsoft Edge WebView2) and the call returns when the player has closed
+ * it; only when WebView2 cannot be used does it open in the PC's web browser, and the call then returns at once.
  * The page's script uses the console browser's window.nx (footer buttons L / R / B, endApplet, play reports) before
  * anything else and stops without it; so it is shown from a copy next to it (<name>_pc.html, written once) that first
  * loads nx_pc.js (written into the document's js folder): the footer buttons answer to the keyboard (Q / E or Page Up /
- * Page Down for L / R, Escape or Backspace for B; the page's own arrow keys stay) and to a pad through the browser's
- * Gamepad API (shoulder buttons L / R, bottom face button B, right face button A, D-pad = arrow keys), endApplet closes
- * the tab, play reports do nothing. A file URL with a query cannot be opened by name, so a small page in %TEMP%
+ * Page Down for L / R, Escape or Backspace for B; the page's own arrow keys stay); pads come from the runtime in the game
+ * window (window.__smo_pad, smo_guide.c) and through the browser's Gamepad API in a PC browser (shoulder buttons L / R,
+ * bottom face button B, right face button A, D-pad = arrow keys); endApplet closes the page (in a PC browser: the tab),
+ * play reports do nothing. A file URL with a query cannot be opened by name in a PC browser, so a small page in %TEMP%
  * forwards to it. Without the document the page is answered as closed, as before. */
 static const char g_nx_pc_js[] =
-    "/* smo-recomp: window.nx of the console's browser applet, for SMO's Help in a PC browser (written by the runtime) */\n"
+    "/* smo-recomp: window.nx of the console's browser applet, for SMO's Help in the game window or a PC browser (written by the runtime) */\n"
     "(function () {\n"
     "  var keys = {};\n"
+    "  var host = window.chrome && window.chrome.webview;   /* inside the game window: pads come from the runtime */\n"
     "  function press(b) { if (keys[b]) keys[b](); }\n"
     "  function arrow(code) { if (document.onkeydown) document.onkeydown({ keyCode: code, preventDefault: function () {} }); }\n"
+    "  /* the page moves the focus with up / down only from an item that has it; the console's stick pointer gives the first */\n"
+    "  function nothingFocused() { var e = document.activeElement; return !e || e === document.body || e === document.documentElement; }\n"
+    "  function focusFirst() {\n"
+    "    var a = document.querySelectorAll('a[onfocus], a[id], button');\n"
+    "    for (var i = 0; i < a.length; i++) { var r = a[i].getBoundingClientRect(); if (r.width > 0 && r.height > 0) { a[i].focus(); return; } }\n"
+    "  }\n"
+    "  window.__smo_pad = function (b) {\n"
+    "    if (b === 'B' || b === 'L' || b === 'R') press(b);\n"
+    "    else if (b === 'A') { if (!nothingFocused() && document.activeElement.click) document.activeElement.click(); }\n"
+    "    else if ((b === 'U' || b === 'D') && nothingFocused()) focusFirst();\n"
+    "    else if (b === 'U') arrow(38); else if (b === 'D') arrow(40); else if (b === 'Lf') arrow(37); else if (b === 'Rt') arrow(39);\n"
+    "  };\n"
     "  document.addEventListener('keydown', function (e) {\n"
     "    var k = e.key;\n"
     "    if (k === 'Escape' || k === 'Backspace') { e.preventDefault(); press('B'); }\n"
     "    else if (k === 'q' || k === 'Q' || k === 'PageUp') { e.preventDefault(); press('L'); }\n"
     "    else if (k === 'e' || k === 'E' || k === 'PageDown') { e.preventDefault(); press('R'); }\n"
+    "    else if ((k === 'ArrowUp' || k === 'ArrowDown') && nothingFocused()) { e.preventDefault(); e.stopPropagation(); focusFirst(); }\n"
     "  }, true);\n"
     "  var was = [];\n"
     "  function poll() {\n"
@@ -187,11 +203,12 @@ static const char g_nx_pc_js[] =
     "    }\n"
     "    requestAnimationFrame(poll);\n"
     "  }\n"
-    "  requestAnimationFrame(poll);\n"
+    "  if (!host) requestAnimationFrame(poll);\n"
     "  window.nx = {\n"
     "    footer: { setAssign: function (b, label, fn) { keys[b] = fn; }, unsetAssign: function (b) { delete keys[b]; } },\n"
     "    playReport: { setCounterSetIdentifier: function () {}, incrementCounter: function () {} },\n"
     "    endApplet: function () {\n"
+    "      if (host) host.postMessage('endApplet');\n"
     "      window.close();\n"
     "      setTimeout(function () { document.body.innerHTML = '<p style=\"color:#fff;font:20px sans-serif;padding:2em\">Close this tab to return to the game.</p>'; }, 300);\n"
     "    }\n"
@@ -268,6 +285,8 @@ static int web_open_offline(const char *doc) {
                       "<title>Super Mario Odyssey - Help</title><a href=\"%s\">Help</a>\n", url, url);
     if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
     if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }    /* self-test */
+    int guide_show(const char *url);                    /* smo_guide.c: in the game window, back when the player has closed it */
+    if (guide_show(url)) return 1;
     HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
     printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
     return (INT_PTR)r > 32;
