@@ -33,15 +33,15 @@ git). One script does all of it, in resumable steps:
 | *Super Mario Odyssey* 1.0.0, the base package: an `.nsp` with `[0100000000010000]` in its name | the executable (`main`), the system library it ships (`sdk`), the RomFS |
 | `prod.keys` from your console | decrypting the package, read in place. Found from `--keys`, `%SMO_KEYS%`, `~\.switch\prod.keys`, or Ryujinx's folder |
 | your console's firmware (`.nca` files) | the system's shared fonts (`--fw <folder>`; default: the firmware installed in Ryujinx's folder) |
-| an update package `[0100000000010800]` (optional) | only read for its version; the build uses version 1.0.0 |
+| an update package `[0100000000010800]` (optional) | `--target 1.4.1` builds that version instead (see below); without it the build is 1.0.0 |
 
 Put the packages in one folder and give it as `--dump`. Nothing is copied out of them except what the build derives,
 into `build/`.
 
 **Optional:** a local clone of [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp), given as
-`--decomp <folder>`. Its function list adds names to `build/functions` (for the debugging tools and for the state names
-the scripted runs wait for: `tests/run_cap_kingdom.py` needs it) and checks that your `main` is the 1.0.0 executable.
-Nothing of it is copied into the repository.
+`--decomp <folder>`. Its function list adds names to `build/functions` (for the debugging tools) and checks that your
+`main` is the 1.0.0 executable; the state names the scripted runs wait for also come from the game's own RTTI, without
+it. Nothing of it is copied into the repository.
 
 ## The steps
 
@@ -64,6 +64,23 @@ A step whose output exists is skipped, so an interrupted setup resumes where it 
 always run and only rebuild what changed. `--status` shows what is done, `--only <step>` runs one step, `--redo <step>`
 repeats one, `--from <step>` repeats it and everything after it, `--check` adds the check step (minutes). After a change
 to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runtime, `--only link` is enough.
+
+## The update (1.4.1)
+
+With the update package in the dump folder, `--target` builds the game as the update leaves it, beside 1.0.0:
+
+```bat
+.venv\Scripts\python scripts\setup.py --dump <folder> --target 1.4.1
+.venv\Scripts\python scripts\run.py <run name> --target 1.4.1 --seconds 300
+```
+
+- Everything goes to `build\1.4.1\`, laid out as `build\` is; the extracted packages in `build\dump` are shared.
+- The update's RomFS is a patch of the base's: the `romfs` step applies it and can check every block against the
+  update's own hash tree (`tools\extract\romfs.py --update --verify`). Files the update did not change are hard links
+  to `build\romfs` when that exists, so the second copy takes little space; `build\1.4.1\romfs_changes.txt` lists what
+  changed.
+- The update's `main` has almost no symbols; the function list names the game's states from its RTTI instead, and the
+  few functions the runtime replaces with host code are found by matching them with the base executable's.
 
 ## Running
 
