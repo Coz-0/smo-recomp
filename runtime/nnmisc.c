@@ -60,9 +60,11 @@ static const char *safe_str(uint64_t p) { return p > 0x10000 ? (const char *)(ui
 
 /* ---------------------------------------------------------------- C-linkage nn::os wrappers
  * [sdk] every nnosXxx is a tail jump to the C++ function with the same arguments, so each one
- * forwards to whatever handler is registered for the C++ name (looked up on first use). */
+ * forwards to whatever handler is registered for the C++ name (looked up on first use; also when this game version
+ * does not import the C++ name itself). */
 static ImportFn forward_target(Ctx *c, const char *name) {
     ImportFn f = import_lookup(name);
+    if (!f) f = handler_by_name(name);
     if (!f) fatal(c, "nnmisc: no handler for %s, needed by a C wrapper", name);
     return f;
 }
@@ -877,11 +879,11 @@ void register_misc_imports(void) {
     register_imports(replace_imports, (int)(sizeof replace_imports / sizeof replace_imports[0]));
     int n = (int)(sizeof fill_imports / sizeof fill_imports[0]), added = 0;
     for (int i = 0; i < n; i++) {
-        if (!import_data(fill_imports[i].name)) { printf("nnmisc: \"%s\" is not an import of the game (typo?)\n", fill_imports[i].name); continue; }
+        if (!import_data(fill_imports[i].name)) { printf("nnmisc: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", fill_imports[i].name); continue; }
         if (!import_lookup(fill_imports[i].name)) { register_imports(&fill_imports[i], 1); added++; }
     }
     for (int i = 0; i < (int)(sizeof replace_imports / sizeof replace_imports[0]); i++)
-        if (!import_data(replace_imports[i].name)) printf("nnmisc: \"%s\" is not an import of the game (typo?)\n", replace_imports[i].name);
+        if (!import_data(replace_imports[i].name)) printf("nnmisc: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", replace_imports[i].name);
     trace_printf("nnmisc: %d of %d functions installed (the rest are provided elsewhere or not imported)\n", added, n);
     dump_unregistered();
     (void)ret1;

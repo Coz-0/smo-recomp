@@ -3,7 +3,8 @@
     python tools/dev/disasm.py <symbol substring | hex address> [--module main] [--max 400]
 
 Addresses are module-relative (main loads at 0x7100000000). PLT stubs of main are named by their import (JMPREL).
-Reads only the converted dump in build/; prints instructions, not data.
+Reads only the converted dump in build/; prints instructions, not data. SMO_TARGET picks the game version
+(tools/target.py).
 """
 import argparse
 import csv
@@ -15,7 +16,9 @@ from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'extract'))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
 import functions as F  # noqa: E402
+import target as T  # noqa: E402
 
 
 def main():
@@ -24,10 +27,10 @@ def main():
     ap.add_argument('--module', default='main')
     ap.add_argument('--max', type=int, default=400)
     a = ap.parse_args()
-    rows = list(csv.DictReader(open(os.path.join(REPO, 'build', 'functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
+    rows = list(csv.DictReader(open(T.build('functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
     names = {int(r['start'], 16): (r['symbol'] or r['decomp_name']).split('|')[0] for r in rows}
     ends = {int(r['start'], 16): int(r['end'], 16) for r in rows}
-    m = F.Module(os.path.join(REPO, 'build', 'dump', 'base', 'elf', '%s.elf' % a.module))
+    m = F.Module(T.elf(a.module))
     # PLT stubs -> import names
     if 23 in m.dt:
         syms = m.symbols()

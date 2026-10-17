@@ -111,6 +111,10 @@ static uint8_t *alloc_near(uint8_t *site) {
 void smo_fast_install(void) {
     const char *e = getenv("SMO_FAST");
     if (e && !atoi(e)) { printf("smo_fast: off (SMO_FAST=0): the game's sampler list sort runs as lifted\n"); return; }
+    if (!SYM_SORT || !SYM_REGISTER || !SYM_KEYCMP) {   /* gen_tables.py: not in this main.elf (a stripped update) */
+        printf("smo_fast: off: this game version's sampler list functions are not known; its sort runs as lifted\n");
+        return;
+    }
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);

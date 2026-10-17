@@ -1,5 +1,6 @@
 """Read-only access to the Switch package formats of the user's own dump: NSP (PFS0), NCA, ExeFS (PFS0), RomFS, CNMT,
-NACP, NSO.  Adapted from ssbu-recomp tools/extract (romfs_extract.py, nca_exefs.py, nso2elf.py), GPL-3.0-or-later.
+NACP, NSO, and the RomFS patches of update packages (BKTR).  Adapted from ssbu-recomp tools/extract (romfs_extract.py,
+nca_exefs.py, nso2elf.py), GPL-3.0-or-later.
 
 Nothing here writes anything; callers decide where derived files go (always under build/, ignored by git).
 
@@ -7,6 +8,7 @@ Keys: the user's own prod.keys, looked up in this order (the file is only read, 
     --keys <path> (passed as `keys_path`), %SMO_KEYS%, ~/.switch/prod.keys, %APPDATA%/Ryujinx/system/prod.keys
 Title keys come from the ticket inside the NSP; title.keys next to prod.keys is the fallback.
 """
+import bisect
 import hashlib
 import os
 import struct
@@ -152,14 +154,15 @@ class Nca:
                 self._key = area[0x20:0x30]
         return self._key
 
-    def read(self, sec, offset, size, ctr_val=None):
-        """Decrypted read of `size` bytes at a section-relative offset (AES-CTR sections)."""
+    def read(self, sec, offset, size, ctr_val=None, plain=False):
+        """Decrypted read of `size` bytes at a section-relative offset (AES-CTR sections). ctr_val: the counter
+        generation of this range (an update's patch data, AES-CTR-EX); plain: a range stored unencrypted."""
         if size <= 0:
             return b''
         absolute = sec['offset'] + offset
         aligned = absolute & ~0xF
         data = self.nsp.read(self.name, aligned, (absolute - aligned + size + 15) & ~0xF)
-        if sec['crypto'] == 1:                                     # plain
+        if sec['crypto'] == 1 or plain:                            # plain
             return data[absolute - aligned:absolute - aligned + size]
         upper = sec['ctr'] if ctr_val is None else sec['ctr'][:4] + struct.pack('>I', ctr_val)
         counter = int.from_bytes(upper + struct.pack('>Q', aligned >> 4), 'big')
@@ -172,13 +175,161 @@ class Nca:
         pfs_off, _ = struct.unpack_from('<QQ', sec['fs'], 0x40)
         return Pfs0(lambda o, n: self.read(sec, pfs_off + o, n))
 
+    def romfs_section(self):
+        return next(s for s in self.sections if s['fs_type'] == 0)
+
     def romfs(self, sec=None):
-        """(reader, base) of a plain (non-BKTR) RomFS section: data is IVFC level 6."""
-        sec = sec or next(s for s in self.sections if s['fs_type'] == 0)
-        fs = sec['fs']
-        assert fs[0x8:0xC] == b'IVFC', fs[0x8:0xC]
-        level6 = struct.unpack_from('<Q', fs, 0x8 + 0x10 + 5 * 0x18)[0]
-        return (lambda o, n: self.read(sec, o, n)), level6
+        """(reader, base) of a plain (non-BKTR) RomFS section: data is the last IVFC level."""
+        sec = sec or self.romfs_section()
+        if sec['crypto'] == CRYPTO_BKTR:
+            raise ValueError('%s section %d is an update patch: read it through PatchedSection' % (self.name, sec['index']))
+        return (lambda o, n: self.read(sec, o, n)), ivfc_levels(sec['fs'])[-1][0]
+
+
+CRYPTO_BKTR = 4                                                    # section encryption type of update patches (AES-CTR-EX)
+
+
+def ivfc_levels(fs):
+    """[(offset, size, block size)] of the levels of a RomFS section's hash tree (IVFC), the RomFS itself last."""
+    if fs[0x8:0xC] != b'IVFC':
+        raise ValueError('no IVFC hash tree in this section header (%r)' % fs[0x8:0xC])
+    count = struct.unpack_from('<I', fs, 0x8 + 0xC)[0]             # the master hash counts as a level
+    return [(o, s, 1 << b) for o, s, b in (struct.unpack_from('<QQI', fs, 0x8 + 0x10 + i * 0x18) for i in range(count - 1))]
+
+
+def ivfc_verify(read, fs, chunk=32 << 20):
+    """Check every block of every level of a RomFS section's hash tree, read through `read(offset, size)`: the first
+    level against the master hash in the section header, each further level's blocks against the SHA-256 list that is
+    the level before it. A short last block is hashed padded with zeros to the block size, or else as it is (the
+    result says which matched). Returns [(level, blocks, wrong blocks, short block: 'padded' / 'as is' / None)]."""
+    levels = ivfc_levels(fs)
+    expect = fs[0x8 + 0xC0:0x8 + 0xE0]                             # master hash: the hash of level 1's one block
+    out = []
+    for n, (off, size, bs) in enumerate(levels):
+        step = max(bs, chunk // bs * bs)
+        wrong, short, pos = 0, None, 0
+        while pos < size:
+            data = read(off + pos, min(step, size - pos))
+            for b in range(0, len(data), bs):
+                j = (pos + b) // bs
+                want = expect[j * 32:j * 32 + 32]
+                block = data[b:b + bs]
+                if len(block) == bs:
+                    wrong += hashlib.sha256(block).digest() != want
+                elif hashlib.sha256(block + bytes(bs - len(block))).digest() == want:
+                    short = 'padded'
+                elif hashlib.sha256(block).digest() == want:
+                    short = 'as is'
+                else:
+                    wrong += 1
+            pos += len(data)
+        out.append((n + 1, -(-size // bs), wrong, short))
+        if n + 1 < len(levels):
+            expect = read(off, size)
+    return out
+
+
+# ------------------------------------------------------------------------------------------------------------- patches
+def bucket_tree(table, entry_count, entry_size, node_size=0x4000):
+    """The entries of a BucketTree, the table format of update patches: an L1 node, then the entry sets, each node
+    `node_size` bytes with a 16-byte header (index, entry count, end offset). Returns (entries as bytes, end of the
+    range the tree covers)."""
+    if entry_count <= 0:
+        return [], 0
+    per_set = (node_size - 16) // entry_size
+    sets = -(-entry_count // per_set)
+    if sets > (node_size - 16) // 8:
+        raise NotImplementedError('BucketTree with L2 nodes (%d entries)' % entry_count)
+    end = struct.unpack_from('<q', table, 8)[0]
+    entries = []
+    for s in range(sets):
+        node = (1 + s) * node_size
+        index, count, _ = struct.unpack_from('<iiq', table, node)
+        if index != s or not 0 < count <= per_set:
+            raise ValueError('BucketTree entry set %d: index %d, count %d' % (s, index, count))
+        entries += [table[node + 16 + i * entry_size:node + 16 + (i + 1) * entry_size] for i in range(count)]
+    if len(entries) != entry_count:
+        raise ValueError('BucketTree: %d entries where the header says %d' % (len(entries), entry_count))
+    return entries, end
+
+
+class PatchedSection:
+    """A RomFS section of an update NCA applied to the same section of the base NCA (a BKTR patch).
+
+    The patched section is an indirect storage: its relocation table maps each range either onto the base section
+    (storage 0) or onto the update section's own data (storage 1). That data is AES-CTR encrypted with a counter
+    generation that changes from range to range (the AES-CTR-EX table); both tables are at the end of the update's
+    section, encrypted with its plain counter. The update's section header (its IVFC) describes the patched section."""
+
+    def __init__(self, patch, psec, base, bsec):
+        fs = psec['fs']
+        rel_off, rel_size, rel_magic, _, rel_count, _ = struct.unpack_from('<QQ4sIiI', fs, 0x100)
+        ctr_off, ctr_size, ctr_magic, _, ctr_count, _ = struct.unpack_from('<QQ4sIiI', fs, 0x120)
+        if psec['crypto'] != CRYPTO_BKTR or rel_magic != b'BKTR' or ctr_magic != b'BKTR':
+            raise ValueError('%s section %d is not an update patch' % (patch.name, psec['index']))
+        self.patch, self.psec, self.base, self.bsec = patch, psec, base, bsec
+        tables = patch.read(psec, rel_off, psec['size'] - rel_off)
+        rel, self.size = bucket_tree(tables[:rel_size], rel_count, 0x14)
+        self.rel = [struct.unpack('<qqi', e) for e in rel]           # (patched offset, offset in the storage, storage)
+        ctr, self.data_size = bucket_tree(tables[ctr_off - rel_off:ctr_off - rel_off + ctr_size], ctr_count, 0x10)
+        self.ctr = [struct.unpack('<qB3xI', e) for e in ctr]         # (offset, 1 = not encrypted, generation)
+        self._rel_at = [e[0] for e in self.rel]
+        self._ctr_at = [e[0] for e in self.ctr]
+        for name, at, end in (('relocation', self._rel_at, self.size), ('AES-CTR-EX', self._ctr_at, self.data_size)):
+            if not at or at[0] != 0 or any(b <= a for a, b in zip(at, at[1:])) or at[-1] >= end:
+                raise ValueError('%s: the %s table is not in order' % (patch.name, name))
+        if self.data_size > rel_off:
+            raise ValueError('%s: patch data (%#x) runs into the tables (%#x)' % (patch.name, self.data_size, rel_off))
+
+    def pieces(self, off, size):
+        """(storage, offset in it, length) covering [off, off + size) of the patched section; storage 0 is the base
+        section, 1 the update's own data."""
+        if off < 0 or size < 0 or off + size > self.size:
+            raise ValueError('[%#x, %#x) is outside the patched section (%#x bytes)' % (off, off + size, self.size))
+        i = bisect.bisect_right(self._rel_at, off) - 1
+        end = off + size
+        while off < end:
+            virt, phys, storage = self.rel[i]
+            stop = min(end, self.rel[i + 1][0] if i + 1 < len(self.rel) else self.size)
+            yield storage, phys + off - virt, stop - off
+            off = stop
+            i += 1
+
+    def read(self, off, size):
+        out = []
+        for storage, at, n in self.pieces(off, size):
+            if storage == 0:
+                out.append(self.base.read(self.bsec, at, n))
+            elif storage == 1:
+                out.append(self.read_update(at, n))
+            else:
+                raise ValueError('%s: storage %d in the relocation table' % (self.patch.name, storage))
+        return b''.join(out)
+
+    def read_update(self, off, size):
+        """The update section's own data, each range decrypted with its counter generation."""
+        if off < 0 or off + size > self.data_size:
+            raise ValueError('[%#x, %#x) is outside the patch data (%#x bytes)' % (off, off + size, self.data_size))
+        out = []
+        i = bisect.bisect_right(self._ctr_at, off) - 1
+        end = off + size
+        while off < end:
+            _, not_encrypted, generation = self.ctr[i]
+            if not_encrypted > 1:
+                raise ValueError('%s: AES-CTR-EX entry %d has encryption value %d' % (self.patch.name, i, not_encrypted))
+            stop = min(end, self.ctr[i + 1][0] if i + 1 < len(self.ctr) else self.data_size)
+            out.append(self.patch.read(self.psec, off, stop - off, ctr_val=generation, plain=not_encrypted == 1))
+            off = stop
+            i += 1
+        return b''.join(out)
+
+    def from_update(self, off, size):
+        """How many bytes of [off, off + size) of the patched section are the update's own data."""
+        return sum(n for storage, _, n in self.pieces(off, size) if storage == 1)
+
+    def romfs(self):
+        """(reader, base) of the patched RomFS, as romfs() of a plain section."""
+        return self.read, ivfc_levels(self.psec['fs'])[-1][0]
 
 
 def romfs_walk(read, base):
@@ -227,6 +378,21 @@ class Package:
         d = pfs.read(name)
         tid, ver, mtype = struct.unpack_from('<QIB', d, 0)
         return {'title_id': '%016x' % tid, 'version': ver, 'meta_type': mtype}
+
+    def contents(self):
+        """{NCA id: content type} from the content records of the package's meta: unlike the NCA header, these tell
+        the game's HTML document from its legal information (both 'Manual' NCAs)."""
+        m = self.by_type('Meta')[0]
+        pfs = m.pfs0()
+        d = pfs.read(next(n for n in pfs.files if n.endswith('.cnmt')))
+        ext, count = struct.unpack_from('<HH', d, 0x0E)
+        names = {0: 'Meta', 1: 'Program', 2: 'Data', 3: 'Control', 4: 'HtmlDocument', 5: 'LegalInformation',
+                 6: 'DeltaFragment'}
+        out = {}
+        for i in range(count):
+            rec = d[0x20 + ext + i * 0x38:0x20 + ext + (i + 1) * 0x38]
+            out[rec[0x20:0x30].hex()] = names.get(rec[0x36], rec[0x36])
+        return out
 
     def nacp(self):
         c = self.by_type('Control')[0]

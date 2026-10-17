@@ -201,7 +201,7 @@ static size_t main_stack_size_from_npdm(void) {
     snprintf(path, sizeof path, "%s", g_elf);
     char *sl = strrchr(path, '/'), *bs = strrchr(path, '\\');
     char *cut = sl > bs ? sl : bs;
-    snprintf(cut ? cut + 1 : path, sizeof path - (size_t)((cut ? cut + 1 : path) - path), "..\\exefs\\main.npdm");   /* SMO port: build/dump/base/{elf,exefs} */
+    snprintf(cut ? cut + 1 : path, sizeof path - (size_t)((cut ? cut + 1 : path) - path), "..\\exefs\\main.npdm");   /* SMO port: build/dump/<base or update>/{elf,exefs} */
     FILE *f = fopen(path, "rb");
     unsigned char h[0x20];
     if (!f || fread(h, 1, sizeof h, f) != sizeof h || memcmp(h, "META", 4)) {
@@ -279,7 +279,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
 }
 
 int main(int argc, char **argv) {
-    g_elf = argc > 1 ? argv[1] : "..\\dump\\base\\elf\\main.elf";   /* SMO port: run from build/bin */
+    g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* SMO port: the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);

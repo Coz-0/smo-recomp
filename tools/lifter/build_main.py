@@ -21,8 +21,10 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GEN = os.path.join(REPO, 'build', 'lift', 'main')
-OBJ = os.path.join(REPO, 'build', 'obj', 'main')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+GEN = T.build('lift', 'main')
+OBJ = T.build('obj', 'main')
 RUNTIME = os.path.join(REPO, 'runtime')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 OPT = os.environ.get('RECOMP_OPT', '-O1')

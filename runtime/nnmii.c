@@ -207,7 +207,7 @@ void register_nnmii_imports(void) {
     if (!sdk_image_ready()) return;                       /* without sdk.elf the earlier placeholders stay */
     int n = (int)(sizeof mii_imports / sizeof mii_imports[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(mii_imports[i].name)) printf("nnmii: \"%s\" is not an import of the game (typo?)\n", mii_imports[i].name);
+        if (!import_data(mii_imports[i].name)) printf("nnmii: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", mii_imports[i].name);
     register_imports(mii_imports, n);
 }
 

@@ -23,9 +23,11 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T                                   # noqa: E402  (SMO_TARGET: which package's sdk.elf, which build/)
 SDK_BASE = 0x7500000000
-os.environ['RECOMP_ELF'] = os.path.join(REPO, 'build', 'dump', 'base', 'elf', 'sdk.elf')
-os.environ['RECOMP_FUNCS'] = os.path.join(REPO, 'build', 'functions', 'sdk_functions.tsv')
+os.environ['RECOMP_ELF'] = T.elf('sdk')
+os.environ['RECOMP_FUNCS'] = T.build('functions', 'sdk_functions.tsv')
 os.environ['RECOMP_BASE'] = hex(SDK_BASE)
 sys.path.insert(0, HERE)
 import recomp as R                                   # noqa: E402  (reads the three variables above at import)
@@ -33,7 +35,7 @@ import recomp as R                                   # noqa: E402  (reads the th
 sys.path.insert(0, os.path.join(REPO, 'tools', 'extract'))
 import functions as F                                # noqa: E402
 
-GEN = os.path.join(REPO, 'build', 'gen')
+GEN = T.build('gen')
 MOD = F.Module(R.ELF)
 NSYM = MOD.sec['.dynsym'][1] // 24
 
@@ -66,7 +68,7 @@ NORETURN = re.compile(r'Abort|UnexpectedDefault|OnAssertionFailure|__assert_fail
 class Rules:
     def __init__(self):
         self.families, self.rootall, self.roots, self.cut, self.trap, self.lift = [], [], [], set(), set(), set()
-        self.ctors, self.datafuncs, self.wrap = [], [], set()
+        self.ctors, self.ctorsdata, self.datafuncs, self.wrap = [], [], [], set()
         p = os.path.join(HERE, 'sdklift_rules.txt')
         for line in open(p):
             line = line.split('#')[0].strip()
@@ -79,6 +81,8 @@ class Rules:
                 self.rootall.append(re.compile(arg))
             elif kind == 'ctors':
                 self.ctors.append(re.compile(arg))
+            elif kind == 'ctorsdata':
+                self.ctorsdata.append(re.compile(arg))
             elif kind == 'datafuncs':
                 self.datafuncs.append(re.compile(arg))
             elif kind == 'root':
@@ -262,21 +266,44 @@ def lift_function(env, entry):
     return '\n'.join(out), len(lines), bad, any('guest_svc' in s for _, s in lines)
 
 
+def data_addresses(start, end):
+    """Addresses in the sdk's data segment (.data / .bss) that the code in [start, end) computes with ADRP + ADD."""
+    data_start = SDK_BASE + MOD.sec['.data'][0]
+    page, out = {}, set()
+    for pc in range(start, end, 4):
+        w = R.word(pc)
+        if (w & 0x9f000000) == 0x90000000:                                  # adrp
+            imm = ((w >> 29) & 3) | (((w >> 5) & 0x7ffff) << 2)
+            page[w & 31] = (pc & ~0xfff) + (R.sext(imm, 21) << 12)
+        elif (w & 0xffc00000) == 0x91000000 and (w >> 5) & 31 in page:      # add xd, xn, #imm12
+            a = page[(w >> 5) & 31] + ((w >> 10) & 0xfff)
+            if a >= data_start:
+                out.add(a)
+    return out
+
+
 def selected_ctors(rules):
     """SDK static constructors (.init_array, in order) that directly call (BL / B, through PLT stubs) a function whose
-    name matches a `ctors` rule: on a console the SDK module runs them before the game starts."""
-    if not rules.ctors or 25 not in MOD.dt:
+    name matches a `ctors` rule, or that compute the address of a data object which a function matching a `ctorsdata`
+    rule also computes (the constructor sets up a global those functions use): on a console the SDK module runs them
+    before the game starts."""
+    if not (rules.ctors or rules.ctorsdata) or 25 not in MOD.dt:
         return []
     rel = {off: add for off, info, add in MOD.relocs() if (info & 0xffffffff) == 0x403}
     entries = [rel.get(MOD.dt[25] + 8 * k, 0) for k in range(MOD.dt[27] // 8)]
     env = Env(rules, [])
     env.compute_starts()
+    used = set()
+    if rules.ctorsdata:
+        for s, e in env.ends.items():
+            if any(c.search(n) for n in by_addr.get(s, []) for c in rules.ctorsdata):
+                used |= data_addresses(s, e)
     out = []
     for k, e in enumerate(entries):
         a = SDK_BASE + e
         if a not in env.ends:
             continue
-        hit = False
+        hit = bool(used & data_addresses(a, env.ends[a]))
         for pc in range(a, env.ends[a], 4):
             w = R.word(pc)
             if (w & 0x7c000000) == 0x14000000:

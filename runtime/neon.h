@@ -158,7 +158,7 @@ static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
     *d = r;
 }
 
-enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB };
+enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA };
 
 /* SMO port: saturation of an exact result to a signed / unsigned element of size sz (FPSR.QC is not modelled; the lifter
  * reads FPSR as 0, ssbu-recomp's rule) */
@@ -176,7 +176,7 @@ static inline uint64_t v_sat_u(__int128 v, int sz) {
 }
 
 static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int n) {
-    V128 a = *pn, b = *pm, r;
+    V128 a = *pn, b = *pm, acc = *d, r;
     r.d[0] = 0; r.d[1] = 0;
     uint64_t ones = sz == 3 ? ~0ull : ((1ull << (8 << sz)) - 1);
     for (int i = 0; i < n; i++) {
@@ -195,9 +195,20 @@ static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz
         case I_UQADD: z = v_sat_u((__int128)x + y, sz); break;
         case I_SQSUB: z = v_sat_s((__int128)vsext(x, sz) - vsext(y, sz), sz); break;
         case I_UQSUB: z = v_sat_u((__int128)x - y, sz); break;
+        case I_MLA: z = vget(&acc, sz, i) + x * y; break;            /* SMO port: d += n * m, modulo the size */
         }
         vset(&r, sz, i, z);
     }
+    *d = r;
+}
+
+/* SMO port: ADDV: the sum of the n elements (size sz) of n, modulo the size, alone in d (the rest zeroed). */
+static inline void v_addv(V128 *d, const V128 *pn, int sz, int n) {
+    uint64_t s = 0;
+    for (int i = 0; i < n; i++) s += vget(pn, sz, i);
+    V128 r;
+    r.d[0] = 0; r.d[1] = 0;
+    vset(&r, sz, 0, s);
     *d = r;
 }
 
@@ -248,6 +259,17 @@ static inline void v_qshrn(V128 *d, const V128 *pn, int shift, int dsz, int roun
     }
     if (!upper) { r.d[0] = 0; r.d[1] = 0; }
     for (int i = 0; i < n; i++) vset(&r, dsz, (upper ? n : 0) + i, out[i]);
+    *d = r;
+}
+/* SMO port: the scalar forms of the same (SQRSHRN h, s, #n ...): element 0 only, the rest of d zeroed. */
+static inline void v_qshrn_s(V128 *d, const V128 *pn, int shift, int dsz, int round, int src_signed, int dst_signed) {
+    uint64_t x = vget(pn, dsz + 1, 0);
+    __int128 v = src_signed ? (__int128)vsext(x, dsz + 1) : (__int128)x;
+    if (round) v += (__int128)1 << (shift - 1);
+    v >>= shift;
+    V128 r;
+    r.d[0] = 0; r.d[1] = 0;
+    vset(&r, dsz, 0, dst_signed ? v_sat_s(v, dsz) : v_sat_u(v, dsz));
     *d = r;
 }
 

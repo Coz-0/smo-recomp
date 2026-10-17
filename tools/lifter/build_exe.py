@@ -16,11 +16,13 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
 RT = os.path.join(REPO, 'runtime')
-GEN = os.path.join(REPO, 'build', 'gen')
-LIFT = os.path.join(REPO, 'build', 'lift', 'main')
-OBJ_GAME = os.path.join(REPO, 'build', 'obj', 'main')
-BIN = os.path.join(REPO, 'build', 'bin')
+GEN = T.build('gen')
+LIFT = T.build('lift', 'main')
+OBJ_GAME = T.build('obj', 'main')
+BIN = T.build('bin')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 SDL3 = os.environ.get('SDL3_ROOT') or os.path.join(REPO, 'deps', 'SDL3-3.4.18')
 VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
@@ -78,7 +80,7 @@ def main():
     os.makedirs(BIN, exist_ok=True)
     if build_game_dll(force):
         return 1
-    objdir = os.path.join(REPO, 'build', 'obj', 'host', os.path.splitext(exe)[0])
+    objdir = T.build('obj', 'host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
     deps = [p for p in glob.glob(os.path.join(RT, '*.h')) + glob.glob(os.path.join(RT, '*.inc')) +
             glob.glob(os.path.join(GEN, '*.h')) + [os.path.join(RT, 'nvn_vk_store.c'), os.path.join(RT, 'nvn_vk_draw.c'),

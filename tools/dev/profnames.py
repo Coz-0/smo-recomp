@@ -10,8 +10,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
 MAIN_BASE = 0x7100000000
 
 
@@ -19,10 +22,11 @@ def load_names(tsv):
     names = {}
     for line in open(tsv, encoding='utf-8', errors='replace'):
         f = line.rstrip('\n').split('\t')
-        if len(f) < 6 or not f[5]:
+        name = next((x for x in (f[5:6] + f[6:7] + f[8:9]) if x), '')   # symbol, decomp, RTTI (1.4.1)
+        if not name:
             continue
         try:
-            names[MAIN_BASE + int(f[0], 16)] = f[5].split('|')[0]
+            names[MAIN_BASE + int(f[0], 16)] = name.lstrip('#').split('|')[0]
         except ValueError:
             pass
     return names
@@ -39,7 +43,7 @@ def demangle(mangled):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('log')
-    ap.add_argument('--functions', default=os.path.join(REPO, 'build', 'functions', 'main_functions.tsv'))
+    ap.add_argument('--functions', default=T.build('functions', 'main_functions.tsv'))
     ap.add_argument('--width', type=int, default=110)
     a = ap.parse_args()
     lines = [l.rstrip('\n') for l in open(a.log, encoding='utf-8', errors='replace') if l.startswith('hostprof:')]

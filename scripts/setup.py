@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """One entry point: from a fresh clone and your own dump to a runnable native build of the game.
 
-    python scripts/setup.py --dump <folder> [--keys <prod.keys>] [--fw <firmware folder>] [--jobs N]
+    python scripts/setup.py --dump <folder> [--target <version>] [--keys <prod.keys>] [--fw <firmware folder>] [--jobs N]
 
 <folder> holds what you dumped from YOUR console (see BUILDING.md): the base package of Super Mario Odyssey 1.0.0,
-an .nsp with [0100000000010000] in its name (an update package [0100000000010800] next to it is read for its version
-only). Keys come from --keys, %SMO_KEYS%, ~/.switch/prod.keys or Ryujinx's folder (tools/extract/switchfs.py). The
-system fonts come from your firmware's .nca files (--fw; default: Ryujinx's installed firmware).
+an .nsp with [0100000000010000] in its name, and optionally its update package ([0100000000010800]). Keys come from
+--keys, %SMO_KEYS%, ~/.switch/prod.keys or Ryujinx's folder (tools/extract/switchfs.py). The system fonts come from
+your firmware's .nca files (--fw; default: Ryujinx's installed firmware).
+
+--target is the game version to build: 1.0.0 (the default: the base package alone, into build/) or the version of
+your update package (1.4.1: the update applied to the base, into a folder of its own, build/1.4.1/, laid out as build/
+is). The extracted packages (build/dump) are shared. See tools/target.py.
 
 Nothing of the game is stored in the repository: every step derives its files from the dump into <repo>/build (ignored
 by git). Steps run in this order and are resumable: a step whose output exists is skipped (--redo <step> repeats it,
@@ -37,7 +41,8 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = os.path.join(REPO, 'build')
+BUILD = os.path.join(REPO, 'build')             # the target's build folder, set in main()
+T = None                                        # tools/target.py, imported once SMO_TARGET is set
 PY = sys.executable
 
 
@@ -90,27 +95,31 @@ def decomp(a):
     return ['--decomp', a.decomp] if a.decomp else []
 
 
-# name, what it makes (for --status), done test (None: always runs), commands
+def update(a):
+    return [] if T.IS_BASE else ['--update']
+
+
+# name, what it makes (for --status; in the target's build folder), done test (None: always runs), commands
 STEPS = [
     ('deps', 'tools found', None, None),
-    ('extract', 'build/dump', lambda: exists('dump', 'base', 'elf', 'main.elf'),
+    ('extract', 'build/dump', lambda: os.path.exists(T.elf('main')),
      lambda a: [[PY, tool('extract', 'extract.py')] + need_dump(a) + keys(a) + decomp(a)]),
-    ('romfs', 'build/romfs', lambda: nonempty('romfs'),
-     lambda a: [[PY, tool('extract', 'romfs.py')] + need_dump(a) + keys(a)]),
-    ('manual', 'build/manual', lambda: nonempty('manual'),
-     lambda a: [[PY, tool('extract', 'romfs.py'), '--manual'] + need_dump(a) + keys(a)]),
-    ('fonts', 'build/sysdata/fonts', lambda: nonempty('sysdata', 'fonts'),
+    ('romfs', 'romfs', lambda: nonempty('romfs'),
+     lambda a: [[PY, tool('extract', 'romfs.py')] + update(a) + need_dump(a) + keys(a)]),
+    ('manual', 'manual', lambda: nonempty('manual'),
+     lambda a: [[PY, tool('extract', 'romfs.py'), '--manual'] + update(a) + need_dump(a) + keys(a)]),
+    ('fonts', 'sysdata/fonts', lambda: nonempty('sysdata', 'fonts'),
      lambda a: [[PY, tool('extract', 'fw_fonts.py')] + (['--fw', a.fw] if a.fw else []) + keys(a)]),
-    ('functions', 'build/functions', lambda: exists('functions', 'main_functions.tsv'),
+    ('functions', 'functions', lambda: exists('functions', 'main_functions.tsv'),
      lambda a: [[PY, tool('extract', 'functions.py')] + decomp(a)]),
-    ('lift', 'build/lift/main', lambda: exists('lift', 'main', 'table.c'),
+    ('lift', 'lift/main', lambda: exists('lift', 'main', 'table.c'),
      lambda a: [[PY, tool('lifter', 'recomp.py'), 'full']]),
-    ('compile', 'build/obj/main', None, lambda a: [[PY, tool('lifter', 'build_main.py'), str(a.jobs)]]),
-    ('tables', 'build/gen', None,
+    ('compile', 'obj/main', None, lambda a: [[PY, tool('lifter', 'build_main.py'), str(a.jobs)]]),
+    ('tables', 'gen', None,
      lambda a: [[PY, tool('lifter', 'gen_tables.py')], [PY, tool('lifter', 'gen_sdktest.py')]]),
-    ('sdk', 'build/gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
+    ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
-    ('link', 'build/bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
+    ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
     ('check', 'difftest + linkcheck', None,
      lambda a: [[PY, tool('lifter', 'difftest.py'), 'all'], [PY, tool('lifter', 'linkcheck.py')]]),
 ]
@@ -120,6 +129,8 @@ NAMES = [s[0] for s in STEPS]
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dump', help='folder holding your base NSP (and optionally the update NSP)')
+    ap.add_argument('--target', default='1.0.0', help='game version to build: 1.0.0 (the base package, into build/) or '
+                                                      'your update\'s version (into build/<version>/)')
     ap.add_argument('--keys', help='your prod.keys (default: searched, see tools/extract/switchfs.py)')
     ap.add_argument('--fw', help="folder of your firmware's .nca files, for the system fonts")
     ap.add_argument('--decomp', help='a local OdysseyDecomp clone (optional: names in the function list, a version check)')
@@ -131,11 +142,17 @@ def main():
     ap.add_argument('--from', dest='from_step', choices=NAMES)
     ap.add_argument('--check', action='store_true', help='also run the check step at the end')
     a = ap.parse_args()
+    global T, BUILD
+    os.environ['SMO_TARGET'] = a.target                    # every step's tools read it (tools/target.py)
+    sys.path.insert(0, os.path.join(REPO, 'tools'))
+    T = importlib.import_module('target')
+    BUILD = T.BUILD
 
     if a.steps:
         print('\n'.join(NAMES))
         return
     if a.status:
+        print('target %s: %s' % (T.TARGET, os.path.relpath(BUILD, REPO)))
         for name, made, done, _ in STEPS:
             state = 'runs every time (incremental)' if done is None else ('done' if done() else 'to do')
             print('  %-10s %-28s %s' % (name, made, state if name not in ('deps', 'check') else 'on demand'))
@@ -157,14 +174,17 @@ def main():
             continue
         if done is not None and done() and not forced:
             print('[%s] done (%s)' % (name, made))
-            continue
-        for cmd in cmds(a):
-            print('[%s] %s' % (name, ' '.join(os.path.relpath(c, REPO) if c.startswith(REPO) else c for c in cmd[1:])), flush=True)
-            r = subprocess.run(cmd, cwd=REPO)
-            if r.returncode != 0:
-                raise SystemExit('[%s] failed (exit code %d); fix the cause and run setup again, it resumes here' % (name, r.returncode))
+        else:
+            for cmd in cmds(a):
+                print('[%s] %s' % (name, ' '.join(os.path.relpath(c, REPO) if c.startswith(REPO) else c for c in cmd[1:])), flush=True)
+                r = subprocess.run(cmd, cwd=REPO)
+                if r.returncode != 0:
+                    raise SystemExit('[%s] failed (exit code %d); fix the cause and run setup again, it resumes here' % (name, r.returncode))
+        if name == 'extract' and not T.IS_BASE and T.update_version() != T.TARGET:
+            raise SystemExit('--target %s: the update package in build/dump is %s' % (T.TARGET, T.update_version() or 'missing'))
     if 'link' in todo:
-        print('\nBuilt: build/bin/smo_native.exe. Start the game with: python scripts/run.py <run name> --seconds 300')
+        print('\nBuilt: %s. Start the game with: python scripts/run.py <run name>%s --seconds 300'
+              % (os.path.relpath(T.build('bin', 'smo_native.exe'), REPO), '' if T.IS_BASE else ' --target ' + T.TARGET))
 
 
 if __name__ == '__main__':

@@ -77,7 +77,7 @@ static const char *const lifted_replacements[] = {
 void register_nnnet_imports(void) {
     int n = (int)(sizeof net_imports / sizeof net_imports[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(net_imports[i].name)) printf("nnnet: \"%s\" is not an import of the game (typo?)\n", net_imports[i].name);
+        if (!import_data(net_imports[i].name)) printf("nnnet: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", net_imports[i].name);
     register_imports(net_imports, n);
     if (!sdk_image_ready()) return;
     for (int i = 0; i < (int)(sizeof lifted_replacements / sizeof lifted_replacements[0]); i++)

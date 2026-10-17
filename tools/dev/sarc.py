@@ -9,6 +9,8 @@ import struct
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
 
 
 def yaz0(d):
@@ -60,7 +62,7 @@ def sarc(d):
 
 def main():
     for p in sys.argv[1:]:
-        full = os.path.join(REPO, 'build', 'romfs', p)
+        full = T.build('romfs', p)
         for name, size in sarc(yaz0(open(full, 'rb').read())):
             print('%s\t%s\t%d' % (p, name, size))
 

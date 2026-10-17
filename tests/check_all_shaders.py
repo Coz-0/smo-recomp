@@ -22,9 +22,11 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROM = os.path.join(REPO, 'build', 'romfs')
-OUT = os.path.join(REPO, 'build', 'shaders_all')
-BIN = os.path.join(REPO, 'build', 'bin')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+ROM = T.build('romfs')
+OUT = T.build('shaders_all')
+BIN = T.build('bin')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 sys.path.insert(0, os.path.join(REPO, 'tools', 'dev'))
 from sarc import yaz0  # noqa: E402
@@ -77,7 +79,9 @@ def stages_of(blob):
     program header at +0x30), its length from its own instructions, its constant data the bytes from the next 0x100
     boundary after it to the next section (at most 64 KB; only jump tables are read from it at translation). Compute
     sections have no magic: in an agl archive (magic "BAHS") they follow each other from the code region (header word 7)
-    in the order of their control sections (+0x714 stage 5), each checked to end within the size its control gives."""
+    in the order of their control sections (+0x714 stage 5), each checked to end within the size its control gives; in
+    a BNSH container (nn::gfx) through the record, inside that container, that holds the control's and the code's
+    offsets."""
     n4 = len(blob) // 4
     words = struct.unpack_from('<%dI' % n4, blob)
     codes = [i * 4 for i, w in enumerate(words) if w == CODE and (i * 4) % 0x100 == 0 and not any(words[i + 1:i + 12])]
@@ -116,19 +120,24 @@ def stages_of(blob):
             i = blob.find(b'BNSH', i + 4)
         for c in [i * 4 for i, w in enumerate(words) if w == CTL and i * 4 + 0x760 <= len(blob) and words[i + 0x714 // 4] == 5]:
             # BNSH (nn::gfx): offsets are from the container's start, and a stage's control offset is stored as a u64 with
-            # its code offset right after it; a compute code section starts with its first instruction group
+            # its code offset right after it; a compute code section starts with its first instruction group. The record
+            # and the code lie inside the container (file size at +0x1c), and only there are they looked for: the same
+            # eight bytes can occur elsewhere in the blob (an effect archive of the 1.4.1 update has them in data
+            # outside the container, beside "code" that is data and ends with a stray EXIT).
             b = max((s for s in starts if s < c), default=None)
             size, cbsize, cboff = struct.unpack_from('<III', blob, c + 0x6f8)
             got = None
             if b is not None:
-                pat, p = struct.pack('<Q', c - b), blob.find(struct.pack('<Q', c - b))
+                bend = min(len(blob), b + struct.unpack_from('<I', blob, b + 0x1c)[0])
+                pat = struct.pack('<Q', c - b)
+                p = blob.find(pat, b, bend)
                 while p >= 0 and got is None:
-                    if p % 8 == 0 and p + 16 <= len(blob):
+                    if p % 8 == 0 and p + 16 <= bend:
                         x = b + struct.unpack_from('<Q', blob, p + 8)[0]
-                        end = program_end(blob, x, min(len(blob), x + size + 0x100), fallback=True) if x + 32 <= len(blob) else None
-                        if end is not None and end <= size + 0x20:
+                        end = program_end(blob, x, min(len(blob), x + size + 0x100), fallback=True) if x + 32 <= bend else None
+                        if end is not None and end <= size + 0x20 and x + size <= bend:
                             got = x
-                    p = blob.find(pat, p + 1)
+                    p = blob.find(pat, p + 1, bend)
             if got is None:
                 bad += 1
                 continue
@@ -191,7 +200,7 @@ def main():
                         elif struct.pack('<I', CTL) in inner:
                             take(label + ':' + name, inner)
     for mod in ('main', 'sdk'):
-        p = os.path.join(REPO, 'build', 'dump', 'base', 'elf', mod + '.elf')
+        p = T.elf(mod)
         if os.path.exists(p):
             take(mod + '.elf', open(p, 'rb').read())
     for line in report:

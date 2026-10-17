@@ -1,21 +1,23 @@
 # smo-recomp
 
-A **static recompilation** of *Super Mario Odyssey* (version 1.0.0) from the Nintendo Switch to a native Windows x64
-program, with its own runtime and a Vulkan renderer.
+A **static recompilation** of *Super Mario Odyssey* (version 1.0.0, and its 1.4.1 update) from the Nintendo Switch to a
+native Windows x64 program, with its own runtime and a Vulkan renderer.
 
 It is **not an emulator**: there is no CPU interpreter and no JIT. The game's AArch64 machine code is translated to C
 ahead of time and compiled for the PC; the console's system libraries, graphics API, audio, video, input and file
 system are re-implemented by this project's runtime.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own legally obtained copy of the game (1.0.0) and keys and firmware dumped from your own console.
+> You need your own legally obtained copy of the game (1.0.0; for 1.4.1 also its update) and keys and firmware dumped
+> from your own console.
 > Everything derived from them is generated on your PC, from your dump, under `build/`, and never leaves it.
 
 ## Status (October 2026)
 
 Early, not finished: played by hand up to Cascade Kingdom's first checkpoint, the start checked with scripted input.
 What is written here was measured on the development PC (Windows 11, RTX 4090); where something was not checked, it
-says so.
+says so. The table is version 1.0.0; the 1.4.1 update builds and runs too, and what was checked on it is listed
+[below](#the-141-update).
 
 | Area | State |
 |---|---|
@@ -38,13 +40,30 @@ says so.
 | Online | not available (the network services answer as an offline console) |
 | amiibo | F1, or both stick buttons on a pad (`controllers.ini` `[hotkeys]`), opens a menu drawn like the game's pause menu, from the game's own layout textures, fonts and texts: the 91 amiibo the game has names for, in its language. The game waits while it is open; A puts the chosen amiibo on a virtual NFC reader, and if the game is waiting for one (its amiibo mode, the amiibo NPC's prompt) → is held for you until it has read it. Checked in Cascade Kingdom with scripted input: Mario (the game runs its invincibility help), Peach (a Life-Up Heart), Bowser (its coin help), Luigi (coins); chosen in the game's own pause menu, the amiibo waits on the reader until → is held. The amiibo NPC's prompt was not tried |
 
+### The 1.4.1 update
+
+With your update package, the same sources build the game as the update leaves it (`--target 1.4.1`, beside 1.0.0).
+Checked on 1.4.1 so far:
+
+| Area | State |
+|---|---|
+| Game files | the update's RomFS is a patch of the base's; the extraction applies it (336 files added, 246 changed), and `tools/extract/romfs.py --update --verify` checks every block against the update's own hash tree: 346,568 blocks and the levels above them, 0 wrong |
+| Boot, new game, a 1.0.0 save | a new game starts at the mode select; a 1.0.0 save made at Cascade Kingdom's first checkpoint loads after the game's update notifications, and play resumes there |
+| Scripted Cap Kingdom run | `tests/run_cap_kingdom.py` passes: 13 of 13 checkpoints from an empty save to the frog capture, 0 host exceptions, 0 Vulkan call failures, 0 operations not implemented (3 of 3 runs passed; 40,472 frames in the last) |
+| Speed | Cascade Kingdom's first checkpoint: 60.0 fps in all 24 windows of 300 frames (1% lows 52.7-57.0), with the fast path for the game's sampler list that 1.0.0 uses too (without it 59.88 fps on average, 1% lows down to 43.6). Scripted Cap Kingdom run, with a screenshot every 300 frames: 59.4 fps on average once play begins, lowest 48.3 while the tower stage loads |
+| Shaders | every stage in the game's shader archives translates and compiles, the update's new ones included: 27,886 of 27,886 distinct stages (7,380 vertex, 20,435 fragment, 3 geometry, 68 compute). One small fragment shader the game creates at start-up, from outside those archives, is not translated yet (its texture handle is read from a uniform buffer): no draw used it from start-up to the mode select (70,752 draws, 0 skipped); later scenes not checked |
+| Sound | the game's audio renderer runs on the update's newer system library, whose commands are laid out differently; both layouts are read: 141,972 audio frames in the scripted run, 0 dropped samples, 0 underruns |
+| System calls | the ones 1.4.1 adds are implemented: 333 of 333 reached in the scripted run; `SMO_IMPORT_SELFTEST=1` 0 failures |
+| Not tried yet | what the update adds (Balloon World, the new Snapshot Mode filters and the rest its notification screens list, the Labo VR mode), the amiibo menu, play by hand |
+
 ## How it works
 
 - **Extraction** (`tools/extract`): reads your NSP in place (NCA/PFS0/RomFS readers, keys from your own `prod.keys`) and writes the ELF images, the RomFS and the system fonts to `build/`.
 - **Function boundaries** come from the executable's `.eh_frame` unwind data and its own symbol table, never from guesses: 74,822 functions in `main`.
 - **Lifter** (`tools/lifter/recomp.py`): translates each AArch64 function into one C function operating on a register context. The output is compiled with clang into a game DLL; nothing is interpreted at run time.
-- **Differential testing** (`tools/lifter/difftest.py`): sampled instruction shapes run both as lifted C and in the Unicorn CPU emulator, over random, special floating-point, branch and trap inputs; any difference is a failure (23,068 of 23,068 equal). A mutation test checks that the harness catches planted bugs.
+- **Differential testing** (`tools/lifter/difftest.py`): sampled instruction shapes run both as lifted C and in the Unicorn CPU emulator, over random, special floating-point, branch and trap inputs; any difference is a failure (1.0.0: 23,069 of 23,069 equal; 1.4.1: 23,194 of 23,194). A mutation test checks that the harness catches planted bugs.
 - **System-library lifting** (`tools/lifter/sdklift.py`): parts of the game's own SDK, such as the audio renderer and its DSP, are lifted the same way, so the host only provides the bottom layer (timers, events, memory, the audio device).
+- **Game versions** (`tools/target.py`): 1.0.0, or with the update package 1.4.1, each built in a folder of its own (`build\` and `build\1.4.1\`). The update's RomFS is a patch of the base's (a relocation table and the counter generations of its encryption) that the extraction applies. Its executable keeps almost no symbols: the game's state names come from its RTTI, and the functions the runtime replaces with host code are found by matching them with 1.0.0's. Where its newer system library lays data out differently (the audio commands), the runtime reads it per version.
 - **Host runtime** (`runtime/`), adapted from [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp):
   - Horizon OS services: `nn::os` threads and events, `nn::fs` with save-data journalling, hid, settings, an offline network stack.
   - An NVN → Vulkan graphics back end. Command lists are recorded on the game's threads and replayed on a render thread; a recorded list lives until the game finalizes it or records over its memory, as on the console.
@@ -63,11 +82,13 @@ says so.
 - Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
 - Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`).
 - Play with other physical controllers (PlayStation, Switch Pro), other GPUs (AMD, Intel).
+- 1.4.1: the one shader not translated yet; checks of what the update adds (Balloon World, the Snapshot Mode filters,
+  the Labo VR mode) and of the amiibo menu.
 
 ## Requirements
 
 - Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* 1.0.0 dump (the base NSP), and `prod.keys` and firmware dumped from your own Switch.
+- Your own *Super Mario Odyssey* 1.0.0 dump (the base NSP; for 1.4.1 also its update NSP), and `prod.keys` and firmware dumped from your own Switch.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041, the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, Python 3.13.
 
 ## Building and running
@@ -81,6 +102,10 @@ py -3.13 -m venv .venv
 .venv\Scripts\python scripts\run.py first --seconds 300
 ```
 
+For 1.4.1, put the update NSP in the same folder and add `--target 1.4.1` to the last two commands. That build lives in
+`build\1.4.1\`, beside the 1.0.0 one, with saves of its own in `build\1.4.1\userdata`; copy `build\userdata\save` there
+to continue a 1.0.0 save.
+
 Debugging aids (frame and per-pass captures, shader dumps, guest call stacks on crashes, heap write watches, state
 logs) are described in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
 
@@ -89,7 +114,8 @@ logs) are described in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
 ```
 runtime/         host runtime: OS services, NVN -> Vulkan, shader translator, audio, input, movies, state tracker
 scripts/         setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
-tools/extract/   NSP/NCA/RomFS readers, function list, RomFS and font extraction
+tools/target.py  which game version a build is for (1.0.0, or the 1.4.1 update) and where its files go
+tools/extract/   NSP/NCA/RomFS readers (the update's RomFS patch too), function list, RomFS and font extraction
 tools/lifter/    AArch64 -> C lifter, system-library lifter, differential test, build steps
 tools/dev/       disassembler, caller finder, SARC and stage-placement listers, Maxwell instruction namer
 tools/port/      idempotent adaptation of the ssbu-recomp runtime sources

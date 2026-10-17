@@ -197,20 +197,45 @@ static void sink_submit(void) {                   /* the block g_wcur is full */
     }
     g_wcur = (g_wcur + 1) % SINK_NBLK; g_wfill = 0;
 }
-static void audio_sink_out(const uint8_t *cmd, uint64_t mb, uint32_t ns) {
-    uint32_t nin; uint64_t sbuf;
-    memcpy(&nin, cmd + 0x120, 4); memcpy(&sbuf, cmd + 0x118, 8);
+/* The command header and the device sink command, as each SDK writes them:
+ *   3.5.1 [sdk 0x18aab8 GenerateDeviceSinkCommand]: {u32 magic 0xcafebabe, u16 size, u16 type (0xf: device sink), u32
+ *         estimated time, u32 node}, +0x10 enabled, +0x14 device name, +0x118 sample buffer, +0x120 input count, +0x124
+ *         the mix buffer of each channel (u8, already offset).
+ *   7.3.2 [sdk 7.3.2 0x9f950 CommandBuffer::GenerateDeviceSinkCommand]: {u32 magic, u8 enabled, u8 type (0x10: device
+ *         sink), u16 size, u32 estimated time, u32 node}, +0x20 device name (256), +0x120 session, +0x128 sample buffer,
+ *         +0x130 input count, +0x134 the mix buffer of each channel (u16, already offset).
+ * SDK_VERSION (image.h, the program NCA's SDK) says which; the SDKs between those two are not known here. */
+typedef struct { const char *name; uint32_t inputs; uint64_t sample_buffer; unsigned index[6]; } Sink;
+#if SDK_VERSION >= 0x07000000u
+#define SINK_TYPE 0x10u
+static void cmd_header(const uint8_t *c, unsigned *size, unsigned *type, int *enabled) { *enabled = c[4]; *type = c[5]; *size = c[6] | (unsigned)c[7] << 8; }
+static void sink_fields(const uint8_t *c, Sink *s) {
+    s->name = (const char *)(c + 0x20);
+    memcpy(&s->sample_buffer, c + 0x128, 8); memcpy(&s->inputs, c + 0x130, 4);
+    for (int i = 0; i < 6; i++) s->index[i] = c[0x134 + 2 * i] | (unsigned)c[0x135 + 2 * i] << 8;
+}
+#else
+#define SINK_TYPE 0xfu
+static void cmd_header(const uint8_t *c, unsigned *size, unsigned *type, int *enabled) { *size = c[4] | (unsigned)c[5] << 8; *type = c[6] | (unsigned)c[7] << 8; *enabled = c[0x10]; }
+static void sink_fields(const uint8_t *c, Sink *s) {
+    s->name = (const char *)(c + 0x14);
+    memcpy(&s->sample_buffer, c + 0x118, 8); memcpy(&s->inputs, c + 0x120, 4);
+    for (int i = 0; i < 6; i++) s->index[i] = c[0x124 + i];
+}
+#endif
+static void audio_sink_out(const Sink *s, uint64_t mb, uint32_t ns) {
+    uint32_t nin = s->inputs;
     if (g_wopen < 0) {
         sink_open();
         printf("smo_audio: device sink \"%.32s\": %u channels, mix buffers %u %u %u %u %u %u, %u samples per frame, sample buffer %llx\n",
-               (const char *)(cmd + 0x14), nin, cmd[0x124], cmd[0x125], cmd[0x126], cmd[0x127], cmd[0x128], cmd[0x129], ns, (unsigned long long)sbuf);
+               s->name, nin, s->index[0], s->index[1], s->index[2], s->index[3], s->index[4], s->index[5], ns, (unsigned long long)s->sample_buffer);
     }
     if (!g_wopen || !mb || !ns || nin == 0 || nin > 6) return;
     if (ns != 240) { static int said; if (!said++) printf("smo_audio: the renderer does not run at 48 kHz (%u samples per 5 ms frame): its upsampler output is NOT IMPLEMENTED, no sound\n", ns); return; }
-    /* +0x118 is always filled ([sdk 0x18ad4c]: the translated upsampler buffer, or the caller's argument): at 48 kHz the sink reads the mix buffers */
-    const int32_t *L = (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x124] * ns * 4), *R = (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x124 + (nin > 1)] * ns * 4);
-    const int32_t *C = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x126] * ns * 4) : NULL;      /* 6 channels: FL FR FC LFE BL BR; FC and the backs folded in */
-    const int32_t *BL = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x128] * ns * 4) : NULL, *BR = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)cmd[0x129] * ns * 4) : NULL;
+    /* the sample buffer is always filled ([sdk 0x18ad4c]: the translated upsampler buffer, or the caller's argument): at 48 kHz the sink reads the mix buffers */
+    const int32_t *L = (const int32_t *)(uintptr_t)(mb + (uint64_t)s->index[0] * ns * 4), *R = (const int32_t *)(uintptr_t)(mb + (uint64_t)s->index[nin > 1] * ns * 4);
+    const int32_t *C = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)s->index[2] * ns * 4) : NULL;      /* 6 channels: FL FR FC LFE BL BR; FC and the backs folded in */
+    const int32_t *BL = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)s->index[4] * ns * 4) : NULL, *BR = nin >= 6 ? (const int32_t *)(uintptr_t)(mb + (uint64_t)s->index[5] * ns * 4) : NULL;
     float vol = g_dev_volume[0];
     for (uint32_t i = 0; i < ns; i++) {
         float l = (float)L[i], r = (float)R[i];
@@ -243,14 +268,74 @@ static void dsp_SendCommandBuffer(Ctx *c) {
         if (!scount) { mixbufs = lifted("_ZNK2nn5audio3dsp20CommandListProcessor13GetMixBuffersEv"); scount = lifted("_ZNK2nn5audio3dsp20CommandListProcessor14GetSampleCountEv"); }
         c->x[0] = p; mixbufs(c); uint64_t mb = c->x[0];
         c->x[0] = p; scount(c); uint32_t ns = (uint32_t)c->x[0];
-        for (uint64_t o = 0; o + 0x10 <= size;) {           /* the list: a header, then commands {magic 0xcafebabe, u16 size, u16 type, ...} */
+        {   /* SMO_AUDIO_SCAN=<n>: every n lists, the mix buffers that hold a non-zero sample and their peaks */
+            static int every = -1;
+            static ImportFn bcount;
+            if (every < 0) { const char *e = getenv("SMO_AUDIO_SCAN"); every = e ? atoi(e) : 0; }
+            if (every > 0 && g_lists % every == 0 && mb && ns) {
+                if (!bcount) bcount = lifted("_ZNK2nn5audio3dsp20CommandListProcessor14GetBufferCountEv");
+                c->x[0] = p; bcount(c);
+                unsigned nb = (unsigned)c->x[0], shown = 0;
+                printf("smo_audio: list %lld: %u mix buffers of %u samples at %llx; with signal:", (long long)g_lists, nb, ns, (unsigned long long)mb);
+                for (unsigned b = 0; b < nb && b < 256; b++) {
+                    const int32_t *s = (const int32_t *)(uintptr_t)(mb + (uint64_t)b * ns * 4);
+                    int32_t peak = 0;
+                    for (uint32_t i = 0; i < ns; i++) { int32_t v = s[i] < 0 ? -s[i] : s[i]; if (v > peak) peak = v; }
+                    if (peak && shown++ < 24) printf(" %u:%d", b, peak);
+                }
+                printf("%s\n", shown ? "" : " none");
+            }
+        }
+        static int scan_every = -1;                         /* SMO_AUDIO_SCAN: also the commands of the list, by type */
+        if (scan_every < 0) { const char *e = getenv("SMO_AUDIO_SCAN"); scan_every = e ? atoi(e) : 0; }
+        int scan = scan_every > 0 && g_lists % scan_every == 0;
+        unsigned hist[64][2];
+        if (scan) memset(hist, 0, sizeof hist);
+        for (uint64_t o = 0; o + 0x10 <= size;) {           /* the list: a header, then commands {magic 0xcafebabe, ...} (cmd_header) */
             const uint8_t *cmd = (const uint8_t *)(uintptr_t)(list + o);
-            uint32_t magic; uint16_t csz, type;
-            memcpy(&magic, cmd, 4); memcpy(&csz, cmd + 4, 2); memcpy(&type, cmd + 6, 2);
+            uint32_t magic;
+            unsigned csz, type;
+            int enabled;
+            memcpy(&magic, cmd, 4);
             if (magic != 0xcafebabeu) { o += 4; continue; }
-            if (type == 0xf && cmd[0x10]) audio_sink_out(cmd, mb, ns);
+            cmd_header(cmd, &csz, &type, &enabled);
+            if (scan && type < 64) {
+                hist[type][enabled != 0]++;
+                static long long shown_list = -1;
+                const char *dump = getenv("SMO_AUDIO_SCAN_TYPE");            /* per scanned list, the first command of this type: its first 0x100 bytes */
+                if (dump && (unsigned)strtoul(dump, NULL, 16) == type && enabled && shown_list != g_lists) {
+                    shown_list = g_lists;
+                    printf("smo_audio: command type %x, %u bytes:", type, csz);
+                    for (unsigned i = 0; i < 0x100 && i < csz; i += 8) { uint64_t q; memcpy(&q, cmd + i, 8); printf("%s%016llx", i % 32 ? " " : "\n  ", (unsigned long long)q); }
+                    const char *at = getenv("SMO_AUDIO_SCAN_AT");                /* hex offset in the command of a pointer: 32 bytes it points to */
+                    if (at) {
+                        uint64_t ptr;
+                        memcpy(&ptr, cmd + strtoul(at, NULL, 16), 8);
+                        printf("\n  at +%s -> %llx:", at, (unsigned long long)ptr);
+                        __try { for (int i = 0; i < 32; i++) printf(" %02x", ((const uint8_t *)(uintptr_t)ptr)[i]); } __except (1) { printf(" (unreadable)"); }
+                    }
+                    printf("\n");
+                }
+            }
+            if (type == SINK_TYPE && enabled) { Sink s; sink_fields(cmd, &s); audio_sink_out(&s, mb, ns); }
             if (csz < 0x10) break;
             o += csz;
+        }
+        if (scan) {
+            printf("smo_audio: list %lld: %llu bytes; commands type:enabled/disabled", (long long)g_lists, (unsigned long long)size);
+            for (int t = 0; t < 64; t++) if (hist[t][0] || hist[t][1]) printf(" %x:%u/%u", t, hist[t][1], hist[t][0]);
+            printf("\n  in order:");
+            for (uint64_t o = 0; o + 0x10 <= size;) {
+                const uint8_t *cmd = (const uint8_t *)(uintptr_t)(list + o);
+                uint32_t magic; unsigned csz, type; int enabled;
+                memcpy(&magic, cmd, 4);
+                if (magic != 0xcafebabeu) { o += 4; continue; }
+                cmd_header(cmd, &csz, &type, &enabled);
+                printf(" %x%s", type, enabled ? "" : "-");
+                if (csz < 0x10) break;
+                o += csz;
+            }
+            printf("\n");
         }
     }
     c->x[30] = lr;

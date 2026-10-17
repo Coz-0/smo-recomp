@@ -502,6 +502,9 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ret0},
     {"_ZN2nn7friends17NotificationQueue8FinalizeEv", ret0},
     {"_ZN2nn3mem17StandardAllocator10InitializeEPvm", stdalloc_Initialize},
+    /* 1.4.1 (NintendoSDK 7.3.2) imports this overload: the bool turns on a per-thread cache (stored at +1, a TLS slot
+     * allocated, [sdk 7.3.2 0x2de1d0]); the host heap has no such cache, so it is the same call */
+    {"_ZN2nn3mem17StandardAllocator10InitializeEPvmb", stdalloc_Initialize},
     {"_ZN2nn3mem17StandardAllocator8FinalizeEv", keep},
     {"_ZN2nn3mem17StandardAllocator8AllocateEm", stdalloc_Allocate},
     {"_ZN2nn3mem17StandardAllocator8AllocateEmm", stdalloc_AllocateAligned},

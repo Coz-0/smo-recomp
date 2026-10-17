@@ -366,6 +366,30 @@ static void oe_IsUserInactivityDetectionTimeExtended(Ctx *c) { c->x[0] = (uint64
 static void nifm_HandleNetworkRequestResult(Ctx *c) { c->x[0] = 0x17c6e; }
 static void nifm_SetLocalNetworkMode(Ctx *c) { (void)c; }
 
+/* ---- imported by 1.4.1 only (NintendoSDK 7.3.2); registering a name the game does not import does nothing.
+ * Labo VR, as the game drives it ([game 1.4.1] 0x7b4c80: pl::BeginVrMode, and only when it succeeds
+ * BeginBlockingHomeButton + DisableRecording; 0x7b4cc0: EndVrMode, EndBlockingHomeButton, EnableRecording):
+ *   oe::BeginBlockingHomeButton / EndBlockingHomeButton [sdk 7.3.2 0x3218c0 / 0x321920]: one request each to the
+ *       application functions (abort on failure). This port has no HOME button to block: nothing to do.
+ *   oe::EnableRecording [0x323640]: the same, to allow the video capture again; there is no video capture here (see
+ *       EnableGamePlayRecording above; DisableRecording does nothing either, nnsdk.c).
+ * Stereo vision (parental controls), as the game checks it before VR ([game 1.4.1] 0x568fe0 / 0x569050): it shows an
+ * error and gives up if ConfirmStereoVisionRestrictionConfigurable fails; else, when GetStereoVisionRestriction differs
+ * from what it wants, RequestStereoVisionRestrictionConfigurationPermission (0x16c8e: cancelled) and then
+ * SetStereoVisionRestriction.
+ *   pctl::ConfirmStereoVisionRestrictionConfigurable [sdk 7.3.2 0x330840]: the module's Result.
+ *   pctl::RequestStereoVisionRestrictionConfigurationPermission [0x330880]: the same request; only when it fails, the
+ *       PIN applet.
+ *   pctl::GetStereoVisionRestriction [0x3308e0] / SetStereoVisionRestriction(bool) [0x330940]: the module's setting.
+ * A console without parental controls: configurable without a PIN (0), no restriction set; the setting the game makes
+ * is kept for the session. */
+static void oe_HomeButtonBlocking(Ctx *c) { (void)c; }
+static void oe_EnableRecording(Ctx *c) { (void)c; }
+static volatile LONG g_stereo_restricted;
+static void pctl_StereoConfigurable(Ctx *c) { c->x[0] = 0; }
+static void pctl_GetStereoVisionRestriction(Ctx *c) { c->x[0] = g_stereo_restricted != 0; }
+static void pctl_SetStereoVisionRestriction(Ctx *c) { InterlockedExchange(&g_stereo_restricted, (LONG)(c->x[0] & 1)); }
+
 static const ImportDef smo_imports[] = {
     {"_ZN2nn4nifm26HandleNetworkRequestResultEv", nifm_HandleNetworkRequestResult},
     {"_ZN2nn4nifm19SetLocalNetworkModeEb", nifm_SetLocalNetworkMode},
@@ -400,6 +424,13 @@ static const ImportDef smo_imports[] = {
     {"_ZN2nn2oe28SetResumeNotificationEnabledEb", oe_SetResumeNotificationEnabled},
     {"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", oe_SetPerformanceModeChangedNotificationEnabled},
     {"_ZN2nn5prepo10PlayReportC1EPKc", prepo_PlayReport_ctor_id},
+    /* 1.4.1 only (see above) */
+    {"_ZN2nn2oe23BeginBlockingHomeButtonEv", oe_HomeButtonBlocking}, {"_ZN2nn2oe21EndBlockingHomeButtonEv", oe_HomeButtonBlocking},
+    {"_ZN2nn2oe15EnableRecordingEv", oe_EnableRecording},
+    {"_ZN2nn4pctl42ConfirmStereoVisionRestrictionConfigurableEv", pctl_StereoConfigurable},
+    {"_ZN2nn4pctl53RequestStereoVisionRestrictionConfigurationPermissionEv", pctl_StereoConfigurable},
+    {"_ZN2nn4pctl26GetStereoVisionRestrictionEv", pctl_GetStereoVisionRestriction},
+    {"_ZN2nn4pctl26SetStereoVisionRestrictionEb", pctl_SetStereoVisionRestriction},
 };
 
 void register_smo_imports(void) {

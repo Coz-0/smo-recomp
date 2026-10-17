@@ -95,7 +95,8 @@ The end of every log has the counts that tell whether a run was healthy:
   are tied to three processors and must come before other programs' threads there; `runtime/os_threads.c`).
 - `SMO_FAST=0` leaves the game's own code where `runtime/smo_fast.c` puts host code in its place (the sort of the
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
-  results ever differ.
+  results ever differ. An update's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
+  by matching the base executable's (in `build\dump\base`), and the log says so when the fast path stays off.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
@@ -167,3 +168,9 @@ The end of every log has the counts that tell whether a run was healthy:
   `tools\dev\byml.py StageData\<Stage>Map.szs --scenario 0 --grep <name>` lists the objects placed in a stage, with
   their positions (prints to the console only).
 - `tools\lifter\mapaddr.py` names host addresses from the linker map.
+- The function list (`build\functions\<module>_functions.tsv`) names functions by the module's own symbols, by
+  OdysseyDecomp's names (`--decomp`, 1.0.0 only) and, for `main`, the `execute` function of every state class from its
+  RTTI (column `rtti_name`; on 1.0.0 these are the same names wherever the other two have one; in 1.4.1, whose `main`
+  keeps almost no symbols, they are the only names).
+- For another game version, set `SMO_TARGET` (for example `set SMO_TARGET=1.4.1`): the tools then read
+  `build\dump\update` and `build\1.4.1\` (see `tools\target.py`).

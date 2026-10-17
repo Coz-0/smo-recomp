@@ -708,7 +708,7 @@ static const ImportDef album_imports[] = {
 void register_nnalbum_imports(void) {
     int n = (int)(sizeof album_imports / sizeof album_imports[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(album_imports[i].name)) printf("nnalbum: \"%s\" is not an import of the game (typo?)\n", album_imports[i].name);
+        if (!import_data(album_imports[i].name)) printf("nnalbum: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", album_imports[i].name);
     register_imports(album_imports, n);
 }
 

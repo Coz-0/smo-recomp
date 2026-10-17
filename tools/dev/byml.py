@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sarc as S  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
 
 
 class Byml:
@@ -99,7 +101,7 @@ def main():
     ap.add_argument('--grep', default='')
     ap.add_argument('--scenario', type=int, default=-1, help='0-based index in the root array (default: all)')
     a = ap.parse_args()
-    data = S.yaz0(open(os.path.join(REPO, 'build', 'romfs', a.archive), 'rb').read())
+    data = S.yaz0(open(T.build('romfs', a.archive), 'rb').read())
     files = sarc_files(data)
     name = a.file or next(n for n in files if n.endswith('Map.byml'))
     root = Byml(files[name]).root()

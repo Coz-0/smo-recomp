@@ -40,9 +40,11 @@ game read it (the log's `amiibo menu:`, `nfp:` and `nn::hid:` lines say what hap
 Every state machine of the game is an `al::NerveKeeper`: its current state (a "nerve") runs once a frame through a call
 the runtime sees (`runtime/smo_nerve.c`). A state's name is the game's own class name for it, for example
 `StageSceneNrvPlay` or `OpeningStageStartDemoNrvCameraTutorial`. Names come from the function list
-(`build\functions\main_functions.tsv`; built with `--decomp`, it names most states), and the tracker names the others
-from the code: a state whose code calls `<Class>::exe<State>()` is `<Class>Nrv<State>`, one that runs a sub-state is
-named after its neighbours, `<Class>Nrv_<address>`.
+(`build\functions\main_functions.tsv`): the decompilation's names (built with `--decomp`, 1.0.0) and the class names
+the game's RTTI gives (always; the only source for 1.4.1). The tracker names the others from the code: a state whose
+code calls `<Class>::exe<State>()` is `<Class>Nrv<State>`, one that runs a sub-state is named after its neighbours,
+`<Class>Nrv_<address>`. Many classes are called `HostTypeNrv<State>` by the game itself (one per actor class); such a
+state gets the class of the object that first runs it: `FrogNrvWait`.
 
 - `SMO_NERVELOG=*` (or a list of substrings) logs every change of state with its frame number: the first thing to run
   when a scripted run gets stuck.

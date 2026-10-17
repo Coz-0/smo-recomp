@@ -15,10 +15,23 @@
 #define P(v) ((uint64_t)(uintptr_t)(v))
 
 static int g_bad;
+/* A check whose function this game version does not import (1.0.0 and 1.4.1 import different sets) is skipped, not
+ * failed: call() marks it and the next check() consumes the mark; the names are listed at the end. */
+static int g_skip_check, g_skipped;
+static const char *g_skipped_names[64];
+static int g_skipped_name_count;
 static void check(const char *group, const char *what, int ok) {
+    if (g_skip_check) { g_skip_check = 0; g_skipped++; return; }
     if (!ok) { g_bad++; printf("  FAILED %s: %s\n", group, what); }
 }
 static int call(Ctx *c, const char *name) {
+    if (!import_data(name)) {
+        int i = 0;
+        while (i < g_skipped_name_count && strcmp(g_skipped_names[i], name)) i++;
+        if (i == g_skipped_name_count && i < 64) g_skipped_names[g_skipped_name_count++] = name;
+        g_skip_check = 1;
+        return 0;
+    }
     ImportFn f = import_lookup(name);
     if (!f) { g_bad++; printf("  FAILED: %s has no handler\n", name); return 0; }
     f(c);
@@ -299,6 +312,43 @@ static void test_amiibo_menu(void) {
     printf("  amiibo menu (%d amiibo from the game's messages; picture from its layout textures and fonts): %s\n", n, g_bad == before ? "ok" : "FAILED");
 }
 
+/* The names only 1.4.1 imports (NintendoSDK 7.3.2): hid, bcat, friends, pctl, mem (smo_nn.c, nnhid.c, nnsvc_c5a.inc). */
+static void test_141(Ctx *c) {
+    int before = g_bad;
+    uint32_t bad_handle = 0xff;                                  /* style 0xff: no vibration device */
+    args(c, P(&bad_handle), 0, 0, 0);
+    call(c, "_ZN2nn3hid24IsVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE");
+    check("hid", "IsVibrationDeviceMounted(an invalid handle) = false", (c->x[0] & 1) == 0);
+    uint64_t file = 0;                                           /* DeliveryCacheFile: one pointer, null = closed */
+    static const char ok_path[] = "dir_1/file.bin", no_slash[] = "file.bin", long_dir[] = "a23456789012345678901234567890123/f";
+    args(c, P(&file), P(no_slash), 0, 0);
+    call(c, "_ZN2nn4bcat17DeliveryCacheFile4OpenEPKc"); check("bcat", "File::Open(path without '/') = 0x27a", (uint32_t)c->x[0] == 0x27a);
+    args(c, P(&file), P(long_dir), 0, 0);
+    call(c, "_ZN2nn4bcat17DeliveryCacheFile4OpenEPKc"); check("bcat", "File::Open(directory of 33 characters) = 0x27a", (uint32_t)c->x[0] == 0x27a);
+    args(c, P(&file), P(ok_path), 0, 0);
+    call(c, "_ZN2nn4bcat17DeliveryCacheFile4OpenEPKc");
+    check("bcat", "File::Open(valid path) = not mounted (0xa7a) or not found (0x47a); the file stays closed",
+          ((uint32_t)c->x[0] == 0xa7a || (uint32_t)c->x[0] == 0x47a) && file == 0);
+    uint64_t profile[2] = {0x0123456789abcdefull, 0};
+    args(c, P(profile), 0, 0, 0);
+    call(c, "_ZNK2nn7friends7Profile12GetAccountIdEv"); check("friends", "Profile::GetAccountId = the first field", c->x[0] == profile[0]);
+    call(c, "_ZN2nn4pctl42ConfirmStereoVisionRestrictionConfigurableEv"); check("pctl", "ConfirmStereoVisionRestrictionConfigurable = 0", (uint32_t)c->x[0] == 0);
+    call(c, "_ZN2nn4pctl53RequestStereoVisionRestrictionConfigurationPermissionEv"); check("pctl", "RequestStereoVisionRestrictionConfigurationPermission = 0", (uint32_t)c->x[0] == 0);
+    call(c, "_ZN2nn4pctl26GetStereoVisionRestrictionEv"); check("pctl", "no stereo vision restriction at start", (c->x[0] & 1) == 0);
+    args(c, 1, 0, 0, 0); call(c, "_ZN2nn4pctl26SetStereoVisionRestrictionEb");
+    call(c, "_ZN2nn4pctl26GetStereoVisionRestrictionEv"); check("pctl", "SetStereoVisionRestriction(true) is kept", (c->x[0] & 1) == 1);
+    args(c, 0, 0, 0, 0); call(c, "_ZN2nn4pctl26SetStereoVisionRestrictionEb");
+    call(c, "_ZN2nn4pctl26GetStereoVisionRestrictionEv"); check("pctl", "and false again", (c->x[0] & 1) == 0);
+    uint8_t alloc[0x40] = {0};
+    args(c, P(alloc), 0x100000, 0x200000, 1);
+    call(c, "_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
+    args(c, P(alloc), 0, 0, 0);
+    call(c, "_ZNK2nn3mem17StandardAllocator16GetTotalFreeSizeEv");
+    check("mem", "StandardAllocator::Initialize(addr, size, cache) then GetTotalFreeSize = size", c->x[0] == 0x200000);
+    printf("  1.4.1 (IsVibrationDeviceMounted, DeliveryCacheFile::Open(path), Profile::GetAccountId, stereo vision, "
+           "StandardAllocator::Initialize with cache): %s\n", g_bad == before ? "ok" : "FAILED");
+}
+
 int smo_import_selftest(void) {
     Ctx *c = _aligned_malloc(sizeof *c, 16);
     uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -315,6 +365,13 @@ int smo_import_selftest(void) {
     test_web(c);
     { int nfp_amiibo_selftest(Ctx *c); g_bad += nfp_amiibo_selftest(c); }   /* nnapplet.c: the NFC reader with an amiibo held to it */
     test_amiibo_menu();
+    test_141(c);
+    if (g_skip_check) { g_skip_check = 0; g_skipped++; }
+    if (g_skipped) {
+        printf("  %d check(s) skipped: their functions are not imports of this game version (%s):", g_skipped, GAME_VERSION);
+        for (int i = 0; i < g_skipped_name_count; i++) printf("%s %s", i ? "," : "", g_skipped_names[i]);
+        printf("\n");
+    }
     printf("SMO import self-test: %d failure(s)\n", g_bad);
     fflush(stdout);
     return g_bad;
