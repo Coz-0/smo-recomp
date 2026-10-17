@@ -1081,6 +1081,11 @@ static void hid_IsSevenSixAxisSensorAtRest(Ctx *c) {
     RET(1);
 }
 static void hid_GetSevenSixAxisSensorStates(Ctx *c) { RET(0); }                           /* (states, count) -> number written: the console's own sensor is not sampled while docked */
+/* 1.4.1 (NintendoSDK 7.3.2): FinalizeSevenSixAxisSensor() [sdk 7.3.2 0x2439c0 -> 0x22c8d0] and
+ * ResetSevenSixAxisSensorTimestamp() [0x243b30 -> 0x22cda0] are one hid request each, a failure aborts. Finalize undoes
+ * Initialize; no samples are kept here, so there is no time stamp to reset. */
+static void hid_FinalizeSevenSixAxisSensor(Ctx *c) { (void)c; g_seven_ready = 0; }
+static void hid_ResetSevenSixAxisSensorTimestamp(Ctx *c) { (void)c; }
 
 /* ---- vibration. Handle = style index (3 = full key) | npad id << 8 | device index << 16. */
 static int vib_slot(uint32_t handle, uint32_t *id, uint32_t *dev) {
@@ -1111,6 +1116,12 @@ static void hid_InitializeVibrationDevice(Ctx *c) {         /* (const VibrationD
     uint32_t id, dev;
     hid_setup();
     if (vib_slot(rd32(A0), &id, &dev)) { memcpy(g_vib[id][dev].v, g_vib_default, sizeof g_vib_default); g_vib[id][dev].set = 1; }
+}
+/* 1.4.1 (NintendoSDK 7.3.2): IsVibrationDeviceMounted(const VibrationDeviceHandle &) [sdk 7.3.2 0x24c640] returns the bool
+ * the hid module writes: the actuator of that handle exists, i.e. its controller is connected. */
+static void hid_IsVibrationDeviceMounted(Ctx *c) {
+    uint32_t id, dev;
+    RET(vib_slot(rd32(A0), &id, &dev) && player_connected(id));
 }
 static void hid_GetVibrationDeviceInfo(Ctx *c) {            /* (VibrationDeviceInfo *out, handle): { type, position } */
     uint32_t id, dev;
@@ -1452,6 +1463,10 @@ static const ImportDef hid_imports[] = {
     {H("23StartSevenSixAxisSensorEv"), hid_seven_start_stop}, {H("22StopSevenSixAxisSensorEv"), hid_seven_start_stop},
     {H("27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi"), hid_GetSevenSixAxisSensorStates},
     {H("26IsSevenSixAxisSensorAtRestEv"), hid_IsSevenSixAxisSensorAtRest}, {H("28InitializeSevenSixAxisSensorEPvm"), hid_InitializeSevenSixAxisSensor},
+    /* imported by 1.4.1 only (registering a name the game does not import does nothing) */
+    {H("24IsVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE"), hid_IsVibrationDeviceMounted},
+    {H("26FinalizeSevenSixAxisSensorEv"), hid_FinalizeSevenSixAxisSensor},
+    {H("32ResetSevenSixAxisSensorTimestampEv"), hid_ResetSevenSixAxisSensorTimestamp},
 };
 
 void register_hid_imports(void) {
