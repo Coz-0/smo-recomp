@@ -18,6 +18,8 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
 OFFSET_TYPES = (0xC0, 0xC1, 0xD4, 0xD5, 0xD6)          # node types whose value is an offset to the node's data
 
 
@@ -73,7 +75,7 @@ def root_entry(d, root_off, keys, name):
 def world_of(stage):
     import sarc as S
     from byml import Byml, sarc_files
-    p = os.path.join(REPO, 'build', 'romfs', 'SystemData', 'WorldList.szs')
+    p = T.build('romfs', 'SystemData', 'WorldList.szs')
     files = sarc_files(S.yaz0(open(p, 'rb').read()))
     for i, w in enumerate(Byml(files['WorldList.byml']).root()):
         if w.get('Name') == stage:
