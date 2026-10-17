@@ -271,6 +271,17 @@ static uint32_t c5a_bcat_open(uint64_t self, int names_ok) {
 }
 static void c5a_bcat_Dir_Open(Ctx *c) { RET(c5a_bcat_open(A0, c5a_bcat_dir_ok(A1))); }                              /* (this, const DirectoryName &) */
 static void c5a_bcat_File_Open(Ctx *c) { RET(c5a_bcat_open(A0, c5a_bcat_dir_ok(A1) && c5a_bcat_file_ok(A2))); }      /* (this, const DirectoryName &, const FileName &) */
+/* 1.4.1 (NintendoSDK 7.3.2): File::Open(const char *path) [sdk 7.3.2 0xc11f0]: no '/' in the path, or more than 31
+ * characters before it -> 0x27a; else the characters before the '/' become the DirectoryName and the first 31 after it
+ * the FileName (a longer name is cut there), then the two-argument Open above, whose Result is returned. */
+static void c5a_bcat_File_Open_path(Ctx *c) {
+    const char *path = (const char *)(uintptr_t)A1, *slash = strchr(path, '/');
+    char dir[32] = {0}, file[32] = {0};
+    if (!slash || slash - path + 1 > 32) { RET(BCAT_INVALID_ARG); return; }
+    memcpy(dir, path, (size_t)(slash - path));
+    strncpy(file, slash + 1, 31);
+    RET(c5a_bcat_open(A0, c5a_bcat_dir_ok((uint64_t)(uintptr_t)dir) && c5a_bcat_file_ok((uint64_t)(uintptr_t)file)));
+}
 static void c5a_bcat_Dir_Read(Ctx *c) {                    /* (this, int *outCount, DeliveryCacheDirectoryEntry *, int) */
     if (rd64(A0)) guest_trap("nn::bcat::DeliveryCacheDirectory::Read on an open directory (this model never opens one)", c->x[30] - 4);
     RET(BCAT_NOT_OPEN);
@@ -358,11 +369,20 @@ static const ImportDef c5a_defs[] = {
     {"_ZN2nn3pdm30QueryApplicationPlayStatisticsEPNS0_25ApplicationPlayStatisticsEPKNS_13ApplicationIdEi", c5a_pdm_Query},
     {"_ZN2nn2pl11BeginVrModeEv", c5a_pl_BeginVrMode}, {"_ZN2nn2pl9EndVrModeEv", c5a_pl_EndVrMode},
 };
+/* 1.4.1 (NintendoSDK 7.3.2): Profile::GetAccountId() const [sdk 7.3.2 0x1dc190] is the Profile's first field. */
+static void c5a_fr_Profile_GetAccountId(Ctx *c) { RET(rd64(A0)); }
+/* imported by 1.4.1 only: registered without the check below (registering a name the game does not import does nothing) */
+static const ImportDef c5a_defs_141[] = {
+    {"_ZN2nn4bcat17DeliveryCacheFile4OpenEPKc", c5a_bcat_File_Open_path},
+    {"_ZNK2nn7friends7Profile12GetAccountIdEv", c5a_fr_Profile_GetAccountId},
+};
 static void c5a_register(void) {
     int n = (int)(sizeof c5a_defs / sizeof c5a_defs[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(c5a_defs[i].name)) printf("nnsvc_c5a: \"%s\" is not an import of the game (typo?)\n", c5a_defs[i].name);
+        if (!import_data(c5a_defs[i].name))
+            printf("nnsvc_c5a: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", c5a_defs[i].name);
     register_imports(c5a_defs, n);
+    register_imports(c5a_defs_141, (int)(sizeof c5a_defs_141 / sizeof c5a_defs_141[0]));
 }
 
 /* ---------------------------------------------------------------- self-test */

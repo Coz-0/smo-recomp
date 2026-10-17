@@ -1095,7 +1095,7 @@ static void c4a_register(void) {
     };
     int n = (int)(sizeof defs / sizeof defs[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(defs[i].name)) printf("nnnet: \"%s\" is not an import of the game (typo?)\n", defs[i].name);
+        if (!import_data(defs[i].name)) printf("nnnet: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", defs[i].name);
     g_nifm_initialize_prev = import_lookup("_ZN2nn4nifm10InitializeEv");
     register_imports(defs, n);
     {

@@ -700,7 +700,7 @@ static const ImportDef applet_imports[] = {
 void register_nnapplet_imports(void) {
     int n = (int)(sizeof applet_imports / sizeof applet_imports[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(applet_imports[i].name)) printf("nnapplet: \"%s\" is not an import of the game (typo?)\n", applet_imports[i].name);
+        if (!import_data(applet_imports[i].name)) printf("nnapplet: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", applet_imports[i].name);
     register_imports(applet_imports, n);
 }
 
