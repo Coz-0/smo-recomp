@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import switchfs as S
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: the runtime of build/<version>/bin looks in build/<version>/sysdata)
 FONT_TITLES = set(range(0x0100000000000810, 0x0100000000000815))
 SFNT = (b'\x00\x01\x00\x00', b'OTTO', b'ttcf', b'true')
 BFTTF_PLAIN_MAGIC = 0x7f9a0218
@@ -48,7 +50,7 @@ def decode_bfttf(data):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fw', default=os.path.join(os.environ.get('APPDATA', ''), 'Ryujinx', 'bis', 'system', 'Contents', 'registered'))
-    ap.add_argument('--out', default=os.path.join(REPO, 'build', 'sysdata', 'fonts'))
+    ap.add_argument('--out', default=T.build('sysdata', 'fonts'))
     ap.add_argument('--keys')
     a = ap.parse_args()
     keys = S.Keys(a.keys)
