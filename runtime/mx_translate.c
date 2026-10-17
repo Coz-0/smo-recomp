@@ -50,6 +50,7 @@ typedef struct {
     char exitcode[4096];
     unsigned lmem_words, ssbo_word0;
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64]; int nsmp;      /* target 1: named samplers used (SMP) */
+    int dyn_unit_ok;                          /* tex_unit() may return a unit of a handle kept in a uniform buffer (op_tex_b) */
 } Mx;
 
 const char *mx_opcode_name(uint64_t insn) {
@@ -255,9 +256,14 @@ static void attr_out(Mx *e, unsigned a, const char *v) {
 }
 
 /* ---------------------------------------------------------------- textures */
+/* Units 0..31 are the entries of the texture handle table c[2] (bound textures). Units 32..255 stand for a handle the game
+ * keeps in one of its own uniform buffers (bindless_unit): 32 + 8 * buffer + the handle's 64-bit word in that buffer; the
+ * back end reads the handle there at every draw. Per-unit masks of MxIn (int_tex, sint_tex) describe units 0..31 only. */
+static int unit_bit(uint32_t mask, int unit) { return unit >= 0 && unit < 32 && (mask >> unit & 1); }
 static int tex_unit(Mx *e, uint64_t i) {
     unsigned off = MXB(i, 36, 13);
-    if (off < 8 || (off & 1) || (off - 8) / 2 >= 32) { fail(e, "texture handle", "texture handle at constant buffer word %u", off); return -1; }
+    if (off < 8 || (off & 1) || ((off - 8) / 2 >= 32 && !(e->dyn_unit_ok && (off - 8) / 2 < 256))) { fail(e, "texture handle", "texture handle at constant buffer word %u", off); return -1; }
+    if ((off - 8) / 2 >= 32) return (int)(off - 8) / 2;
     e->cbufs |= 4;
     e->tex_units |= 1u << ((off - 8) / 2);
     return (int)(off - 8) / 2;
@@ -265,7 +271,7 @@ static int tex_unit(Mx *e, uint64_t i) {
 /* sampler of the given GLSL base type ("2D", "2DArray", "Cube", ...) for a bound unit */
 static const char *SMP(Mx *e, int unit, const char *base, int shadow) {
     const char *pre = "";
-    if (!shadow && (e->in->int_tex >> unit & 1)) pre = (e->in->sint_tex >> unit & 1) ? "i" : "u";
+    if (!shadow && (unit_bit(e->in->int_tex, unit))) pre = (unit_bit(e->in->sint_tex, unit)) ? "i" : "u";
     if (e->in->target == 1) {                /* Vulkan: a named sampler per (unit, type), declared in the header from e->smp */
         char type[24];
         int k, same_unit = 0;
@@ -281,7 +287,7 @@ static const char *SMP(Mx *e, int unit, const char *base, int shadow) {
     }
     return S(e, "%ssampler%s%s(uvec2(c2[%uu], c2[%uu]))", pre, base, shadow ? "Shadow" : "", 8 + 2 * unit, 9 + 2 * unit);
 }
-static int tex_is_int(Mx *e, int unit, int shadow) { return !shadow && unit >= 0 && (e->in->int_tex >> unit & 1); }
+static int tex_is_int(Mx *e, int unit, int shadow) { return !shadow && unit >= 0 && (unit_bit(e->in->int_tex, unit)); }
 static const char *ARR(Mx *e, unsigned r) { return S(e, "float(%s & 0xffffu)", X(e, r)); }
 static const char *FR(Mx *e, unsigned r) { return S(e, "F(%s)", X(e, r)); }
 static const char *IR(Mx *e, unsigned r) { return S(e, "int(%s)", X(e, r)); }
@@ -392,7 +398,7 @@ static void op_tex(Mx *e, uint64_t i) {
         if (off && off_dynamic(e, offreg) && t <= 4) { coords = tex_off_coords(e, t, smp, coords, off, explicit_lod ? lodv : NULL); off = NULL; }
         if (explicit_lod) call = off ? S(e, "textureLodOffset(%s, %s, %s, %s)", smp, coords, lodv, off) : S(e, "textureLod(%s, %s, %s)", smp, coords, lodv);
         else call = off ? S(e, "textureOffset(%s, %s, %s%s%s)", smp, coords, off, bias ? ", " : "", bias ? lod : "") : S(e, "texture(%s, %s%s%s)", smp, coords, bias ? ", " : "", bias ? lod : "");
-        emit(e, "%s%s;", tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+        emit(e, "%s%s;", tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     }
     tex_store_mask(e, mask, MXB(i, 0, 8), is_int);
     if (MXB(i, 51, 3) != 7) emit(e, " %s = true;", PD(e, MXB(i, 51, 3)));     /* sparse residency: always resident */
@@ -432,7 +438,7 @@ static void op_texs(Mx *e, uint64_t i) {
     default: fail(e, "TEXS", "TEXS encoding %u", enc); return;
     }
     if (shadow) emit(e, "float sv = %s; vec4 tv = vec4(sv, sv, sv, 1.0);", call);
-    else emit(e, "%s%s;", tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+    else emit(e, "%s%s;", tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     tex_store_pair(e, mask, rd0, rd1, !MXB(i, 59, 1), is_int);
 }
 
@@ -471,7 +477,7 @@ static void op_tld(Mx *e, uint64_t i) {
     if (off && !ms && off_dynamic(e, offreg)) { coords = fetch_off_coords(t, e, coords, off); off = NULL; }
     if (ms) call = S(e, "texelFetch(%s, %s, %s)", smp, coords, smpl);
     else call = off ? S(e, "texelFetchOffset(%s, %s, %s, %s)", smp, coords, lod, off) : S(e, "texelFetch(%s, %s, %s)", smp, coords, lod);
-    emit(e, "%s%s;", tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+    emit(e, "%s%s;", tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     tex_store_mask(e, mask, MXB(i, 0, 8), is_int);
     if (MXB(i, 51, 3) != 7) emit(e, " %s = true;", PD(e, MXB(i, 51, 3)));
 }
@@ -506,7 +512,7 @@ static void op_tlds(Mx *e, uint64_t i) {
         call = S(e, "texelFetchOffset(%s, ivec2(%s, %s), %s, %s)", SMP(e, unit, "2D", 0), IR(e, a), IR(e, a + 1), IR(e, b), off); break;
     default: fail(e, "TLDS", "TLDS encoding %u", enc); return;
     }
-    emit(e, "%s%s;", tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+    emit(e, "%s%s;", tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     tex_store_pair(e, mask, rd0, rd1, !MXB(i, 59, 1), is_int);
 }
 
@@ -527,7 +533,7 @@ static void op_tld4(Mx *e, uint64_t i) {
         static const char *const o[4] = {"o1.xy", "o1.zw", "o2.xy", "o2.zw"};
         emit(e, "ivec4 o1 = ivec4(bitfieldExtract(int(%s), 0, 6), bitfieldExtract(int(%s), 8, 6), bitfieldExtract(int(%s), 16, 6), bitfieldExtract(int(%s), 24, 6));", p1, p1, p1, p1);
         emit(e, " ivec4 o2 = ivec4(bitfieldExtract(int(%s), 0, 6), bitfieldExtract(int(%s), 8, 6), bitfieldExtract(int(%s), 16, 6), bitfieldExtract(int(%s), 24, 6));", p2, p2, p2, p2);
-        emit(e, " %s tv;", dc ? "vec4" : is_int ? ((e->in->sint_tex >> unit & 1) ? "ivec4" : "uvec4") : "vec4");
+        emit(e, " %s tv;", dc ? "vec4" : is_int ? ((unit_bit(e->in->sint_tex, unit)) ? "ivec4" : "uvec4") : "vec4");
         for (int k = 0; k < 4; k++) {
             if (dc) emit(e, " tv[%d] = textureGatherOffset(%s, %s, %s, %s).w;", k, smp, coords, dref, o[k]);
             else emit(e, " tv[%d] = textureGatherOffset(%s, %s, %s, %u).w;", k, smp, coords, o[k], comp);
@@ -538,7 +544,7 @@ static void op_tld4(Mx *e, uint64_t i) {
     }
     if (dc) call = off ? S(e, "textureGatherOffset(%s, %s, %s, %s)", smp, coords, dref, off) : S(e, "textureGather(%s, %s, %s)", smp, coords, dref);
     else call = off ? S(e, "textureGatherOffset(%s, %s, %s, %u)", smp, coords, off, comp) : S(e, "textureGather(%s, %s, %u)", smp, coords, comp);
-    emit(e, "%s%s;", dc ? "vec4 tv = " : tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+    emit(e, "%s%s;", dc ? "vec4 tv = " : tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     tex_store_mask(e, mask, MXB(i, 0, 8), is_int);
     if (MXB(i, 51, 3) != 7) emit(e, " %s = true;", PD(e, MXB(i, 51, 3)));
 }
@@ -554,16 +560,19 @@ static void op_tld4s(Mx *e, uint64_t i) {
         call = dc ? S(e, "textureGatherOffset(%s, %s, %s, %s)", smp, co, FR(e, b + 1), off) : S(e, "textureGatherOffset(%s, %s, %s, %u)", smp, co, off, comp);
     } else if (dc) call = S(e, "textureGather(%s, vec2(%s, %s), %s)", smp, FR(e, a), FR(e, a + 1), FR(e, b));
     else call = S(e, "textureGather(%s, vec2(%s, %s), %u)", smp, FR(e, a), FR(e, b), comp);
-    emit(e, "%s%s;", dc ? "vec4 tv = " : tv_decl(is_int, e->in->sint_tex >> unit & 1), call);
+    emit(e, "%s%s;", dc ? "vec4 tv = " : tv_decl(is_int, unit_bit(e->in->sint_tex, unit)), call);
     tex_store_pair(e, 15, MXB(i, 0, 8), MXB(i, 28, 8), MXB(i, 55, 1), is_int);    /* precision bit: 1 = F16 here */
 }
 
 static void op_tmml_unit(Mx *e, uint64_t i, int unit);
 static void op_tmml(Mx *e, uint64_t i) { int unit = tex_unit(e, i); if (unit >= 0) op_tmml_unit(e, i, unit); }
 /* TMML (b), SMO: the texture handle is in register Rb (bits 20..27; [doc] yuzu texture_mipmap_level.cpp: the bindless form
- * reads the handle from meta_reg, coordinates as in the bound form). Vulkan has no bindless samplers, so the handle must be
- * a known entry of the texture handle table: the last write of that register in the same block must be an unpredicated
- * MOV from c[2][word w] (SMO's 173 stages: MOV r3, c[2][0x20] right before), which is unit (w - 8) / 2 as for a bound TMML. */
+ * reads the handle from meta_reg, coordinates as in the bound form). Vulkan has no bindless samplers, so where the handle
+ * comes from must be known: the last write of that register in the same block must be an unpredicated MOV from a
+ * constant buffer word. From c[2][word w], an entry of the texture handle table (SMO's 173 stages: MOV r3, c[2][0x20]
+ * right before), it is unit (w - 8) / 2 as for a bound TMML. From one of the game's uniform buffers c[3..17], at an
+ * even word w < 16 (1.4.1's primitive drawer, SystemData/primitive_drawer_nvn_shader.bin: the 64-bit handle at c[3][0]),
+ * it is unit 32 + 8 * buffer + w / 2 (Vulkan only): the back end reads the handle from that buffer at each draw. */
 /* The unit a bindless texture instruction at word pc names through handle register h, or -1 (after fail()): see TMML (b). */
 static int bindless_unit(Mx *e, unsigned pc, unsigned h, const char *name) {
     if (e->leader[pc]) { fail(e, name, "%s at word %u starts a block: its handle register r%u is not known", name, pc, h); return -1; }
@@ -571,13 +580,20 @@ static int bindless_unit(Mx *e, unsigned pc, unsigned h, const char *name) {
         if (k % 4 == 0) continue;
         uint64_t w = *(const uint64_t *)(e->base + (size_t)k * 8);
         if (MXB(w, 0, 8) != h) { if (e->leader[k]) break; continue; }
-        unsigned off = MXB(w, 20, 14);
-        if (decode(w) != MXOP_MOV_cbuf || MXB(w, 16, 3) != 7 || MXB(w, 34, 5) != 2 || off < 8 || (off & 1) || (off - 8) / 2 >= 32) break;
-        e->cbufs |= 4;
-        e->tex_units |= 1u << ((off - 8) / 2);
-        return (int)(off - 8) / 2;
+        unsigned off = MXB(w, 20, 14), cb = MXB(w, 34, 5);
+        if (decode(w) != MXOP_MOV_cbuf || MXB(w, 16, 3) != 7) break;
+        if (cb == 2 && off >= 8 && !(off & 1) && (off - 8) / 2 < 32) {
+            e->cbufs |= 4;
+            e->tex_units |= 1u << ((off - 8) / 2);
+            return (int)(off - 8) / 2;
+        }
+        if (e->in->target == 1 && cb >= 3 && cb < 18 && !(off & 1) && off < 16) {
+            e->cbufs |= 1u << cb;
+            return 32 + (int)(cb * 8 + off / 2);
+        }
+        break;
     }
-    fail(e, name, "%s at word %u: the handle register r%u is not a MOV from the texture handle table c[2] in the same block", name, pc, h);
+    fail(e, name, "%s at word %u: the handle register r%u is not a MOV from the texture handle table c[2] or from the first 64 bytes of a uniform buffer, in the same block", name, pc, h);
     return -1;
 }
 static void op_tmml_b(Mx *e, unsigned pc, uint64_t i) {
@@ -598,7 +614,9 @@ static void op_tex_b(Mx *e, unsigned pc, uint64_t i) {
     b |= (uint64_t)(8 + 2 * unit) << 36;                      /* the unit's word of the texture handle table */
     b |= i & (0x1full << 49);                                 /* NODEP, DC, sparse predicate */
     b |= (uint64_t)MXB(i, 36, 1) << 54 | (uint64_t)MXB(i, 37, 3) << 55 | (uint64_t)MXB(i, 40, 1) << 58;
+    e->dyn_unit_ok = unit >= 32;
     op_tex(e, b);
+    e->dyn_unit_ok = 0;
 }
 static void op_tmml_unit(Mx *e, uint64_t i, int unit) {
     unsigned t = MXB(i, 28, 3), c = MXB(i, 8, 8), mask = MXB(i, 31, 4), r = MXB(i, 0, 8);
@@ -644,7 +662,7 @@ static void op_txd(Mx *e, uint64_t i) {
     }
     int is_int = tex_is_int(e, unit, 0);
     const char *smp = SMP(e, unit, k_tex_base[t], 0);
-    emit(e, "%s%s;", tv_decl(is_int, e->in->sint_tex >> unit & 1),
+    emit(e, "%s%s;", tv_decl(is_int, unit_bit(e->in->sint_tex, unit)),
          off ? S(e, "textureGradOffset(%s, %s, %s, %s, %s)", smp, coords, dx, dy, off) : S(e, "textureGrad(%s, %s, %s, %s)", smp, coords, dx, dy));
     tex_store_mask(e, mask, MXB(i, 0, 8), is_int);
     if (MXB(i, 51, 3) != 7) emit(e, " %s = true;", PD(e, MXB(i, 51, 3)));
