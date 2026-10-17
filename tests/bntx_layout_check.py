@@ -18,7 +18,9 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROMFS = os.path.join(REPO, 'build', 'romfs')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+ROMFS = T.build('romfs')
 OUT = os.path.join(REPO, 'build', 'test')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 
