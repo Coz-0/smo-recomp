@@ -808,8 +808,12 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
 }
 
 /* smo_amiibo.c, while the menu holds the game: the buttons of every player as fill_pad reads them (player 1's test sequence
- * included; it goes on one step per call, i.e. per menu frame), the left stick as the BTN_SL_* bits */
-uint64_t hid_menu_buttons(void) {
+ * included; it goes on one step per call, i.e. per menu frame), the left stick as the BTN_SL_* bits. keyboard = 0
+ * (hid_menu_pad_buttons, smo_guide.c): without the keyboard player's keys, which the Help page reads itself. */
+static uint64_t menu_buttons(int keyboard);
+uint64_t hid_menu_buttons(void) { return menu_buttons(1); }
+uint64_t hid_menu_pad_buttons(void) { return menu_buttons(0); }
+static uint64_t menu_buttons(int keyboard) {
     uint64_t all = 0;
     hid_setup();
     if (sdl_on()) nnpad_poll(0);
@@ -819,7 +823,7 @@ uint64_t hid_menu_buttons(void) {
         int lx = 0, ly = 0;
         g_menu_last[id] = 0; g_menu_last_stick[id] = 0;
         if (!player_connected(id)) continue;
-        if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) && ((int)id == g_keyboard_player || (id == 0 && scripted_run()))) {
+        if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) && ((keyboard && (int)id == g_keyboard_player) || (id == 0 && scripted_run()))) {
             for (size_t i = 0; i < sizeof g_keymap / sizeof g_keymap[0]; i++) if (key_for(id, g_keymap[i].vk, g_keymap[i].bit)) b |= 1ull << g_keymap[i].bit;
             lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
             ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
