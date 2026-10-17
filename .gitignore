@@ -1,0 +1,64 @@
+# The firewall: nothing derived from the game or from the console's software is ever committed.
+# Everything below is produced on your PC from your own dump.
+
+# everything scripts/setup.py produces from your dump, and tools you put in deps/
+/build/
+/deps/
+/dump/
+/work/
+/cache/
+/userdata*/
+
+# dumps, keys, firmware
+*.nsp
+*.xci
+*.nca
+*.nso
+*.nro
+*.elf
+*.npdm
+*.nacp
+*.tik
+*.cert
+*.keys
+prod.keys
+title.keys
+
+# game files and archives
+*.bin
+*.sarc
+*.szs
+*.bfres
+*.bntx
+*.bnsh
+*.bfsha
+*.pack
+
+# lifted (recompiled) code and everything built from it
+gen*/
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.pdb
+*.map
+*.spv
+
+# function lists carry addresses and names derived from the dump (and the decompilation, when given)
+functions*.tsv
+functions*.json
+
+# captures, sound and logs of runs
+*.bmp
+*.png
+*.wav
+*.log
+
+# reference repositories are cloned next to this one, never inside it
+/ref/
+
+# python
+__pycache__/
+*.pyc
+.venv/
