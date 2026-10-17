@@ -564,9 +564,9 @@ static void op_tmml(Mx *e, uint64_t i) { int unit = tex_unit(e, i); if (unit >= 
  * reads the handle from meta_reg, coordinates as in the bound form). Vulkan has no bindless samplers, so the handle must be
  * a known entry of the texture handle table: the last write of that register in the same block must be an unpredicated
  * MOV from c[2][word w] (SMO's 173 stages: MOV r3, c[2][0x20] right before), which is unit (w - 8) / 2 as for a bound TMML. */
-static void op_tmml_b(Mx *e, unsigned pc, uint64_t i) {
-    unsigned h = MXB(i, 20, 8);
-    if (e->leader[pc]) { fail(e, "TMML (b)", "TMML (b) at word %u starts a block: its handle register r%u is not known", pc, h); return; }
+/* The unit a bindless texture instruction at word pc names through handle register h, or -1 (after fail()): see TMML (b). */
+static int bindless_unit(Mx *e, unsigned pc, unsigned h, const char *name) {
+    if (e->leader[pc]) { fail(e, name, "%s at word %u starts a block: its handle register r%u is not known", name, pc, h); return -1; }
     for (unsigned k = pc - 1; k >= 1; k--) {      /* back to the block's first instruction (words k % 4 == 0 are scheduling words) */
         if (k % 4 == 0) continue;
         uint64_t w = *(const uint64_t *)(e->base + (size_t)k * 8);
@@ -575,10 +575,30 @@ static void op_tmml_b(Mx *e, unsigned pc, uint64_t i) {
         if (decode(w) != MXOP_MOV_cbuf || MXB(w, 16, 3) != 7 || MXB(w, 34, 5) != 2 || off < 8 || (off & 1) || (off - 8) / 2 >= 32) break;
         e->cbufs |= 4;
         e->tex_units |= 1u << ((off - 8) / 2);
-        op_tmml_unit(e, i, (int)(off - 8) / 2);
-        return;
+        return (int)(off - 8) / 2;
     }
-    fail(e, "TMML (b)", "TMML (b) at word %u: the handle register r%u is not a MOV from the texture handle table c[2] in the same block", pc, h);
+    fail(e, name, "%s at word %u: the handle register r%u is not a MOV from the texture handle table c[2] in the same block", name, pc, h);
+    return -1;
+}
+static void op_tmml_b(Mx *e, unsigned pc, uint64_t i) {
+    int unit = bindless_unit(e, pc, MXB(i, 20, 8), "TMML (b)");
+    if (unit >= 0) op_tmml_unit(e, i, unit);
+}
+/* TEX (b), 1.4.1: the bindless form of TEX ([doc] yuzu texture_fetch.cpp TEX_b): the handle in register Rb (bits 20..27),
+ * the other meta operands (lod, offset, depth reference) in the registers after it; AOFFI, the LOD mode and LC at bits 36,
+ * 37..39 and 40 instead of 54, 55..57 and 58; every other field as in TEX. The handle is resolved as for TMML (b), and the
+ * instruction is translated as the bound TEX of that unit. */
+static void op_tex_b(Mx *e, unsigned pc, uint64_t i) {
+    unsigned h = MXB(i, 20, 8);
+    int unit = bindless_unit(e, pc, h, "TEX (b)");
+    if (unit < 0) return;
+    uint64_t b = 0xc000000000000000ull;                       /* TEX */
+    b |= i & 0x0000000fffffffffull & ~(0xffull << 20);        /* bits 0..35: dest, coordinates, type, mask, NDV */
+    b |= (uint64_t)((h + 1) & 0xff) << 20;                    /* the meta operands after the handle register */
+    b |= (uint64_t)(8 + 2 * unit) << 36;                      /* the unit's word of the texture handle table */
+    b |= i & (0x1full << 49);                                 /* NODEP, DC, sparse predicate */
+    b |= (uint64_t)MXB(i, 36, 1) << 54 | (uint64_t)MXB(i, 37, 3) << 55 | (uint64_t)MXB(i, 40, 1) << 58;
+    op_tex(e, b);
 }
 static void op_tmml_unit(Mx *e, uint64_t i, int unit) {
     unsigned t = MXB(i, 28, 3), c = MXB(i, 8, 8), mask = MXB(i, 31, 4), r = MXB(i, 0, 8);
@@ -1414,6 +1434,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
 
     /* ---- textures */
     case MXOP_TEX: op_tex(e, i); break;
+    case MXOP_TEX_b: op_tex_b(e, pc, i); break;
     case MXOP_TEXS: op_texs(e, i); break;
     case MXOP_TLD: op_tld(e, i); break;
     case MXOP_TLDS: op_tlds(e, i); break;
