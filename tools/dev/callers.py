@@ -3,6 +3,7 @@
     python tools/dev/callers.py <symbol substring> [--module main]
 
 Same inputs as disasm.py (build/functions/<module>_functions.tsv and the converted dump); prints addresses and names only.
+SMO_TARGET picks the game version (tools/target.py).
 """
 import argparse
 import bisect
@@ -13,7 +14,9 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'extract'))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
 import functions as F  # noqa: E402
+import target as T  # noqa: E402
 
 
 def main():
@@ -21,10 +24,10 @@ def main():
     ap.add_argument('what')
     ap.add_argument('--module', default='main')
     a = ap.parse_args()
-    rows = list(csv.DictReader(open(os.path.join(REPO, 'build', 'functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
+    rows = list(csv.DictReader(open(T.build('functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
     names = {int(r['start'], 16): (r['symbol'] or r['decomp_name']).split('|')[0] for r in rows}
     ends = {int(r['start'], 16): int(r['end'], 16) for r in rows}
-    m = F.Module(os.path.join(REPO, 'build', 'dump', 'base', 'elf', '%s.elf' % a.module))
+    m = F.Module(T.elf(a.module))
     if 23 in m.dt:
         syms = m.symbols()
         slot = {}
