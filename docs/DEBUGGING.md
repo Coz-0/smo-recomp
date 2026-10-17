@@ -32,6 +32,9 @@ The end of every log has the counts that tell whether a run was healthy:
   (the lightning), at least 60 frames apart.
 - `SMO_AMIIBO_SHOT_DIR=<folder>` saves the first three different pictures of each opening of the amiibo menu as
   `amiibo_menu_<opening>_<n>.png` (the menu's frames are not game frames, so `SMO_SHOT` does not see them).
+- `SMO_GUIDE_SHOT=<file.png>` saves the Help page as shown in the game window (`runtime/smo_guide.c`, WebView2) 1.5 s
+  after it loaded and 0.8 s after each pad action, as `<file>_2.png`, `_3.png`, ... (at most 8); `SMO_SHOT` does not see
+  it either. The log says what the guide does (`guide:`).
 
 ## Shaders
 
@@ -151,7 +154,7 @@ The end of every log has the counts that tell whether a run was healthy:
   registered, before the game starts; one line per group, then it exits with the number of failed checks as exit code.
   `SMO_AMIIBO_SHOT=<file.png>` also saves the menu picture it composes.
 - `SMO_MANUAL=<folder>` takes the game's manual from that folder instead of `build\manual`; `SMO_WEB_NOOPEN=1` prepares
-  the Help pages without opening the browser.
+  the Help pages without showing them (neither in the game window nor in the browser).
 - `SMO_STRICT=1` stops at the first call to a system call that only has a placeholder handler; `SMO_STRICT=report`
   lists them without stopping.
 - `SMO_VK_CSLOG=1` logs compute dispatches with large work groups.
