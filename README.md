@@ -13,20 +13,22 @@ system are re-implemented by this project's runtime.
 
 ## Status (October 2026)
 
-Early, playable in parts with scripted input, not finished. What is written here was measured on the development PC
-(Windows 11, RTX 4090); where something was not checked, it says so.
+Early, not finished: played by hand up to Cascade Kingdom's first checkpoint, the start checked with scripted input.
+What is written here was measured on the development PC (Windows 11, RTX 4090); where something was not checked, it
+says so.
 
 | Area | State |
 |---|---|
 | Boot → title screen → file select | works |
-| New game → prologue → Cap Kingdom → Bonneton → into Top-Hat Tower, up to Mario's first capture (a frog) | plays with scripted input: `tests/run_cap_kingdom.py` checks 13 checkpoints against the game's own state, from an empty save, without a crash (3 of 3 runs passed; 15,016 frames in the last). Not yet played through by hand |
-| The rest of Cap Kingdom (Topper), the other kingdoms | not tested |
-| Renderer | Vulkan. Every shader stage the scripted run meets is translated (Maxwell machine code → GLSL → SPIR-V; 0 untranslated or rejected). The structured control flow of the translator was checked against its reference form on the GPU: 1,519 of 1,519 stages equal over 6.2 million invocations. 0 Vulkan call failures and 0 dropped command lists in the scripted run |
+| New game → prologue → Cap Kingdom → Bonneton → into Top-Hat Tower, up to Mario's first capture (a frog) | plays with scripted input: `tests/run_cap_kingdom.py` checks 13 checkpoints against the game's own state, from an empty save, without a crash (5 of 5 runs passed; 42,409 frames in the last) |
+| Cap Kingdom → Cascade Kingdom, up to its first checkpoint | played by hand with an Xbox One controller; no scripted check yet |
+| The rest of Cascade Kingdom, the other kingdoms | not tested |
+| Renderer | Vulkan. Every shader stage the scripted run meets is translated (Maxwell machine code → GLSL → SPIR-V; 0 untranslated or rejected). The structured control flow of the translator was checked against its reference form on the GPU: 1,519 of 1,519 stages equal over 6.2 million invocations. 0 Vulkan call failures and 0 dropped command lists in the scripted run. No single-frame flashes: 0 frames with a flash in captures of every frame while the camera pans in Cascade Kingdom (2 to 9 in 361 before the fix: draws that read vertices past the range the game declared) |
 | Audio | the game's own audio renderer runs (lifted from its system library); the final mix plays through the Windows audio device (6 → 2 channel downmix, 48 kHz): 0 dropped samples, 0 underruns in the scripted run |
 | Video | H.264 through Windows Media Foundation; the tutorial videos open and close without error, their picture is not checked |
-| Controllers | keyboard, XInput, and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, gyro): passes its automated tests with virtual devices (49 of 49); **not yet confirmed in play with physical pads** |
+| Controllers | keyboard, XInput, and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, gyro): passes its automated tests with virtual devices (49 of 49); played by hand with an Xbox One controller; other physical pads not tried |
 | Save data | journalled like the console's (two-phase commit); the game's autosave and Resume work |
-| Speed | 26-42 fps in Cap Kingdom until Cappy joins (mostly 29-34); after that a median of about 13 fps in Bonneton at night and in Top-Hat Tower (6-31 fps per 300-frame window). Measured causes: every occlusion-query report waits for the GPU (about 37 a frame), and in the tower most of the frame time is spent in the game's own code. Not optimized yet |
+| Speed | 60 fps, paced to a 60 Hz clock. At Cascade Kingdom's first checkpoint 59.6-60.0 fps in every 300-frame window for two minutes (median frame 16.7 ms, 99th percentile 17.5-19.4 ms). Scripted Cap Kingdom run, with a screenshot every 300 frames: 59.4 fps on average once play begins, 59.4-59.6 in Bonneton, 59.0-59.6 in Top-Hat Tower; lowest 48.4 while the tower stage loads (before: 26-42 fps until Cappy joins, then about 13). Measured on the development PC only, with nothing else busy; while a web browser used 1-1.5 CPU cores, 56.4-59.8 fps per window at the checkpoint over two runs |
 | Online | not available (the network services answer as an offline console) |
 
 ## How it works
@@ -47,10 +49,10 @@ Early, playable in parts with scripted input, not finished. What is written here
 
 ## Plans
 
-- Speed: occlusion-query results without a GPU wait per report; profile the game side in Top-Hat Tower.
+- Speed on slower CPUs and GPUs; shorter stalls while a stage loads.
 - Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
 - Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`).
-- Play with physical controllers, other GPUs (AMD, Intel).
+- Play with other physical controllers (PlayStation, Switch Pro), other GPUs (AMD, Intel).
 
 ## Requirements
 
@@ -81,7 +83,7 @@ tools/extract/   NSP/NCA/RomFS readers, function list, RomFS and font extraction
 tools/lifter/    AArch64 -> C lifter, system-library lifter, differential test, build steps
 tools/dev/       disassembler, caller finder, SARC and stage-placement listers, Maxwell instruction namer
 tools/port/      idempotent adaptation of the ssbu-recomp runtime sources
-tests/           scripted Cap Kingdom run, shader translator equivalence harness, texture layout check
+tests/           scripted Cap Kingdom run, shader translator equivalence harness, texture layout check, fast-path checks
 docs/            debugging aids, scripted runs
 ```
 

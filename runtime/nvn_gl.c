@@ -72,6 +72,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #define P(a) ((void *)(uintptr_t)(a))
 
 int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size);     /* nvn_stub.c */
+int nvn_pool_flags(uint64_t pool);
 void input_frame_draws(int draws);                                    /* nnhid.c */
 void display_pace(void);                                              /* display.c */
 int display_wait_refresh(void);                                       /* display.c, P3 round 3: one refresh clock */
@@ -490,6 +491,64 @@ static void *hnew(uint64_t g, uint32_t kind, size_t size) {
 
 static SRWLOCK g_pool_lock = SRWLOCK_INIT;
 static Tex *volatile g_all_tex;            /* every texture, newest first (never unlinked: host records of textures are not freed) */
+/* The live textures by the 64 KB pages of guest memory they are stored on, for nvn_gl_memory_written: a flush of a
+ * range looks only at the textures on its pages. It walked every texture record ever made, so each flush cost more the
+ * longer the game ran (Cascade Kingdom: the water's vertex buffer is flushed several times a frame; that walk grew to 55%
+ * of the main thread's time after two minutes). Added at nvnTextureInitialize, removed at its finalize. */
+#define TP_SHIFT 16
+typedef struct { uint64_t page; Tex **t; int n, cap; } TexPage;
+static TexPage *g_tp;                      /* open addressing; pages are never removed (their lists empty out) */
+static size_t g_tp_cap, g_tp_used;
+static SRWLOCK g_tp_lock = SRWLOCK_INIT;
+static TexPage *tp_find(uint64_t page) {
+    if (!g_tp_cap) return NULL;
+    for (size_t h = (size_t)((page * 0x9E3779B97F4A7C15ULL) >> 20) & (g_tp_cap - 1);; h = (h + 1) & (g_tp_cap - 1)) {
+        if (g_tp[h].t && g_tp[h].page == page) return &g_tp[h];
+        if (!g_tp[h].t) return NULL;
+    }
+}
+static TexPage *tp_get(uint64_t page) {    /* exclusive lock held */
+    TexPage *p = tp_find(page);
+    if (p) return p;
+    if ((g_tp_used + 1) * 2 > g_tp_cap) {
+        TexPage *old = g_tp;
+        size_t oc = g_tp_cap;
+        g_tp_cap = oc ? oc * 2 : 4096;
+        g_tp = calloc(g_tp_cap, sizeof *g_tp);
+        for (size_t i = 0; i < oc; i++) if (old[i].t) {
+            size_t h = (size_t)((old[i].page * 0x9E3779B97F4A7C15ULL) >> 20) & (g_tp_cap - 1);
+            while (g_tp[h].t) h = (h + 1) & (g_tp_cap - 1);
+            g_tp[h] = old[i];
+        }
+        free(old);
+    }
+    size_t h = (size_t)((page * 0x9E3779B97F4A7C15ULL) >> 20) & (g_tp_cap - 1);
+    while (g_tp[h].t) h = (h + 1) & (g_tp_cap - 1);
+    g_tp[h].page = page; g_tp[h].cap = 4; g_tp[h].n = 0; g_tp[h].t = malloc(4 * sizeof(Tex *));
+    g_tp_used++;
+    return &g_tp[h];
+}
+static void tp_add(Tex *t) {
+    if (!t->mem || !t->storage) return;
+    uint64_t a = (uint64_t)(uintptr_t)t->mem;
+    AcquireSRWLockExclusive(&g_tp_lock);
+    for (uint64_t pg = a >> TP_SHIFT, last = (a + t->storage - 1) >> TP_SHIFT; pg <= last; pg++) {
+        TexPage *p = tp_get(pg);
+        if (p->n == p->cap) { p->cap *= 2; p->t = realloc(p->t, (size_t)p->cap * sizeof(Tex *)); }
+        p->t[p->n++] = t;
+    }
+    ReleaseSRWLockExclusive(&g_tp_lock);
+}
+static void tp_remove(Tex *t) {
+    if (!t->mem || !t->storage) return;
+    uint64_t a = (uint64_t)(uintptr_t)t->mem;
+    AcquireSRWLockExclusive(&g_tp_lock);
+    for (uint64_t pg = a >> TP_SHIFT, last = (a + t->storage - 1) >> TP_SHIFT; pg <= last; pg++) {
+        TexPage *p = tp_find(pg);
+        if (p) for (int i = 0; i < p->n; i++) if (p->t[i] == t) { p->t[i] = p->t[--p->n]; break; }
+    }
+    ReleaseSRWLockExclusive(&g_tp_lock);
+}
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
 void nvn_label_drop(uint64_t obj);
@@ -638,6 +697,7 @@ static struct { uint64_t page; uint64_t stamp; } *g_ww_tab;
 static uint64_t g_ww_stamp, g_ww_used, g_ww_floor;       /* g_ww_floor: stamp given to every page when the table had to be emptied */
 static int g_ww_off = -1;
 static LONG64 g_ww_clean, g_ww_dirty, g_ww_unwatched;
+static LONG64 g_th_n[4], g_th_bytes[4], g_th_same[4], g_th_skip;      /* textures hashed by nvn_front_tex_changed, by reason (see there); not hashed by the pool rule */
 static uint64_t *ww_slot(uint64_t page, int insert) {
     for (unsigned h = (unsigned)((page * 0x9E3779B97F4A7C15ULL) >> 44);; h = (h + 1) & (WW_SLOTS - 1)) {
         if (g_ww_tab[h].page == page) return &g_ww_tab[h].stamp;
@@ -1986,13 +2046,62 @@ static const char *const k_op_name[OP_COUNT] = {
     "DispatchComputeIndirect", "SetRenderEnable", "ResetCounter", "ReportCounter", "ReportValue", "FenceSync", "WaitSync", "SignalEvent", "WaitEvent",
     "BindCoverageModulationTable", "DebugGroup", "DrawTexture"};
 
-typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used, seq; uint64_t blk[4][3]; int nblk; } List;
+typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used, seq; uint64_t blk[4][3]; int nblk, live_pos; } List;
 static List *g_lists;
 static int g_list_count, g_list_cap, *g_list_free, g_list_free_n;
+static int *g_live, g_live_n, g_live_cap;      /* the slots that hold a list (job_list_overwrite and list_collect look only at these, not at every slot ever used) */
 static size_t g_list_bytes, g_list_bytes_max;  /* recorded command lists held, bytes (list_collect's budget), and the most held */
 static LONG64 g_list_budget_drops, g_list_final_drops, g_list_reuse_drops, g_list_reuse_events;
 static volatile LONG64 g_list_seq;             /* lists registered so far: a list's seq orders it against command memory reuse */
 static SRWLOCK g_list_lock = SRWLOCK_INIT;
+/* SMO port: the live lists by where they were written, in 64 KB chunks of each command memory pool (a hash table of
+ * cells), so that job_list_overwrite looks only at the lists in the chunks a new recording covers. Looking at every live
+ * list took 8% of the game's main thread in Cascade Kingdom, about 1.4 ms a frame (some 30 recordings a frame against
+ * thousands of live lists, most recorded once at loading). A piece [lo, hi) is in the chunks of lo .. hi - 1, an empty
+ * one in the chunk of lo, so two pieces job_list_overwrite counts as overlapping share a chunk. A piece over more than
+ * CELL_SPAN chunks goes to g_wide, looked at by every recording, and a recording that long looks at every live list. */
+#define CELL_SHIFT 16
+#define CELL_SPAN 1024
+typedef struct { uint64_t pool, chunk; int *ix, n, cap, used; } Cell;
+static Cell *g_cells;
+static int g_cells_cap, g_cells_used, *g_wide, g_wide_n, g_wide_cap;
+static unsigned cell_hash(uint64_t pool, uint64_t chunk) { return (unsigned)(((pool >> 4) ^ chunk * 0x9E3779B97F4A7C15ull) * 0xC2B2AE3D27D4EB4Full >> 40); }
+static Cell *cell_find(uint64_t pool, uint64_t chunk, int make) {      /* under g_list_lock */
+    if (make && (g_cells_used + 1) * 4 > g_cells_cap * 3) {      /* at most 3/4 full, else twice the size */
+        Cell *old = g_cells;
+        int n = g_cells_cap;
+        g_cells_cap = n ? n * 2 : 4096; g_cells = calloc((size_t)g_cells_cap, sizeof *g_cells);
+        for (int k = 0; k < n; k++) {
+            if (!old[k].used) continue;
+            unsigned h = cell_hash(old[k].pool, old[k].chunk) & (unsigned)(g_cells_cap - 1);
+            while (g_cells[h].used) h = (h + 1) & (unsigned)(g_cells_cap - 1);
+            g_cells[h] = old[k];
+        }
+        free(old);
+    }
+    if (!g_cells_cap) return NULL;
+    for (unsigned h = cell_hash(pool, chunk) & (unsigned)(g_cells_cap - 1);; h = (h + 1) & (unsigned)(g_cells_cap - 1)) {
+        Cell *c = &g_cells[h];
+        if (!c->used) { if (!make) return NULL; c->used = 1; c->pool = pool; c->chunk = chunk; g_cells_used++; return c; }
+        if (c->pool == pool && c->chunk == chunk) return c;
+    }
+}
+static void ix_add(int **v, int *n, int *cap, int i) { if (*n == *cap) { *cap = *cap ? *cap * 2 : 8; *v = realloc(*v, sizeof **v * (size_t)*cap); } (*v)[(*n)++] = i; }
+static void ix_del(int *v, int *n, int i) { for (int m = 0; m < *n; m++) if (v[m] == i) { v[m] = v[--*n]; return; } }
+static void cell_span(const uint64_t *p, uint64_t *c0, uint64_t *c1) { *c0 = p[1] >> CELL_SHIFT; *c1 = (p[2] > p[1] ? p[2] - 1 : p[1]) >> CELL_SHIFT; }
+static void list_cells(int i, int add) {           /* list i into the cells of its pieces, or out of them (under g_list_lock) */
+    List *l = &g_lists[i];
+    for (int k = 0; k < l->nblk && k < 4; k++) {
+        uint64_t c0, c1;
+        cell_span(l->blk[k], &c0, &c1);
+        if (c1 - c0 >= CELL_SPAN) { if (add) ix_add(&g_wide, &g_wide_n, &g_wide_cap, i); else ix_del(g_wide, &g_wide_n, i); continue; }
+        for (uint64_t ch = c0; ch <= c1; ch++) {
+            Cell *c = cell_find(l->blk[k][0], ch, add);
+            if (!c) continue;
+            if (add) ix_add(&c->ix, &c->n, &c->cap, i); else ix_del(c->ix, &c->n, i);
+        }
+    }
+}
 
 static CmdBuf *cb_get(uint64_t g) {
     CmdBuf *cb = hobj(g, K_CMD);
@@ -2048,6 +2157,9 @@ static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uin
     if (seq) *seq = g_lists[i].seq;
     g_lists[i].nblk = cb ? cb->rec_nblk : 0;
     if (cb) memcpy(g_lists[i].blk, cb->rec_blk, sizeof g_lists[i].blk);
+    list_cells(i, 1);
+    if (g_live_n == g_live_cap) { g_live_cap = g_live_cap ? g_live_cap * 2 : 1024; g_live = realloc(g_live, sizeof *g_live * (size_t)g_live_cap); }
+    g_lists[i].live_pos = g_live_n; g_live[g_live_n++] = i;
     uint64_t h = ((uint64_t)(g_lists[i].gen & 0x7fffffff) << 32) | (uint32_t)(i + 1);
     ReleaseSRWLockExclusive(&g_list_lock);
     InterlockedIncrement64(&g_st.lists);
@@ -2073,18 +2185,31 @@ static uint8_t *list_lookup(uint64_t h, size_t *len) {
  * scenery at Top-Hat Tower's door gone in every other frame after a budget rule had dropped "idle" lists). A memory
  * budget (SMO_LIST_BUDGET_MB, default 4096) stays as a last resort and says when it drops lists, as they can be live. */
 typedef struct { uint64_t seg[4][3]; int nseg; LONG64 seq; } Overwrite;
+static void overwrite_check(List *l, const Overwrite *w) {
+    if (!l->data || l->finalized || l->seq >= w->seq) return;
+    int hit = 0;
+    for (int k = 0; k < l->nblk && k < 4 && !hit; k++)
+        for (int j = 0; j < w->nseg && j < 4 && !hit; j++)
+            hit = l->blk[k][0] == w->seg[j][0] && l->blk[k][1] < w->seg[j][2] && w->seg[j][1] < l->blk[k][2];
+    if (hit) { l->finalized = 2; g_list_reuse_drops++; }
+}
 static void job_list_overwrite(void *arg) {            /* lists registered before seq that overlap one of the pieces are over */
     const Overwrite *w = arg;
     AcquireSRWLockExclusive(&g_list_lock);
     g_list_reuse_events++;
-    for (int i = 0; i < g_list_count; i++) {
-        List *l = &g_lists[i];
-        if (!l->data || l->finalized || l->seq >= w->seq) continue;
-        int hit = 0;
-        for (int k = 0; k < l->nblk && k < 4 && !hit; k++)
-            for (int j = 0; j < w->nseg && j < 4 && !hit; j++)
-                hit = l->blk[k][0] == w->seg[j][0] && l->blk[k][1] < w->seg[j][2] && w->seg[j][1] < l->blk[k][2];
-        if (hit) { l->finalized = 2; g_list_reuse_drops++; }
+    int all = 0;
+    for (int j = 0; j < w->nseg && j < 4; j++) { uint64_t c0, c1; cell_span(w->seg[j], &c0, &c1); all |= c1 - c0 >= CELL_SPAN; }
+    if (all) for (int k = 0; k < g_live_n; k++) overwrite_check(&g_lists[g_live[k]], w);
+    else {
+        for (int k = 0; k < g_wide_n; k++) overwrite_check(&g_lists[g_wide[k]], w);
+        for (int j = 0; j < w->nseg && j < 4; j++) {
+            uint64_t c0, c1;
+            cell_span(w->seg[j], &c0, &c1);
+            for (uint64_t ch = c0; ch <= c1; ch++) {
+                Cell *c = cell_find(w->seg[j][0], ch, 0);
+                for (int m = 0; c && m < c->n; m++) overwrite_check(&g_lists[c->ix[m]], w);
+            }
+        }
     }
     ReleaseSRWLockExclusive(&g_list_lock);
 }
@@ -2093,13 +2218,21 @@ static int list_lru_cmp(const void *a, const void *b) {
     LONG64 lx = x->used >= 0 ? x->used : x->created, ly = y->used >= 0 ? y->used : y->created;
     return lx < ly ? -1 : lx > ly;
 }
-static void list_drop(int i) { List *l = &g_lists[i]; g_list_bytes -= l->len; free(l->data); l->data = NULL; l->gen++; g_list_free[g_list_free_n++] = i; }
+static void list_drop(int i) {
+    List *l = &g_lists[i];
+    list_cells(i, 0);
+    int last = g_live[--g_live_n];
+    g_live[l->live_pos] = last; g_lists[last].live_pos = l->live_pos; l->live_pos = -1;
+    g_list_bytes -= l->len; free(l->data); l->data = NULL; l->gen++; g_list_free[g_list_free_n++] = i;
+}
 static void list_collect(void) {
     static size_t budget;
     if (!budget) { const char *e = getenv("SMO_LIST_BUDGET_MB"); budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 4096) << 20; }
     AcquireSRWLockExclusive(&g_list_lock);
-    for (int i = 0; i < g_list_count; i++)
-        if (g_lists[i].data && g_lists[i].finalized) { if (g_lists[i].finalized == 1) g_list_final_drops++; list_drop(i); }      /* finalized by the game, or its memory reused */
+    for (int k = g_live_n - 1; k >= 0; k--) {      /* backwards: list_drop moves the last live slot into the place of the dropped one */
+        int i = g_live[k];
+        if (g_lists[i].finalized) { if (g_lists[i].finalized == 1) g_list_final_drops++; list_drop(i); }      /* finalized by the game, or its memory reused */
+    }
     if (g_list_bytes > budget) {
         int *cand = malloc(sizeof *cand * (size_t)g_list_count), nc = 0;
         for (int i = 0; i < g_list_count; i++) {
@@ -3498,6 +3631,17 @@ static void pf_frame_mark(LONG64 frame) {
     }
     printf(" | MB/frame: streamed %.2f, read back %.2f, hashed %.2f\n", (double)(g_pf_arena_bytes - b0[0]) / 300.0 / 1048576.0, (double)(g_pf_cflush_bytes - b0[1]) / 300.0 / 1048576.0,
            (double)(g_pf_hash_bytes - b0[2]) / 300.0 / 1048576.0);
+    {   /* why textures were hashed (nvn_front_tex_changed): per frame, count and MB, and how many came out unchanged */
+        static LONG64 n0[4], by0[4], s0[4];
+        static const char *why[4] = {"first look", "flushed by the game", "pages written", "memory not watched"};
+        static LONG64 sk0;
+        printf("nvn_texhash: frames %lld..%lld per frame: %.1f not hashed (pool flags);", (long long)frame - 300, (long long)frame, (double)(g_th_skip - sk0) / 300.0);
+        sk0 = g_th_skip;
+        for (int k = 0; k < 4; k++) {
+            printf(" %s %.1f (%.2f MB, %.1f unchanged)%s", why[k], (double)(g_th_n[k] - n0[k]) / 300.0, (double)(g_th_bytes[k] - by0[k]) / 300.0 / 1048576.0, (double)(g_th_same[k] - s0[k]) / 300.0, k < 3 ? ";" : "\n");
+            n0[k] = g_th_n[k]; by0[k] = g_th_bytes[k]; s0[k] = g_th_same[k];
+        }
+    }
     b0[0] = g_pf_arena_bytes; b0[1] = g_pf_cflush_bytes; b0[2] = g_pf_hash_bytes;
     {
         static int on = -1;
@@ -3537,12 +3681,12 @@ static void job_present(void *arg) {
     pair_off();
     pw_gate();
     PresentJob *j = arg;
-    static int shot = -2, every, shot_from;
+    static int shot = -2, every, shot_from, shot_to;
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     RECT r;
     LONG64 frame = g_st.frames + 1;
     LONG64 pf0 = pf_now();
-    if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; }
+    if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
     GetClientRect(g_hwnd, &r);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_FRAMEBUFFER_SRGB_);
@@ -3555,7 +3699,7 @@ static void job_present(void *arg) {
         glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[2], sr[1] + sr[3], 0, r.bottom, r.right, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         if (g_drawlog_frame >= 0 && frame == g_drawlog_frame + 1) save_bmp("frame_drawlog.bmp", t);      /* the frame the draw log describes */
         { int step = nvn_front_take_step_shot(); if (step) { char path[300]; const char *dir = getenv("SMO_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp(path, t); } }
-        if (frame == shot || (every > 0 && frame >= shot_from && frame % every == 0)) {
+        if (frame == shot || (every > 0 && frame >= shot_from && frame <= shot_to && frame % every == 0)) {
             char path[300];
             const char *dir = getenv("SMO_SHOT_DIR");                /* default: the current directory */
             snprintf(path, sizeof path, "%s%sframe_%lld.bmp", dir ? dir : "", dir ? "/" : "", (long long)frame);
@@ -4124,8 +4268,10 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     memcpy(&t->b, P(A1), sizeof t->b);
     if (t->b.pool && nvn_pool_range(t->b.pool, &mem, &size) && mem) { t->mem = (uint8_t *)P(mem) + t->b.offset; t->limit = (uint8_t *)P(mem) + size; }
     t->storage = tex_storage_size2(&t->b, &t->data_size);
+    t->pool_flags = t->b.pool ? (uint32_t)nvn_pool_flags(t->b.pool) : 0;
     t->guest = A0;
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
+    tp_add(t);
     if (texlog_on()) printf("texlog: init %llx host %p %dx%d fmt 0x%x target %d mem %p\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, t->b.target, (void *)t->mem);
     RET(1);
 }
@@ -4144,6 +4290,7 @@ static void tex_finalize(Ctx *c) {
         return;
     }
     InterlockedExchange(&t->dead, 1);
+    tp_remove(t);
     if (texlog_on()) printf("texlog: finalize %llx host %p %dx%d fmt 0x%x mem %p (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, (void *)t->mem, (unsigned long long)c->x[30]);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
@@ -4538,12 +4685,38 @@ static void job_present_movie(void *arg) {
     free(px);
     glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
 }
+/* SMO port, SMO_PRESENT_ASYNC=1 (off by default): the present does not wait for the render thread either. The game
+ * presents from a thread of its own and its main thread waits for that present (sead::Event in
+ * al::GameFrameworkNx::procFrame_) before it starts the next frame, so with a waiting present the next frame's game work
+ * could not begin until the render thread had replayed and shown this one: the two threads took turns (Cascade Kingdom:
+ * the main thread blocked 40-60% of its time). Now the present is queued like a submit and the caller goes on; the one
+ * before it must have been shown first (one frame in flight), so the render thread works on frame N while the game works
+ * on frame N+1, as the console's GPU does. The game's fences (SyncWait) still order everything the commands refer to.
+ * Measured at Cascade Kingdom's first checkpoint (mw3 / mw4, 150 s each): 59.4-60.0 fps waiting, 58.0-59.6 queued, with
+ * lower 1% lows queued (39-48 fps against 43-55): where neither thread is busy all the time, overlapping the frames only
+ * makes the moments of the presents less even. Kept for scenes where both threads are busy. */
+static HANDLE g_present_ev;
+static int g_present_out, g_present_sync = -1;
+static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     if (j.win && j.win->native && j.win->native == album_movie_native_window()) { gl_run(g_rb->present_movie, &j); return; }
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();
-    gl_run(g_rb->present, &j);
+    if (g_present_sync < 0) g_present_sync = !(getenv("SMO_PRESENT_ASYNC") && atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();
+    if (g_present_sync) gl_run(g_rb->present, &j);
+    else {
+        if (!g_present_ev) g_present_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (g_present_out) {                            /* the previous frame has been shown before this one is queued */
+            LONG64 pf0 = pf_now();
+            hitch_wait_render(1);
+            WaitForSingleObject(g_present_ev, INFINITE);
+            hitch_wait_render(0);
+            pf_add(PF_WAIT_PRESENT_, pf0);
+        }
+        gl_post(job_present_signal, &j, sizeof j);
+        g_present_out = 1;
+    }
     display_pace();
 }
 
@@ -5153,6 +5326,15 @@ int nvn_front_tex_changed(Tex *t) {
     if (t->gpu_written || !src || t->b.samples > 1 || !fmt_get(t->b.format, &f) || (f.kind >= 1 && f.kind <= 3)) return 0;
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return 0;
     if (t->b.packaged && t->uploaded) return 0;
+    /* NVN memory pool flags: the CPU cannot write a CPU_NO_ACCESS pool (1), and what it writes into a CPU_CACHED pool (4)
+     * reaches the GPU only after nvnMemoryPoolFlushMappedRange / nvnBufferFlushMappedRange, which mark the textures there
+     * dirty (nvn_gl_memory_written). So a texture there that was read once is read again only when it is dirty. Only
+     * CPU_UNCACHED pools (2: writes are seen without a flush) need the check below. SMO's heap is a section view (smo_nn.c),
+     * which write watch cannot follow, so before this every texture bound in a batch was hashed again (369 a frame in
+     * Cascade Kingdom, all unchanged). SMO_TEXHASH_ALL=1: as before. */
+    static int hash_all = -1;
+    if (hash_all < 0) hash_all = getenv("SMO_TEXHASH_ALL") && atoi(getenv("SMO_TEXHASH_ALL"));
+    if (!hash_all && t->uploaded && !t->dirty && (t->pool_flags & 1 || (t->pool_flags & 6) == 4)) { g_th_skip++; return 0; }
     LONG64 pf0 = pf_now();
     uint64_t newest = ww_newest(src, t->data_size);
     if (newest) {
@@ -5160,8 +5342,10 @@ int nvn_front_tex_changed(Tex *t) {
         t->ww_seen = newest;
         g_ww_dirty++;
     } else g_ww_unwatched++;
+    int why = !t->uploaded ? 0 : t->dirty ? 1 : newest ? 2 : 3;      /* nvn_texhash line: first look, flushed by the game, pages written, memory not watched */
     uint64_t h = mem_hash(src, t->data_size, newest != 0 || (t->b.flags & 0x10) != 0);
     int same = t->uploaded && !t->dirty && h == t->hash && (!newest || t->ww_hashed);
+    g_th_n[why]++; g_th_bytes[why] += (LONG64)t->data_size; if (t->uploaded && h == t->hash) g_th_same[why]++;
     t->ww_hashed = newest != 0;
     pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (LONG64)t->data_size;
     if (same) return 0;
@@ -5338,8 +5522,17 @@ static void vk_shutdown_at_exit(void) {
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
-    for (Tex *t = g_all_tex; t; t = t->all_next)
-        if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    if (!size) return;
+    AcquireSRWLockShared(&g_tp_lock);
+    if (g_tp_cap)
+        for (uint64_t pg = addr >> TP_SHIFT, last = (addr + size - 1) >> TP_SHIFT; pg <= last; pg++) {
+            const TexPage *p = tp_find(pg);
+            if (p) for (int i = 0; i < p->n; i++) {
+                Tex *t = p->t[i];
+                if (!t->dead && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+            }
+        }
+    ReleaseSRWLockShared(&g_tp_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {

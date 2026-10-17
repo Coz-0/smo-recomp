@@ -202,7 +202,8 @@ static void nerve_init(void) {                           /* first indirect call 
     static volatile LONG once;
     if (InterlockedCompareExchange(&once, 1, 0)) { while (*(volatile int *)&g_nerve_mode < 0) YieldProcessor(); return; }
     const char *log = getenv("SMO_NERVELOG"), *pos = getenv("SMO_ACTORPOS"), *seq = getenv("SMO_SEQ");
-    int want = (log && *log) || (pos && atoi(pos) > 0) || (seq && strstr(seq, "@nerve:"));
+    int want = (log && *log) || (pos && atoi(pos) > 0) || (seq && (strstr(seq, "@nerve:") || strstr(seq, "@until-nerve:") || strstr(seq, "@goto:") ||
+                                                                    strstr(seq, "@near:") || strstr(seq, "@at:") || strstr(seq, "@chase:")));
     if (log) { snprintf(g_filter, sizeof g_filter, "%s", log); g_filter_all = !strcmp(log, "*"); }
     g_pos_every = pos ? atoi(pos) : 0;
     if (pos && strchr(pos, ':')) snprintf(g_pos_prefix, sizeof g_pos_prefix, "%s", strchr(pos, ':') + 1);
@@ -355,8 +356,19 @@ int nerve_actor_pos(const char *prefix, float pos[3]) {
     return found;
 }
 
+/* SMO_SEQ: no step left in the input sequence needs the tracker. Unless SMO_NERVELOG or SMO_ACTORPOS want it, it stops,
+ * so that the rest of a run (a timing run, say) is not slowed by it. */
+static long long g_released = -1;
+void nerve_release(void) {
+    if (g_nerve_mode <= 0 || g_filter[0] || g_pos_every > 0) return;
+    g_nerve_mode = 0;
+    g_released = nvn_front_frame_next();
+    printf("nerve: tracking stops at frame %lld: no step of the input sequence needs it any more\n", g_released);
+}
+
 void nerve_report(FILE *out) {
-    if (g_nerve_mode <= 0) return;
+    if (g_nerve_mode <= 0 && g_released < 0) return;
+    if (g_released >= 0) fprintf(out, "nerve: tracking stopped at frame %lld (input sequence)\n", g_released);
     int seen = 0;
     for (int i = 0; i < g_nrv_count; i++) seen += g_nrv[i].last_frame >= 0;
     fprintf(out, "nerve: %d of %d nerve states ran; %lld state changes (%lld printed); keeper table cleared %d times\n",

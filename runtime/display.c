@@ -111,7 +111,7 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     GetModuleFileNameA(NULL, exe, sizeof exe);
     const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SMO_SHOW");
     int visible = show ? atoi(show) != 0 : (!_stricmp(base, "smo_native.exe") || !_stricmp(base, "smo_user.exe"));
-    snprintf(g_title, sizeof g_title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "SSBU native (study build)");
+    snprintf(g_title, sizeof g_title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "Super Mario Odyssey (smo-recomp)");
     if (visible)
         g_hwnd = CreateWindowExA(go->window_mode == 2 ? WS_EX_TOPMOST : 0, wc.lpszClassName, g_title, style | WS_VISIBLE, px, py, r.right - r.left,
                                  r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);

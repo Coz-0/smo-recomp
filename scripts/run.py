@@ -1,6 +1,7 @@
 """Run the built game for a while and summarise what happened.
 
     python scripts/run.py <name> [--seconds 30] [--exe smo_test.exe] [--env NAME=VALUE ...] [--full]
+    python scripts/run.py <name> --exe smo_native.exe --seconds 0 [--userdata <folder>]      play: window, sound, no time limit
                           [--seq <file.seq>] [--userdata <folder>]
 
 Copies build/bin/smo_native.exe (+ its .map) to the test name (only smo_native.exe / smo_user.exe open a visible window
@@ -57,8 +58,8 @@ def main():
     log = os.path.join(RUN, a.name + '.log')
     with open(log, 'w', encoding='utf-8', errors='replace') as f:
         try:
-            r = subprocess.run([exe, r'..\dump\base\elf\main.elf', str(a.seconds)], cwd=BIN, stdout=f, stderr=subprocess.STDOUT,
-                               env=env, timeout=a.seconds + 120)
+            r = subprocess.run([exe, r'..\dump\base\elf\main.elf', str(max(a.seconds, 0))], cwd=BIN, stdout=f, stderr=subprocess.STDOUT,
+                               env=env, timeout=a.seconds + 120 if a.seconds > 0 else None)      # 0: no time limit, until the window is closed
             code = r.returncode
         except subprocess.TimeoutExpired:
             code = 'timeout (killed)'

@@ -107,9 +107,16 @@ def main():
     if r.returncode:
         print((r.stdout + r.stderr)[-8000:])
         return 1
-    shutil.copy2(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(BIN, 'SDL3.dll'))
+    copy_if_changed(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(BIN, 'SDL3.dll'))
     print('linked %s (%.1f MB)' % (out, os.path.getsize(out) / 2 ** 20))
     return build_shader_shim()
+
+
+def copy_if_changed(src, dst):
+    """Copies a DLL next to the exe unless the same file is there already (a running game keeps it open)."""
+    if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src) and os.path.getmtime(dst) >= os.path.getmtime(src):
+        return
+    shutil.copy2(src, dst)
 
 
 def build_shader_shim():
@@ -125,7 +132,7 @@ def build_shader_shim():
             return 1
     sdk_bin = os.path.join(os.path.dirname(VKH), 'Bin', 'shaderc_shared.dll')
     if os.path.exists(sdk_bin):
-        shutil.copy2(sdk_bin, os.path.join(BIN, 'shaderc_shared.dll'))
+        copy_if_changed(sdk_bin, os.path.join(BIN, 'shaderc_shared.dll'))
     lib = ctypes.CDLL(dll)
     words, count, log = ctypes.POINTER(ctypes.c_uint32)(), ctypes.c_size_t(), ctypes.create_string_buffer(4096)
     ok = lib.smo_glsl_to_spirv(0, b'#version 460\nvoid main() { gl_Position = vec4(float(gl_VertexIndex), 0.0, 0.0, 1.0); }\n',

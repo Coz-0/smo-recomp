@@ -18,8 +18,8 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Pictures
 
-- `SMO_SHOT=<n>` saves frame n; `SMO_SHOT_EVERY=<k>` saves every k-th frame from `SMO_SHOT_FROM=<frame>` on, as
-  `frame_<n>.bmp` in `SMO_SHOT_DIR=<folder>` (the folder must exist).
+- `SMO_SHOT=<n>` saves frame n; `SMO_SHOT_EVERY=<k>` saves every k-th frame from `SMO_SHOT_FROM=<frame>` on (up to
+  `SMO_SHOT_TO=<frame>` when given), as `frame_<n>.bmp` in `SMO_SHOT_DIR=<folder>` (the folder must exist).
 - `SMO_VK_PASSSHOT=<frame>` saves colour target 0 at the end of every render pass of that frame
   (`pass_<n>_<format>.bmp`) and logs every draw of it: programs, blend and depth state, viewport, vertex attributes and
   the texture behind every binding. `SMO_VK_PASSSHOT=<first>-<last>/<step>` does it for several frames
@@ -48,6 +48,31 @@ The end of every log has the counts that tell whether a run was healthy:
   so, because the game may still submit them.
 - `SMO_TEXLOG=1` logs texture creation, finalization and registration; the per-draw log of `SMO_VK_PASSSHOT` says why
   a texture handle is unknown (slot outside the pool, never registered, or a texture that was finalized).
+- Flicker that shows in single frames: save every frame of a stretch (`SMO_SHOT_EVERY=1 SMO_SHOT_FROM=<a> SMO_SHOT_TO=<b>
+  SMO_SHOT_DIR=<folder>`), then `tools\dev\flicker.py <folder>` lists the frames where a region of the picture is brighter
+  or darker than in both neighbours, and saves them side by side. To see what such a frame drew differently, run the same
+  stretch again with `SMO_VK_PASSSHOT=<a>-<b> SMO_VK_PASSSHOT_LOGONLY=1 SMO_VK_FRAMELOG=<a>-<b>` (every draw logged,
+  no pass pictures; a lot of log) and `tools\dev\drawdiff.py build\run\<name>.log <frame>`: the draws the frame has that
+  neither neighbour has, and the ones it lacks.
+- `SMO_VK_FRAMELOG=<first>-<last>`: one `nvn_vk_frame:` line per frame (draws, draws left out and why, conditional
+  renders, render passes, texture barriers, stream ring wraps and kilobytes streamed).
+
+## Speed
+
+- Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
+  ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
+  the GPU, present). `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why.
+- `SMO_HOSTPROF=<start s>,<seconds>[,<threads>][;<start s>,<seconds>[,<threads>] ...]` samples the stacks of the
+  busiest threads (default 4) about every millisecond in each window and prints the functions met most often, what
+  each thread was blocked in, and under which function of the game. `tools\dev\profnames.py build\run\<name>.log` adds
+  the names of the lifted game's functions (`guest f_...`) from the function list.
+- Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
+  GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
+  ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
+  `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
+  the render thread), `SMO_VK_VTXGROW=0` (vertex streams are copied only as far as the range the game bound, even when
+  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=1` lets the present not wait for the render thread (one frame in flight);
+  `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
 
 ## Crashes and stalls
 

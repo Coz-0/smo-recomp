@@ -150,6 +150,9 @@ static void seq_begin(int i) {
     g_seq_holding = 0;
     g_seq_run = 0;
     g_seq_left = i < g_seq_count ? g_seq[i].wait : 0;
+    int k = i;
+    while (k < g_seq_count && (g_seq[k].kind == SEQ_KEYS || g_seq[k].kind == SEQ_DRAWS || g_seq[k].kind == SEQ_UNTIL || (g_seq[k].kind == SEQ_MARK && strncmp(g_seq[k].mark, "nerve:", 6)))) k++;
+    if (i > 0 && k == g_seq_count) { void nerve_release(void); nerve_release(); }      /* smo_nerve.c: no step left needs the game-state tracker */
 }
 
 static void seq_tick(void) {                              /* once per poll of player 1 */

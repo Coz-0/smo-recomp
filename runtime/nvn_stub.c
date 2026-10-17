@@ -312,6 +312,7 @@ int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
     *mem = p->memory; *size = p->size;
     return p->memory != 0;
 }
+int nvn_pool_flags(uint64_t pool) { return pool ? (int)nobj(pool)->flags : 0; }      /* for nvn_gl.c */
 static void pool_map(Ctx *c) { log_call(c); vp_note_use(A0); RET(nobj(A0)->memory); }
 static void pool_size(Ctx *c) { log_call(c); RET(nobj(A0)->size); }
 static void buffer_builder_storage(Ctx *c) {                         /* (builder, pool, offset, size) */

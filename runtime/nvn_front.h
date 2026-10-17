@@ -43,6 +43,7 @@ typedef struct Tex {
     uint64_t hash;
     uint64_t ww_seen; int ww_hashed;       /* write-watch stamp seen at the last look; hash is a full hash (see ww_newest) */
     uint32_t checked;
+    uint32_t pool_flags;                   /* NVN memory pool flags of its storage (nvnMemoryPoolBuilderSetFlags) */
     TexObj o;
     VNode *views;
     void *vk;                              /* the Vulkan back end's record of this texture (nvn_vk_draw.c: VTex), NULL until first used */

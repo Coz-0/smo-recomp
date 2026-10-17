@@ -78,6 +78,8 @@ Say in the pull request which of these you ran:
 - **Shader translator changes:** `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of dumped
   stages>` (0 different); stages are dumped with `SMO_SHADERDUMP=<folder>` and `SMO_VK_DUMP_MINBYTES=<n>`.
 - **Texture layout changes:** `tests\bntx_layout_check.py` (every texture of the RomFS equal).
+- **Changes to the largest-index scan (`runtime/nvn_vk_draw.c`) or the command-list overwrite index
+  (`runtime/nvn_gl.c`):** `tests\check_fast_paths.py` (`PASS`: both equal to the plain code on random input).
 - **Anything that can change game behaviour, rendering or timing:** `tests\run_cap_kingdom.py <new run name>` must
   print `RESULT: PASS`.
 - **Input changes:** `scripts\run.py padtest --env SMO_PAD_SELFTEST=1` (every check passes).

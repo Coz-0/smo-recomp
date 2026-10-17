@@ -45,6 +45,10 @@ named after its neighbours, `<Class>Nrv_<address>`.
 - `SMO_ACTORPOS=<n>[:<prefixes>]` logs where actors are (the player by default); following another actor's path, such as
   Cappy running ahead in the opening, gives waypoints that are known to be walkable.
 - `SMO_ICALLS=<start>,<seconds>` counts which functions run in a window; the state that runs every frame stands out.
+- The tracker costs time on every indirect call. It is on when a sequence has a step that needs it (`@nerve`,
+  `@until-nerve`, `@goto`, `@near`, `@at`, `@chase`) and stops by itself once no such step is left, unless
+  `SMO_NERVELOG` or `SMO_ACTORPOS` asks for it; so a timing run that only waits for a state at the start runs at full
+  speed after it (the log says `nerve: tracking stops at frame F`).
 
 ## Steering
 

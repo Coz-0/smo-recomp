@@ -217,8 +217,196 @@ static DWORD WINAPI wd_main(void *arg) {
     }
     return 0;
 }
+/* SMO_HOSTPROF=<start s>,<seconds>[,<threads>] (debug aid): samples the stacks of the busiest threads (default 4, by CPU
+ * time in half a second at the start) about every millisecond for that long, then prints per thread the functions met
+ * most often: "self" when the sampled pc is in the function, "total" when the function is anywhere on the stack, in % of
+ * the thread's samples. Names as in the watchdog's report: this exe's functions by the linker map, the lifted game's as
+ * "guest f_<address>" (tools/dev/profnames.py adds their names from the function list), other modules by nearest
+ * export. A thread is suspended only for the few microseconds of its unwind; nothing is allocated or printed meanwhile. */
+#define HP_SLOTS 32768
+#define HP_DEPTH 160
+typedef struct { uint64_t key; unsigned self, total; } HpEnt;
+typedef struct { DWORD tid; HANDLE h; unsigned samples, used, waits, wused; HpEnt *t, *w; char name[80]; double cpu_ms; } HpThread;
+static uint64_t hp_mod_end(HMODULE m) {           /* end address of a loaded module (its SizeOfImage) */
+    const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)m;
+    if (!m || dh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)((const uint8_t *)m + dh->e_lfanew);
+    return (uint64_t)(uintptr_t)m + nt->OptionalHeader.SizeOfImage;
+}
+static int hp_cmp_self(const void *a, const void *b) { const HpEnt *x = a, *y = b; return x->self < y->self ? 1 : x->self > y->self ? -1 : 0; }
+static int hp_cmp_total(const void *a, const void *b) { const HpEnt *x = a, *y = b; return x->total < y->total ? 1 : x->total > y->total ? -1 : 0; }
+static uint64_t hp_func(uint64_t pc) {             /* the start of the function holding pc (pc itself in code without unwind data) */
+    DWORD64 base = 0;
+    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &base, NULL);
+    return rf ? base + rf->BeginAddress : pc;
+}
+static void hp_window(double secs, int want) {
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    static struct { DWORD tid; ULONGLONG c0, c1; } th[512];
+    int nt = 0;
+    for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, half a second apart */
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        if (snap == INVALID_HANDLE_VALUE) return;
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+            int i;
+            for (i = 0; i < nt && th[i].tid != te.th32ThreadID; i++) {}
+            if (i == nt) { if (pass || nt == 512) continue; th[nt].tid = te.th32ThreadID; th[nt].c0 = th[nt].c1 = 0; nt++; }
+            HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            FILETIME c, x, k, u;
+            if (!h) continue;
+            if (GetThreadTimes(h, &c, &x, &k, &u)) {
+                ULONGLONG cpu = (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime);
+                if (pass) th[i].c1 = cpu; else th[i].c0 = cpu;
+            }
+            CloseHandle(h);
+        }
+        CloseHandle(snap);
+        if (!pass) Sleep(500);
+    }
+    static HpThread hp[8];
+    int n = 0;
+    memset(hp, 0, sizeof hp);
+    for (int k = 0; k < want; k++) {
+        int best = -1;
+        for (int i = 0; i < nt; i++) if (th[i].c1 > th[i].c0 && (best < 0 || th[i].c1 - th[i].c0 > th[best].c1 - th[best].c0)) best = i;
+        if (best < 0) break;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, th[best].tid);
+        if (h && (hp[n].t = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL && (hp[n].w = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL) {
+            char tb[80];
+            hp[n].tid = th[best].tid; hp[n].h = h;
+            hp[n].cpu_ms = (double)(th[best].c1 - th[best].c0) / 10000.0;
+            snprintf(hp[n].name, sizeof hp[n].name, "%s", wd_tname(hp[n].tid, tb, sizeof tb));
+            n++;
+        } else if (h) CloseHandle(h);
+        th[best].c1 = th[best].c0;
+    }
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    LARGE_INTEGER fq, t0, now;
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    printf("hostprof: sampling %d threads for %.0f s\n", n, secs);
+    fflush(stdout);
+    static uint64_t pcs[HP_DEPTH], seen[HP_DEPTH];
+    static CONTEXT ctx;
+    /* a sample whose pc is in ntdll or win32u is a thread blocked in a system call: it is also counted under the
+     * innermost function of the lifted game on its stack ("waits under"), to see what the game was waiting for */
+    HMODULE m_nt = GetModuleHandleA("ntdll.dll"), m_w32 = GetModuleHandleA("win32u.dll"), m_game = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)&fn_table[0], &m_game);
+    uint64_t nt0 = (uint64_t)(uintptr_t)m_nt, nt1 = hp_mod_end(m_nt), w0 = (uint64_t)(uintptr_t)m_w32, w1 = hp_mod_end(m_w32);
+    uint64_t g0 = (uint64_t)(uintptr_t)m_game, g1 = hp_mod_end(m_game);
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        if ((double)(now.QuadPart - t0.QuadPart) / (double)fq.QuadPart >= secs || g_wd_quit) break;
+        for (int i = 0; i < n; i++) {
+            int np = 0, ns = 0;
+            if (SuspendThread(hp[i].h) == (DWORD)-1) continue;
+            memset(&ctx, 0, sizeof ctx);
+            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(hp[i].h, &ctx)) np = wd_walk(&ctx, pcs, HP_DEPTH);
+            ResumeThread(hp[i].h);
+            if (!np) continue;
+            hp[i].samples++;
+            if ((pcs[0] >= nt0 && pcs[0] < nt1) || (pcs[0] >= w0 && pcs[0] < w1)) {
+                uint64_t key = 0;
+                for (int f = 1; f < np && !key; f++) if (pcs[f] >= g0 && pcs[f] < g1) key = hp_func(pcs[f]);
+                if (!key) key = 1;                 /* no game function on the stack (a host thread's own wait) */
+                unsigned h = (unsigned)((key >> 4) * 2654435761u) % HP_SLOTS;
+                while (hp[i].w[h].key && hp[i].w[h].key != key) h = (h + 1) % HP_SLOTS;
+                if (hp[i].w[h].key || hp[i].wused < HP_SLOTS * 3 / 4) {
+                    if (!hp[i].w[h].key) { hp[i].w[h].key = key; hp[i].wused++; }
+                    hp[i].w[h].self++;
+                    hp[i].waits++;
+                }
+            }
+            for (int f = 0; f < np; f++) {
+                uint64_t key = hp_func(pcs[f]);
+                int dup = 0;
+                for (int s = 0; s < ns && !dup; s++) dup = seen[s] == key;
+                if (dup) continue;
+                seen[ns++] = key;
+                unsigned h = (unsigned)((key >> 4) * 2654435761u) % HP_SLOTS;
+                while (hp[i].t[h].key && hp[i].t[h].key != key) h = (h + 1) % HP_SLOTS;
+                if (!hp[i].t[h].key) { if (hp[i].used >= HP_SLOTS * 3 / 4) continue; hp[i].t[h].key = key; hp[i].used++; }
+                hp[i].t[h].total++;
+                if (f == 0) hp[i].t[h].self++;
+            }
+        }
+        if (tm) { LARGE_INTEGER due; due.QuadPart = -10000; SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, 20); } else Sleep(1);
+    }
+    if (tm) CloseHandle(tm);
+    for (int i = 0; i < n; i++) {
+        HpEnt *e = calloc(hp[i].used ? hp[i].used : 1, sizeof *e);
+        int m = 0;
+        if (!e) break;
+        for (int s = 0; s < HP_SLOTS; s++) if (hp[i].t[s].key) e[m++] = hp[i].t[s];
+        printf("hostprof: thread %lu (%s): %.0f ms of CPU in the half second before sampling; %u samples\n", (unsigned long)hp[i].tid, hp[i].name, hp[i].cpu_ms, hp[i].samples);
+        for (int pass = 0; pass < 2 && hp[i].samples; pass++) {
+            qsort(e, (size_t)m, sizeof *e, pass ? hp_cmp_total : hp_cmp_self);
+            printf("hostprof:   %s\n", pass ? "most often anywhere on the stack (total %, self %):" : "most often running (self %, total %):");
+            for (int k = 0; k < m && k < (pass ? 40 : 30); k++) {
+                char ab[300];
+                wd_addr(e[k].key, ab, sizeof ab);
+                double sf = 100.0 * e[k].self / hp[i].samples, tt = 100.0 * e[k].total / hp[i].samples;
+                printf("hostprof:   %5.1f %5.1f  %s\n", pass ? tt : sf, pass ? sf : tt, ab);
+            }
+        }
+        if (hp[i].waits) {
+            int mw = 0;
+            HpEnt *we = calloc(hp[i].wused ? hp[i].wused : 1, sizeof *we);
+            if (we) {
+                for (int s = 0; s < HP_SLOTS; s++) if (hp[i].w[s].key) we[mw++] = hp[i].w[s];
+                qsort(we, (size_t)mw, sizeof *we, hp_cmp_self);
+                printf("hostprof:   blocked in a system call %.1f%% of the samples; by the innermost game function on the stack (%% of all samples):\n", 100.0 * hp[i].waits / hp[i].samples);
+                for (int k = 0; k < mw && k < 12; k++) {
+                    char ab[300];
+                    if (we[k].key == 1) snprintf(ab, sizeof ab, "(no game function on the stack)"); else wd_addr(we[k].key, ab, sizeof ab);
+                    printf("hostprof:   %5.1f        %s\n", 100.0 * we[k].self / hp[i].samples, ab);
+                }
+                free(we);
+            }
+        }
+        free(e);
+        free(hp[i].t);
+        free(hp[i].w);
+        CloseHandle(hp[i].h);
+    }
+    fflush(stdout);
+}
+static DWORD WINAPI hp_main(void *arg) {           /* SMO_HOSTPROF=<start>,<seconds>[,<threads>][;<start>,<seconds>[,<threads>] ...] */
+    char spec[256];
+    LARGE_INTEGER fq, t0, now;
+    (void)arg;
+    snprintf(spec, sizeof spec, "%s", getenv("SMO_HOSTPROF"));
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    for (char *w = spec; w && *w && !g_wd_quit; w = strchr(w, ';') ? strchr(w, ';') + 1 : NULL) {
+        double start = 0, secs = 0;
+        int want = 4;
+        if (sscanf(w, "%lf,%lf,%d", &start, &secs, &want) < 2 || secs <= 0) continue;
+        if (want < 1) want = 1;
+        if (want > 8) want = 8;
+        QueryPerformanceCounter(&now);
+        double el = (double)(now.QuadPart - t0.QuadPart) / (double)fq.QuadPart;
+        if (start > el) Sleep((DWORD)((start - el) * 1000));
+        if (g_wd_quit) break;
+        printf("hostprof: window from %.0f s after the renderer started, frame %lld\n", start, nvn_front_frame_next());
+        hp_window(secs, want);
+    }
+    return 0;
+}
+static void hp_start(void) {
+    static int done;
+    if (done || !getenv("SMO_HOSTPROF")) return;
+    done = 1;
+    HANDLE t = CreateThread(NULL, 0, hp_main, NULL, 0, NULL);
+    if (t) { SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL); CloseHandle(t); }
+}
 static void wd_start(void) {
     static double limit = 5.0;
+    hp_start();
     const char *e = getenv("SMO_VK_WATCHDOG");
     if (e) limit = atof(e);
     if (limit <= 0 || g_offline) { printf("nvn_vk_watchdog: off (SMO_VK_WATCHDOG=0)\n"); return; }
