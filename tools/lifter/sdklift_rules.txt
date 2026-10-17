@@ -1,0 +1,102 @@
+# Rules for tools/lifter/sdklift.py (SMO). No addresses and no code: only which SDK functions to lift and where to stop.
+#   family <regex>   every game import whose name matches and that sdk.elf defines is a root (lifted, then installed as
+#                    the import's handler)
+#   rootall <regex>  every FUNCTION symbol of sdk.elf that matches is a root (reached through method tables at run
+#                    time, which the static closure cannot follow); only game imports are installed as handlers
+#   ctors <regex>    SDK static constructors (.init_array) that directly call a function matching: lifted, and run (in
+#                    .init_array order) before the game starts, as the console's loader runs the SDK module's
+#   datafuncs <regex> every code pointer stored inside sdk DATA objects whose symbol matches (method tables, function
+#                    pointer data) is a root
+#   root <name>      an extra root
+#   cut <name>       calls to it go to the host handler of that name (game imports are cut by default)
+#   wrap <name>      lifted, but calls to it go to the host handler of that name (which may call the lifted code)
+#   trap <name>      calls to it stop with the name
+#   lift <name>      lift the SDK's own code even though the game imports the name
+
+# nn::audio: SMO's sdk contains the whole AudioRenderer (client, nn::audio::server, nn::audio::dsp); see runtime/smo_audio.c
+family ^_ZNK?2nn5audio
+# the server and DSP side and the sf implementation templates of the audio interfaces (called through method tables)
+rootall ^_ZNK?2nn5audio
+rootall 5audio6detail1[24]IAudio(Renderer|Device)
+rootall 5audio6detail21IAudioRendererManager
+rootall ^_ZNK?2nn2sf6detail.*5audio
+# code pointers held by audio DATA objects: method tables of the audio classes and the SupportTags (feature checks)
+datafuncs ^_ZTVN2nn5audio
+datafuncs ^_ZN2nn5audio
+datafuncs ^_ZTVN2nn2sf4impl6detail.*5audio
+# the in-process renderer manager is a static object built by an SDK static constructor
+ctors ^_ZNK?2nn5audio
+
+# The renderer manager over IPC: on the console the audio system module runs the same AudioRendererManagerImpl the sdk
+# contains; the host answers with the in-process (DFC) manager instead of opening an IPC session.
+cut _ZN2nn5audio32CreateAudioRendererManagerByHipcEv
+
+# transfer memory (OpenAudioRenderer lends the work buffer to the server): host side in runtime/smo_nn.c
+cut _ZN2nn2os6detail27TransferMemoryImplByHorizon6CreateEPjPvmNS0_16MemoryPermissionE
+cut _ZN2nn2os6detail27TransferMemoryImplByHorizon5CloseEj
+cut _ZN2nn2os6detail27TransferMemoryImplByHorizon3MapEPPvjS3_mNS0_16MemoryPermissionE
+cut _ZN2nn2os6detail27TransferMemoryImplByHorizon5UnmapEjPvm
+cut _ZN2nn2os6detail21AddressSpaceAllocator13AllocateSpaceEmm
+cut _ZN2nn2os6detail21AddressSpaceAllocator15CheckGuardSpaceEmmm
+
+# the rendering clock and the DSP (runtime/smo_audio.c): the host keeps the list of started renderers and runs the
+# command lists; SendCommandBuffer is an empty stub in this SDK
+wrap _ZN2nn5audio6server17AudioRenderSystem5StartEv
+wrap _ZN2nn5audio6server17AudioRenderSystem4StopEv
+cut _ZN2nn5audio3dsp17SendCommandBufferEimmibm
+
+# system events: host model shared through handles (runtime/os_threads.c sev_*), for game and lifted SDK alike
+cut _ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb
+cut _ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE
+cut _ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE
+cut _ZN2nn2os33AttachWritableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE
+cut _ZN2nn2os33DetachReadableHandleOfSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os33DetachWritableHandleOfSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE
+cut _ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os30GetReadableHandleOfSystemEventEPKNS0_15SystemEventTypeE
+cut _ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE
+cut _ZN2nn2os30GetReadableHandleOfSystemEventEPNS0_15SystemEventTypeE
+cut _ZN2nn2os30GetWritableHandleOfSystemEventEPNS0_15SystemEventTypeE
+
+# the audio DEVICE layer: stubs in the application SDK, answered by the host as the audio system module does
+# (runtime/smo_audio.c dev_*)
+cut _ZN2nn5audio6server6detail21InitializeAudioDeviceERKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail19FinalizeAudioDeviceERKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi
+cut _ZN2nn5audio6server6detail26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEfRKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail26GetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameERKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE
+cut _ZN2nn5audio6server6detail27QueryAudioDeviceSystemEventEPjRKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail38QueryAudioDeviceInputNotificationEventEPjRKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail39QueryAudioDeviceOutputNotificationEventEPjRKNS_6applet20AppletResourceUserIdE
+cut _ZN2nn5audio6server6detail21GetActiveChannelCountEv
+
+# nn::hid vibration graph (VibrationNode / Mixer / Target / Writer / Player / NodeConnection): SDK code that mixes
+# vibration values in software; the device side below it is cut when the boot reaches it
+family ^_ZNK?2nn3hid[0-9]+Vibration(Node|Mixer|Target|Writer|Player|NodeConnection|FileParser)
+rootall ^_ZNK?2nn3hid[0-9]+Vibration(Node|Mixer|Target|Writer|Player|NodeConnection|FileParser)
+datafuncs ^_ZTVN2nn3hid[0-9]+Vibration
+
+# nn::hid handle getters: pure functions of (npad id, style set) in the sdk (no IPC, no shared memory), lifted as they are
+family ^_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE$
+family ^_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE$
+# the vibration queue's one request to the hid module (runtime/nnhid.c hid_SendVibrationValues)
+cut _ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi
+
+# nn::util: the NintendoWare binary file helpers and the UTF-8 / UTF-16 conversions, pure functions over guest memory.
+# Relocate is lifted with Unrelocate, so that one undoes exactly what the other did (it replaces runtime/nnsdk.c's host
+# Relocate, which added a section's base without taking off the section's position). Users in the game: unloading of
+# g3d / font / ui2d / vfx resources, the IsValid checks of g3d and gfx resource files, nn::font's formatted text.
+family ^_ZN2nn4util15RelocationTable(8Relocate|10Unrelocate)Ev$
+family ^_ZN2nn4util16BinaryFileHeader12SetRelocatedEb$
+family ^_ZNK2nn4util16BinaryFileHeader7IsValidEliii$
+family ^_ZN2nn4util30ConvertString(Utf16NativeToUtf8EPciPKti|Utf8ToUtf16NativeEPtiPKci)$
+
+# nn::web: the offline page's argument (TLV writers) and return value (readers) of SMO's Help (al::HtmlViewer::call);
+# ShowOfflineHtmlPage itself is the host's (runtime/nnapplet.c: the page opens in the PC's web browser)
+family ^_ZNK?2nn3web(22ShowOfflineHtmlPageArg|26OfflineHtmlPageReturnValue|36ShowOfflineHtmlPageArgWithPlayReport)
