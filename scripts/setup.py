@@ -16,7 +16,7 @@ Nothing of the game is stored in the repository: every step derives its files fr
 by git). Steps run in this order and are resumable: a step whose output exists is skipped (--redo <step> repeats it,
 --from <step> repeats it and everything after it); compile, tables and link always run, and only rebuild what changed.
 
-    deps       check Python packages, clang, the Vulkan SDK and SDL3
+    deps       check Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
     extract    dump -> ExeFS, main.elf / sdk.elf, NACP, version.json        (tools/extract/extract.py)
     romfs      the game's RomFS -> build/romfs                              (tools/extract/romfs.py)
     manual     the offline HTML document (the game's Help) -> build/manual  (tools/extract/romfs.py --manual)
@@ -31,7 +31,7 @@ by git). Steps run in this order and are resumable: a step whose output exists i
 
 Other commands:  --status (what is done)   --steps (list)   --only <step>
 Tool locations: LLVM_ROOT (clang 9, default C:/llvm-9.0.0), VULKAN_HEADERS (default the Vulkan SDK's Include folder),
-SDL3_ROOT (default deps/SDL3-*). Then start the game with scripts/run.py.
+SDL3_ROOT (default deps/SDL3-*), WEBVIEW2_ROOT (default deps/webview2-*). Then start the game with scripts/run.py.
 """
 import argparse
 import glob
@@ -71,7 +71,10 @@ def check_deps(a):
     clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
     vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
     sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
-    for what, path in (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl)):
+    wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
+    wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
+    for what, path in (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
+                       ('WebView2 SDK (WEBVIEW2_ROOT)', wv2)):
         found = bool(path) and os.path.exists(path)
         print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
         ok &= found
