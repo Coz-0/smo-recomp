@@ -4,6 +4,9 @@ names (the module's own dynamic symbols, plus OdysseyDecomp's name where it has 
     python tools/extract/functions.py [--dump build/dump/base] [--out build/functions]
                                       [--decomp <OdysseyDecomp clone, optional>]
 
+The defaults follow SMO_TARGET (tools/target.py): for an update target, build/dump/update and build/<version>/functions;
+the decompilation's names are for 1.0.0 and are only used for that target.
+
 Boundary evidence, per function (column `src`):
     E  .eh_frame FDE (exact start and length, written by the compiler)
     S  dynamic symbol of type FUNC with a size (exact start and length, written by the linker)
@@ -13,6 +16,11 @@ Boundary evidence, per function (column `src`):
 The list is the union of E and S, plus B/R/T targets that no E/S function starts at. The end of a function is the
 E or S end when there is one (they must agree, checked), else the next start. Addresses are module-relative
 (main is loaded at 0x7100000000 on the console; add that for absolute addresses).
+
+Names of main's nerve states from RTTI (column `rtti_name`; 1.4.1's main has almost no symbols): every class whose
+typeinfo derives (through single-inheritance bases) from al::Nerve has a vtable whose first function is its
+execute(al::NerveKeeper *) const; that function gets the mangled name the class implies. On 1.0.0 these names equal the
+symbols and the decompilation's names wherever those exist (see the summary line).
 
 Writes <out>/<module>_functions.tsv and <out>/summary.json. Output is derived from the dump and the decomp: it stays
 under build/ (ignored by git).
@@ -27,6 +35,8 @@ import struct
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T               # noqa: E402
 OFF = 0x1000                     # image offset inside our ELF files (switchfs.nso_to_elf)
 
 
@@ -314,28 +324,92 @@ def analyse(mod, decomp=None):
     return rows, stats
 
 
+def rtti_nerves(mod, on_end=False):
+    """{address: mangled name} of the execute functions of every class derived from al::Nerve, from RTTI. A typeinfo
+    is a pointer to a __cxxabiv1 class_type_info vtable (+16, a symbol relocation), the name (a RELATIVE relocation to
+    the type's mangled name) and, for single inheritance, the base typeinfo; a vtable is offset-to-top (no relocation),
+    the typeinfo, then the virtual functions: slot 0 is al::Nerve's execute, slot 1 its executeOnEnd (run when the
+    keeper leaves the state). on_end: also the classes' own executeOnEnd (not the default most classes share)."""
+    syms = mod.symbols()
+    rel, symrel = {}, {}
+    for off, info, add in mod.relocs():
+        kind = info & 0xffffffff
+        if kind == 0x403:                                         # R_AARCH64_RELATIVE
+            rel[off] = add
+        elif kind in (0x101, 0x401):                              # R_AARCH64_ABS64, GLOB_DAT
+            symrel[off] = syms[info >> 32][0]
+    tinfo = {}
+    for off, name in symrel.items():
+        if name.startswith('_ZTVN10__cxxabiv1') and name.endswith('class_type_infoE') and off + 8 in rel:
+            tinfo[off] = (mod.cstr(rel[off + 8]), rel.get(off + 16) if '_si_' in name else None)
+    nerve = [t for t, (s, _) in tinfo.items() if s == 'N2al5NerveE']
+    if len(nerve) != 1:
+        return {}
+    nerve = nerve[0]
+    refs = collections.defaultdict(list)
+    for off, p in rel.items():
+        refs[p].append(off)
+    out, ends = {}, []
+    for t, (s, base) in tinfo.items():
+        b, depth = base, 0
+        while b is not None and b != nerve and b in tinfo and depth < 32:
+            b, depth = tinfo[b][1], depth + 1
+        if b != nerve:
+            continue
+        vts = [o - 8 for o in refs.get(t, []) if o - 8 not in rel and o - 8 not in symrel and o - 8 not in tinfo]
+        fn = rel.get(vts[0] + 16) if len(vts) == 1 else None
+        if fn is None:
+            continue
+        inner = s[1:-1] if s.startswith('N') and s.endswith('E') else s
+        param = 'PNS_11NerveKeeperE' if inner.startswith('2al') else 'PN2al11NerveKeeperE'   # `al` is substitution S_
+        out.setdefault(fn, '_ZNK' + inner + '7executeE' + param)
+        if rel.get(vts[0] + 24) is not None:
+            ends.append((rel[vts[0] + 24], '_ZNK' + inner + '12executeOnEndE' + param))
+    if on_end and ends:
+        shared = collections.Counter(a for a, _ in ends).most_common(1)[0][0]    # al::Nerve's own, which most keep
+        for a, name in ends:
+            if a != shared and a not in out:
+                out.setdefault(a, name)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dump', default=os.path.join(REPO, 'build', 'dump', 'base'))
-    ap.add_argument('--out', default=os.path.join(REPO, 'build', 'functions'))
+    ap.add_argument('--dump', default=T.DUMP)
+    ap.add_argument('--out', default=T.build('functions'))
     ap.add_argument('--decomp', default=os.path.join(os.path.dirname(REPO), 'ref', 'OdysseyDecomp'))
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     summary = {}
     elfdir = os.path.join(a.dump, 'elf')
+    base_main = os.path.normcase(os.path.abspath(a.dump)) == os.path.normcase(os.path.join(REPO, 'build', 'dump', 'base'))
     for fn in sorted(os.listdir(elfdir)):
         name = fn[:-4]
         mod = Module(os.path.join(elfdir, fn))
-        dec = decomp_list(a.decomp) if name == 'main' else None
+        dec = decomp_list(a.decomp) if name == 'main' and base_main else None   # its addresses are 1.0.0's
         rows, stats = analyse(mod, dec)
+        rtti = rtti_nerves(mod, on_end=True) if name == 'main' else {}
+        if rtti:
+            on_end = sum(1 for n in rtti.values() if '12executeOnEndE' in n)
+            rtti_exec = {a: n for a, n in rtti.items() if '12executeOnEndE' not in n}
+            starts = {r['start'] for r in rows}
+            same_sym = sum(1 for r in rows if r['start'] in rtti and rtti[r['start']] in r['names'])
+            other_sym = sum(1 for r in rows if r['start'] in rtti and r['names'] and rtti[r['start']] not in r['names'])
+            dec_rows = [r for r in rows if r['start'] in rtti and '7executeEP' in r.get('decomp', {}).get('label', '')
+                        or r['start'] in rtti and '12executeOnEndEP' in r.get('decomp', {}).get('label', '')]
+            same_dec = sum(1 for r in dec_rows if r['decomp']['label'].lstrip('#') == rtti[r['start']])
+            stats['rtti_nerves'] = {'execute_functions': len(rtti_exec), 'own_executeOnEnd': on_end,
+                                    'not_a_listed_start': len(set(rtti) - starts),
+                                    'same_as_symbol': same_sym, 'other_symbol': other_sym,
+                                    'decomp_named': len(dec_rows), 'same_as_decomp': same_dec}
         summary[name] = stats
         with open(os.path.join(a.out, '%s_functions.tsv' % name), 'w', encoding='utf-8', newline='\n') as f:
-            f.write('start\tend\tsize\tsrc\tend_from\tsymbol\tdecomp_name\tdecomp_status\n')
+            f.write('start\tend\tsize\tsrc\tend_from\tsymbol\tdecomp_name\tdecomp_status\trtti_name\n')
             for r in rows:
                 d = r.get('decomp', {})
-                f.write('%x\t%x\t%d\t%s\t%s\t%s\t%s\t%s\n' % (
+                f.write('%x\t%x\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' % (
                     r['start'], r['end'], r['end'] - r['start'], r['src'], r['end_from'], '|'.join(r['names']),
-                    d.get('label', ''), d.get('status', '')))
+                    d.get('label', ''), d.get('status', ''), rtti.get(r['start'], '')))
         print('%-8s functions %6d  exact E %6d  S %6d  both %6d  E/S disagree %d  heuristic-only %d  secondary entries %d'
               '  .text covered %.2f%%' % (name, stats['functions'], stats['exact_E'], stats['exact_S'],
                                           stats['exact_both'], stats['E_S_end_disagree'], stats['only_heuristic'],
@@ -344,6 +418,8 @@ def main():
         if 'decomp' in stats:
             print('         decomp:', json.dumps({k: v for k, v in stats['decomp'].items()
                                                   if not k.endswith('examples')}))
+        if 'rtti_nerves' in stats:
+            print('         nerve states from RTTI:', json.dumps(stats['rtti_nerves']))
     with open(os.path.join(a.out, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=1)
 
