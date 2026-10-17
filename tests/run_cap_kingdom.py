@@ -18,7 +18,9 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUN = os.path.join(REPO, 'build', 'run')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+RUN = T.build('run')
 
 # (what, regular expression on the log). Nerve lines read "nerve: frame F keeper K: A -> B".
 CHECKPOINTS = [
@@ -55,7 +57,7 @@ def main():
             raise SystemExit('%s exists: the run must start from an empty save, choose another run name' % save)
         cmd = [sys.executable, os.path.join(REPO, 'scripts', 'run.py'), a.name, '--seconds', str(a.seconds),
                '--seq', os.path.join(REPO, 'tests', 'cap_kingdom.seq'), '--userdata', save,
-               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60']
+               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60', '--target', T.TARGET]
         if a.cache:
             cmd += ['--env', 'SMO_VK_CACHE=' + a.cache]
         if a.shots:
