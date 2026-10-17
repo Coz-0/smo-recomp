@@ -3,7 +3,8 @@
     python tests/check_all_shaders.py [--folders ShaderData,EffectData,SystemData,LayoutData] [--list]
 
 1. Takes every NVN shader stage out of the game's shader containers in build/romfs (agl .sharcb, g3d .bfsha, the effect
-   .ptcl, inside the SARC archives of the folders given) and out of main.elf / sdk.elf, and writes the distinct ones to
+   .ptcl, inside the SARC archives of the folders given; raw .bin shader files there, such as the primitive drawer's) and
+   out of main.elf / sdk.elf, and writes the distinct ones to
    build/shaders_all/*.mxs (derived from the game: under build/, ignored by git).
    A graphics stage is a code section (magic 0x12345678, program header at +0x30, instructions, constant data); its
    length comes from its own instructions (every program ends with a branch to itself). A compute stage has no header:
@@ -184,9 +185,14 @@ def main():
         base = os.path.join(ROM, folder)
         for root, _, files in os.walk(base):
             for n in sorted(files):
+                path = os.path.join(root, n)
+                if n.endswith('.bin'):                         # raw shader files (SystemData/primitive_drawer_nvn_shader.bin)
+                    d = open(path, 'rb').read()
+                    if struct.pack('<I', CTL) in d:
+                        take(os.path.relpath(path, ROM), d)
+                    continue
                 if not n.endswith('.szs'):
                     continue
-                path = os.path.join(root, n)
                 d = yaz0(open(path, 'rb').read())
                 if d[:4] != b'SARC':
                     continue
