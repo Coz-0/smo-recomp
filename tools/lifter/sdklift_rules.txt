@@ -5,6 +5,8 @@
 #                    time, which the static closure cannot follow); only game imports are installed as handlers
 #   ctors <regex>    SDK static constructors (.init_array) that directly call a function matching: lifted, and run (in
 #                    .init_array order) before the game starts, as the console's loader runs the SDK module's
+#   ctorsdata <regex> the same for SDK static constructors that set up a global (an address in .data / .bss they
+#                    compute) which a function matching also uses
 #   datafuncs <regex> every code pointer stored inside sdk DATA objects whose symbol matches (method tables, function
 #                    pointer data) is a root
 #   root <name>      an extra root
@@ -26,6 +28,9 @@ datafuncs ^_ZN2nn5audio
 datafuncs ^_ZTVN2nn2sf4impl6detail.*5audio
 # the in-process renderer manager is a static object built by an SDK static constructor
 ctors ^_ZNK?2nn5audio
+# the globals of the renderer objects (7.3.2: a mutex and the pool of system events each AudioRendererImpl takes one
+# from) are set up by a static constructor that calls only nn::os functions
+ctorsdata AudioRendererManagerImpl17AudioRendererImpl
 
 # The renderer manager over IPC: on the console the audio system module runs the same AudioRendererManagerImpl the sdk
 # contains; the host answers with the in-process (DFC) manager instead of opening an IPC session.
