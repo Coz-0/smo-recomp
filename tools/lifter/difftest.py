@@ -10,7 +10,7 @@ state: once by Unicorn, once by the C code recomp.py generates. Final registers,
     python tools/lifter/difftest.py check    run difftest.exe and Unicorn, compare; exit code 1 on any failure
     python tools/lifter/difftest.py show <i> registers that differ for one test
     python tools/lifter/difftest.py all      sample + gen + build + check
-Working files live in build/difftest/.
+Working files live in build/difftest/ (build/<version>/difftest/ for an update target: SMO_TARGET, tools/target.py).
 
 Test kinds (column `kind`):
   straight  data processing, loads/stores, FP/SIMD: registers + NZCV + a memory window must match (ssbu-recomp's test)
@@ -36,7 +36,8 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recomp
 
-WORK = os.path.join(recomp._REPO, 'build', 'difftest')
+T = recomp._T                    # SMO_TARGET (tools/target.py): which package's modules, which build/
+WORK = T.build('difftest')
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(recomp._REPO, 'runtime')
 LLVM = os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0')
@@ -161,10 +162,10 @@ def module_words(spec):
     module, _, only = spec.partition(':')
     keep = None
     if only == 'lifted':
-        gen = os.path.join(recomp._REPO, 'build', 'gen', 'sdklift_gen.c')
+        gen = T.build('gen', 'sdklift_gen.c')
         keep = set(int(m, 16) - 0x7500000000 for m in re.findall(r'^\s+\{0x([0-9a-f]+)ULL, f_', open(gen).read(), re.M)) if os.path.exists(gen) else set()
-    elf = open(os.path.join(recomp._REPO, 'build', 'dump', 'base', 'elf', '%s.elf' % module), 'rb').read()
-    with open(os.path.join(recomp._REPO, 'build', 'functions', '%s_functions.tsv' % module), encoding='utf-8') as f:
+    elf = open(T.elf(module), 'rb').read()
+    with open(T.build('functions', '%s_functions.tsv' % module), encoding='utf-8') as f:
         next(f)
         for line in f:
             t = line.split('\t')

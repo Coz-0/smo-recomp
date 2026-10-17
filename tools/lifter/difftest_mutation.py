@@ -18,7 +18,7 @@ sys.path.insert(0, HERE)
 import recomp
 import difftest
 
-WORK = os.path.join(recomp._REPO, 'build', 'difftest')
+WORK = difftest.WORK
 MUT = os.path.join(WORK, 'mutant')
 
 
