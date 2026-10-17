@@ -235,6 +235,7 @@ static void is_read_float(Ctx *c) {                                   /* operato
 #define SBUF "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE"
 #define OSTR "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE"
 #define ISTR "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE"
+#define IOSTR "_ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEE"
 static const ImportDef iostream_imports[] = {
     {SBUF "C2Ev", sb_ctor}, {SBUF "D2Ev", sb_dtor}, {SBUF "4syncEv", sb_sync}, {SBUF "5imbueERKNS_6localeE", sb_imbue},
     {SBUF "6setbufEPcl", sb_setbuf}, {SBUF "9showmanycEv", sb_showmanyc}, {SBUF "6xsgetnEPcl", sb_xsgetn}, {SBUF "9underflowEv", sb_eof},
@@ -244,6 +245,11 @@ static const ImportDef iostream_imports[] = {
     {OSTR "6sentryC1ERS3_", os_sentry_ctor}, {OSTR "6sentryD1Ev", nothing}, {OSTR "lsEi", os_put_int}, {OSTR "lsEm", os_put_ulong},
     {OSTR "D0Ev", ret_this}, {OSTR "D1Ev", ret_this}, {OSTR "D2Ev", ret_this},
     {ISTR "3getEv", is_get}, {ISTR "rsERf", is_read_float}, {ISTR "D1Ev", ret_this},
+    /* SMO port: basic_iostream's destructors and their thunks (std::stringstream's base: SessionMusicianNpc::init). Like
+     * the ostream ones above they have nothing to release here (classic locale only, no buffers of their own). */
+    {IOSTR "D0Ev", ret_this}, {IOSTR "D1Ev", ret_this}, {IOSTR "D2Ev", ret_this},
+    {"_ZThn16_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED0Ev", ret_this}, {"_ZThn16_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED1Ev", ret_this},
+    {"_ZTv0_n24_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED0Ev", ret_this}, {"_ZTv0_n24_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED1Ev", ret_this},
 };
 
 void register_iostream_imports(void) {

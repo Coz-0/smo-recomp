@@ -320,6 +320,7 @@ int main(int argc, char **argv) {
     register_unwind_imports();               /* installs the unwinder the C++ runtime calls on a throw */
     register_sdk2_imports();                 /* SDK families (lifted sdk.elf code + offline service answers): fills only; after the C runtime because its self-test needs every handler */
     { void register_smo_imports(void); register_smo_imports(); }   /* smo_nn.c: SDK functions SMO imports that ssbu-recomp never handled */
+    if (getenv("SMO_IMPORT_SELFTEST")) { int smo_import_selftest(void); return smo_import_selftest() != 0; }   /* smo_selftest.c */
     { void audit_startup(void); audit_startup(); }   /* hostrt.c: fake audit / SMO_STRICT (plan\FAKE_AUDIT.md) */
     display_init();
     int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */

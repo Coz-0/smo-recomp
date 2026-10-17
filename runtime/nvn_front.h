@@ -112,6 +112,7 @@ typedef struct RBackend {
     void (*reset_status)(void *);           /* int * */
     void (*sample_grid)(void *);            /* int[2] */
     void (*idle)(void);                     /* before every job (GL: deferred deletion); may be NULL */
+    void (*menu)(void *);                   /* UiMenuJob (smo_ui.h): the amiibo menu's pictures; NULL = no menu with this back end */
 } RBackend;
 extern const RBackend rb_gl, rb_vk;
 extern const RBackend *g_rb;
@@ -132,6 +133,7 @@ int nvn_front_tex_levels(const Tex *t);                                     /* l
 /* 1 when the guest memory of the texture must be read (again): first use, or written since the last look. `commit` = the
  * caller uploads now (the texture's hash and stamps are then updated). */
 int nvn_front_tex_changed(Tex *t);
+void nvn_front_tex_rehash(Tex *t);                                          /* the back end wrote the texture's pool memory itself */
 /* Calls put() once per (level, layer) with tightly packed texels de-swizzled from the texture's memory; decode != 0 turns
  * every level into RGBA8 with tex_decode_rgba8 (rgba8 = 1 in the call). Returns 0 when the memory is not readable. */
 typedef void nvn_front_put_fn(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t row_stride);

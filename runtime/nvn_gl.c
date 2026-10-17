@@ -48,6 +48,7 @@
 #include "gfx_options.h"
 #include "nvn_front.h"
 #include "tex_decode.h"
+#include "smo_ui.h"
 #include "nvn_sdk.h"
 #include "nvn_c4.h"
 
@@ -4783,7 +4784,17 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
         g_present_out = 1;
     }
     display_pace();
+    {   /* SMO port: the amiibo menu (smo_amiibo.c), asked for by its key or button combination: the game waits here, after this
+         * frame, until the menu is closed */
+        int amiibo_menu_wanted(void); void amiibo_menu_run(void *present_job);
+        if (amiibo_menu_wanted()) {
+            if (!g_present_sync && g_present_out) { WaitForSingleObject(g_present_ev, INFINITE); g_present_out = 0; }   /* this frame shown first */
+            amiibo_menu_run(&j);
+        }
+    }
 }
+/* smo_amiibo.c: a request to the render back end (UiMenuJob, smo_ui.h), run on the render thread; 0 = the back end has no menu */
+int nvn_menu_job(UiMenuJob *m) { if (!g_rb->menu) return 0; gl_run(g_rb->menu, m); return m->ok; }
 
 
 /* ================================================================ the rest of the NVN API (plan\phases\G1_nvn_audit.md)
@@ -5342,8 +5353,8 @@ static void dev_finalize_command_handle(Ctx *c) {       /* (device, handle): the
 }
 /* ================================================================ V1 step S0: the render thread's jobs in Vulkan mode
  * (plan\phases\V1_vulkan.md, section 1). Every job the entry points above hand to the render thread arrives here when
- * SMO_RENDERER=vk. A job nvn_vk.c implements is done there; one it does not implement yet stops the game with the name
- * of the NVN operation (nvn_vk_missing; SMO_VK_MISSING=warn: reported once, counted, skipped). A job that is not one
+ * SMO_RENDERER=vk. A job nvn_vk.c implements is done there; one it does not implement is reported once with the name
+ * of the NVN operation, counted and skipped (nvn_vk_missing; SMO_VK_MISSING=exit: the game stops there). A job that is not one
  * of this file's (nvn_vk.c's own, through nvn_render_run) runs as it is. Step S2 replaces this table by the RBackend
  * interface. */
 void nvn_render_run(void (*fn)(void *), void *arg) { gl_run(fn, arg); }
@@ -5385,6 +5396,9 @@ int nvn_front_tex_levels(const Tex *t) {
     return b->samples > 1 ? 1 : levels > maxl ? maxl : levels;
 }
 /* The decision of tex_sync without its OpenGL calls (the same rule, the same fields of Tex). */
+/* SMO port: the back end wrote the texture's own texels into its pool memory (nvnTextureInvalidateTexels in nvn_vk_draw.c):
+ * the hash is taken again so that this is not seen as a change by the game, exactly as job_read_texels does for OpenGL. */
+void nvn_front_tex_rehash(Tex *t) { if (t && t->mem) t->hash = mem_hash(t->mem, t->data_size, t->ww_hashed || (t->b.flags & 0x10) != 0); }
 int nvn_front_tex_changed(Tex *t) {
     Fmt f;
     if (t->checked == g_serial) return 0;

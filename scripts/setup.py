@@ -15,6 +15,7 @@ by git). Steps run in this order and are resumable: a step whose output exists i
     deps       check Python packages, clang, the Vulkan SDK and SDL3
     extract    dump -> ExeFS, main.elf / sdk.elf, NACP, version.json        (tools/extract/extract.py)
     romfs      the game's RomFS -> build/romfs                              (tools/extract/romfs.py)
+    manual     the offline HTML document (the game's Help) -> build/manual  (tools/extract/romfs.py --manual)
     fonts      the system's shared fonts from your firmware                 (tools/extract/fw_fonts.py)
     functions  every function of main, with exact boundaries                (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main          (tools/lifter/recomp.py)
@@ -96,6 +97,8 @@ STEPS = [
      lambda a: [[PY, tool('extract', 'extract.py')] + need_dump(a) + keys(a) + decomp(a)]),
     ('romfs', 'build/romfs', lambda: nonempty('romfs'),
      lambda a: [[PY, tool('extract', 'romfs.py')] + need_dump(a) + keys(a)]),
+    ('manual', 'build/manual', lambda: nonempty('manual'),
+     lambda a: [[PY, tool('extract', 'romfs.py'), '--manual'] + need_dump(a) + keys(a)]),
     ('fonts', 'build/sysdata/fonts', lambda: nonempty('sysdata', 'fonts'),
      lambda a: [[PY, tool('extract', 'fw_fonts.py')] + (['--fw', a.fw] if a.fw else []) + keys(a)]),
     ('functions', 'build/functions', lambda: exists('functions', 'main_functions.tsv'),

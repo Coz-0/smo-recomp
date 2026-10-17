@@ -17,6 +17,8 @@ typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
     int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
+    int gprim;                                     /* SMO, a geometry stage: the primitive class of the draws it serves (MxIn.gs_in_prim; part of hb) */
+    uint32_t images_w; uint16_t img_fmt[8]; uint8_t img_type[8];      /* SMO, a compute stage's images (MxOut): written ones, declared format and type */
     uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly, temp;      /* fragonly (session 9): handed over by a program without a vertex stage */
     VkPipeline cp; VkPipelineLayout cl; VkDescriptorSetLayout cdl[2];      /* compute stage: its pipeline */
     uint32_t local[3];
@@ -28,7 +30,7 @@ typedef struct VStage {
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
-typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; } SSrc;
+typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* SMO: geometry stage, as VStage */ } SSrc;
 static CRITICAL_SECTION g_sh_lock;
 static CONDITION_VARIABLE g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
 /* ---- Session 12: the freeze watchdog's wait registry (nvn_vk_wd.c writes the report). Every wait of ours that has no
@@ -115,6 +117,7 @@ static uint64_t ssrc_hb(const SSrc *o) {
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)o->stage, o->code, (size_t)o->code_len);
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
+    if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* SMO: a geometry stage is translated for the draw's primitive class */
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
     return fnv(h, &ver, 4);
 }
@@ -206,6 +209,7 @@ static VStage *vstage_new(uint64_t hb, int s, int code_len, const uint32_t *key,
 /* Any thread, no lock: fills v (in the table, state 1) from its record on disk, else with the translator and glslang. */
 static void vstage_build(VStage *v, const SSrc *src) {
     int s = v->stage, done = 0;
+    v->gprim = src->gprim;
     char path[128];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
@@ -215,7 +219,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
             VkShaderModule mod;
             if (e.magic != STAGEREC_MAGIC || e.fo != v->fo || !key_fits(s, v->key, e.key, e.dep, e.tex)) continue;
-            if (stage_rec_read(s, e.vh, &r) && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; InterlockedIncrement64(&R.modules); done = 1; }
+            if (stage_rec_read(s, e.vh, &r) && !r.images && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; InterlockedIncrement64(&R.modules); done = 1; }      /* SMO: not a stage with images (their formats and types are not in the record) */
         }
         fclose(fp);
     }
@@ -225,13 +229,13 @@ static void vstage_build(VStage *v, const SSrc *src) {
         char what[64];
         memset(&in, 0, sizeof in); memset(&out, 0, sizeof out);
         in.stage = s; in.code = src->code; in.code_len = src->code_len; in.cdata = src->cdata; in.cdata_size = src->cdata ? src->cdata_size : 0;
-        in.int_attrs = v->key[0]; in.sint_attrs = v->key[1]; in.int_tex = v->key[2]; in.sint_tex = v->key[3]; in.force_out = v->fo;
+        in.int_attrs = v->key[0]; in.sint_attrs = v->key[1]; in.int_tex = v->key[2]; in.sint_tex = v->key[3]; in.force_out = v->fo; in.gs_in_prim = src->gprim;
         in.target = 1; in.binding_base = 40u * (unsigned)s; in.ssbo_base = 40u * (unsigned)s + 20; in.tex_base = 40u * (unsigned)s; in.image_base = 40u * (unsigned)s + 32; in.wmask_binding = 40u * (unsigned)s + 38;
         if (s == 5) {                              /* compute has a layout of its own (design, section 4): the bindings of stage 0 */
             in.binding_base = 0; in.ssbo_base = 20; in.tex_base = 0; in.image_base = 32; in.wmask_binding = 38; in.track_writes = 1;
             memcpy(in.local_size, src->local, sizeof in.local_size); in.smem_bytes = src->smem; in.lmem_bytes = src->lmem;
         }
-        snprintf(what, sizeof what, "program #%d %s stage", src->serial, s == 5 ? "compute" : s ? "fragment" : "vertex");
+        snprintf(what, sizeof what, "program #%d %s stage", src->serial, s == 5 ? "compute" : s == 2 ? "geometry" : s ? "fragment" : "vertex");
         if (s == 1 && RS_ON) in.screen_scale = 1;
         {   /* SMO debug aid: SMO_VK_DUMP_SERIAL=<n> writes the machine code of program n's stages (vk_prog_<n>_<stage>.bin in SMO_SHADERDUMP or the run folder) */
             static int want = -2; if (want == -2) want = getenv("SMO_VK_DUMP_SERIAL") ? atoi(getenv("SMO_VK_DUMP_SERIAL")) : -1;
@@ -250,6 +254,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
+            v->images_w = out.images_written; memcpy(v->img_fmt, out.image_gl_format, sizeof v->img_fmt); memcpy(v->img_type, out.image_type, sizeof v->img_type);
             v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
             for (int i = 0; i < out.nsmp && i < 64; i++) {
                 const char *ty = out.smp[i].type;
@@ -263,6 +268,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 VarRec e;
                 v->key[0] &= v->dep; v->key[1] &= v->dep; v->key[2] &= v->tex_units; v->key[3] &= v->tex_units;
                 v->h = fnv(fnv(v->hb, v->key, 16), &v->fo, 4);
+                if (v->images) goto no_record;     /* SMO: a stage with images has no record (its images' formats and types are not in it; see above) */
                 memset(&r, 0, sizeof r);
                 r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
                 r.cbufs = v->cbufs; r.ssbos = v->ssbos; r.ssbo_w = v->ssbo_w; r.images = v->images; r.dep = v->dep; r.tex_units = v->tex_units; r.in_attr = v->in_attr; r.out_attr = v->out_attr;
@@ -273,6 +279,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 e.magic = STAGEREC_MAGIC; memcpy(e.key, v->key, 16); e.fo = v->fo; e.dep = v->dep; e.tex = v->tex_units; e.vh = v->h;
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
                 if ((fp = fopen(path, "ab")) != NULL) { fwrite(&e, 1, sizeof e, fp); fclose(fp); }
+            no_record:;
             }
         }
     }
@@ -319,14 +326,15 @@ static void skip_note(int what, uint64_t vh, uint64_t fh) {
     g_skip_n++; g_skip_fr_n++; if (what) g_skip_pipe++; else g_skip_stage++;
     { static int nl; if (nl++ < 600) printf("nvn_vk_skip: frame %lld: a draw left out, its %s was not ready: vertex code %016llx, fragment code %016llx\n", (long long)nvn_front_frame_next(), what ? "pipeline (stage library or link)" : "stage", (unsigned long long)vh, (unsigned long long)fh); }
 }
-static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
+static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int gprim) {      /* gprim: a geometry stage's primitive class (0 for the others) */
     Stage *st = &p->st[s];
     VStage *v = st->vk;
     SSrc src;
     int how;
     if (!st->code) return NULL;
-    if (v && v->state == 2 && v->fo == fo && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
+    if (v && v->state == 2 && v->fo == fo && v->gprim == gprim && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
     if (!ssrc_of(&src, p, s)) return NULL;
+    src.gprim = gprim;
     if (s != 5 && skip_active()) {                 /* shader_wait = skip: only what is ready */
         VStage *busy = NULL;
         uint64_t hb = ssrc_hb(&src);
@@ -341,7 +349,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
     if (how) { LONG64 dt = tk() - t0; hold_note(how == 1 ? H_STAGE_DRAW : H_STAGE_WAIT, dt); g_tm[6] += dt;
         if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
             printf("nvn_vk_hold: frame %lld (%s): %s STAGE %s, %.2f ms: program #%d, code %016llx, key asked %x %x %x %x (kept %x %x %x %x), forced outputs %x; %s\n", (long long)nvn_front_frame_next(), g_in_fight ? "fight" : "no fight",
-                   s == 5 ? "compute" : s ? "fragment" : "vertex", how == 1 ? "made at the draw" : "waited for (a worker was making it)", (double)dt * 1000.0 / (double)fq.QuadPart, p->serial, (unsigned long long)v->hb,
+                   s == 5 ? "compute" : s == 2 ? "geometry" : s ? "fragment" : "vertex", how == 1 ? "made at the draw" : "waited for (a worker was making it)", (double)dt * 1000.0 / (double)fq.QuadPart, p->serial, (unsigned long long)v->hb,
                    key[0], key[1], key[2], key[3], v->key[0], v->key[1], v->key[2], v->key[3], fo, v->from_rec ? "from its record on disk" : "translated now (no record)");
             EnterCriticalSection(&g_sh_lock);
             printf("nvn_vk_hold:     %s; jobs waiting now: %lld foreground, %lld background (container scan)\n", ho_text(v->hb), (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done));
@@ -352,8 +360,13 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
 
 /* ---------------------------------------------------------------- pipelines */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; } PKey;
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* SMO: see gs_pipe_get */; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
+static VkShaderModule g_gs_dbg_fs;                 /* SMO_VK_GS_DEBUG=3 (gs_pipe_get): the fragment stage of draws with a geometry stage */
+/* SMO debug aid SMO_VK_GS_DEBUG=<mode> for the draws with a geometry stage (the lightning): 1 measures them (nvn_vk_draw.c
+ * gsq_begin, gs_dbg_read: "nvn_vk_gs:" lines), 2 leaves them out (to compare pictures), 3 draws them in bright magenta (HDR
+ * 200) without the depth test, and measures them as 1 does. */
+static int gs_dbg_mode(void) { static int m = -1; if (m < 0) m = getenv("SMO_VK_GS_DEBUG") ? atoi(getenv("SMO_VK_GS_DEBUG")) : 0; return m; }
 static void pkey_targets(PKey *k);
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth);
 static VkBlendFactor blend_factor(unsigned f) {
@@ -367,7 +380,7 @@ static VkBlendFactor blend_factor(unsigned f) {
 }
 static VkBlendOp blend_op(unsigned e) { static const uint8_t m[6] = {VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX}; return (VkBlendOp)m[e < 6 ? e : 1]; }
 static void layout_bindings(VStage *v, int s, VkDescriptorSetLayoutBinding *b0, int *n0, VkDescriptorSetLayoutBinding *b1, int *n1) {
-    VkFlags sf = s ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+    VkFlags sf = s == 2 ? VK_SHADER_STAGE_GEOMETRY_BIT : s ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     for (unsigned n = 1; n < 18; n++) if (v->cbufs >> n & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + n, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
     for (unsigned k = 0; k < 16; k++) if (v->ssbos >> k & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + 20 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
     for (int i = 0; i < v->nsmp; i++) { VkDescriptorSetLayoutBinding b = {v->smp[i].binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, sf, NULL}; b1[(*n1)++] = b; }
@@ -681,7 +694,7 @@ static double pipe_build(Pipe *p) {
     const PKey *k = &p->k;
     VStage *vs = p->vs, *fs = p->fs;
     LONG64 t0 = tk();
-    if (D.has_gpl && gpl_sep() && !k->sshade && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) {      /* session 9, SMO_VK_GPL=2: linked from one library per stage */
+    if (D.has_gpl && !p->gs && gpl_sep() && !k->sshade && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) {      /* session 9, SMO_VK_GPL=2: linked from one library per stage */
         int how, how2 = 0, n = 0;
         VkPipeline libs[4];
         libs[n++] = gpl_vilib(k->topo_class < 3 ? k->topo_class : 2);
@@ -708,7 +721,7 @@ static double pipe_build(Pipe *p) {
         LeaveCriticalSection(&g_sh_lock);
         { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
     }
-    if (D.has_gpl) {                               /* session 9: linked from libraries */
+    if (D.has_gpl && !p->gs) {                     /* session 9: linked from libraries */
         int how;
         PairLib *l = pairlib_ensure(vs, fs, k->samples, k->sshade, &how);
         VkPipeline libs[3];
@@ -731,9 +744,10 @@ static double pipe_build(Pipe *p) {
         LeaveCriticalSection(&g_sh_lock);
         { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
     }
-    VkDescriptorSetLayoutBinding b0[80], b1[140];
+    VkDescriptorSetLayoutBinding b0[120], b1[200];
     layout_bindings(vs, 0, b0, &p->nb[0], b1, &p->nb[1]);
     if (fs) layout_bindings(fs, 1, b0, &p->nb[0], b1, &p->nb[1]);
+    if (p->gs) layout_bindings(p->gs, 2, b0, &p->nb[0], b1, &p->nb[1]);
     for (int i = 0; i < 2; i++) {
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = (uint32_t)p->nb[i]; li.pBindings = i ? b1 : b0;
@@ -745,11 +759,13 @@ static double pipe_build(Pipe *p) {
     pl.setLayoutCount = 2; pl.pSetLayouts = p->dl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
     VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &p->layout));
 
-    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineShaderStageCreateInfo st[3];
+    uint32_t nst = 0;
     memset(st, 0, sizeof st);
-    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs->mod; st[0].pName = "main";
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? fs->mod : NULL; st[1].pName = "main";
+    st[0].sType = st[1].sType = st[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[nst].stage = VK_SHADER_STAGE_VERTEX_BIT; st[nst].module = vs->mod; st[nst++].pName = "main";
+    if (p->gs) { st[nst].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[nst].module = p->gs->mod; st[nst++].pName = "main"; }
+    if (fs) { st[nst].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[nst].module = p->gs && g_gs_dbg_fs ? g_gs_dbg_fs : fs->mod; st[nst++].pName = "main"; }
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -795,10 +811,10 @@ static double pipe_build(Pipe *p) {
     if (fmt_aspect((VkFormat)k->dfmt) & VK_IMAGE_ASPECT_DEPTH_BIT) ri.depthAttachmentFormat = (VkFormat)k->dfmt;
     if (k->dfmt && (fmt_aspect((VkFormat)k->dfmt) & VK_IMAGE_ASPECT_STENCIL_BIT)) ri.stencilAttachmentFormat = (VkFormat)k->dfmt;
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gi.pNext = &ri; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
+    gi.pNext = &ri; gi.stageCount = nst; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
-    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
+    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, geometry stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, p->gs ? p->gs->id : 0, k->ncolor, k->dfmt, vk_result_name(r));
     InterlockedIncrement64(&R.pipelines);
     EnterCriticalSection(&g_sh_lock);
     p->state = 2;
@@ -990,6 +1006,33 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
         if (p->predicted && !mine) g_pred_used++;
         if (!p->recorded) { piperec_append(k, vs, fs, 0); p->recorded = 1; }
     }
+    return p;
+}
+/* SMO: a pipeline with a geometry stage (only the lightning effects of the game have one: three geometry stages in all). Render
+ * thread: made at its first draw, whole (no libraries), and kept in a list of its own: not in pipes.bin, not predicted, as the
+ * workers are never handed a program with a geometry stage (nvn_vk_program_set). The key is the draw's plus the geometry
+ * variant, which holds the draw's primitive class. */
+typedef struct GsPipe { PKey k; uint32_t gs; Pipe *p; struct GsPipe *next; } GsPipe;
+static GsPipe *g_gspipes;
+static LONG64 g_gs_draws, g_gs_pipes;
+static Pipe *gs_pipe_get(const PKey *k, VStage *vs, VStage *gs, VStage *fs) {
+    static int dbg = -1;                           /* SMO_VK_GS_DEBUG=3: these draws in magenta, without the depth test (draw_prepare) */
+    if (dbg < 0 && (dbg = gs_dbg_mode() == 3) != 0) {
+        uint64_t h;
+        g_gs_dbg_fs = module_from_glsl(1, "#version 460\nlayout(location = 0) out vec4 o0;\nvoid main() { o0 = vec4(200.0, 0.0, 200.0, 1.0); }\n", "geometry stage debug", &h);
+    }
+    for (GsPipe *q = g_gspipes; q; q = q->next) if (q->gs == gs->id && !memcmp(&q->k, k, sizeof *k)) return q->p;
+    GsPipe *q = calloc(1, sizeof *q);
+    Pipe *p = calloc(1, sizeof *p);
+    q->k = *k; q->gs = gs->id; q->p = p;
+    p->k = *k; p->vs = vs; p->fs = fs; p->gs = gs; p->state = 1; p->used = 1;
+    LONG64 t0 = tk();
+    g_render_tid = GetCurrentThreadId();
+    double ms = pipe_build(p);
+    hold_note(H_PIPE_DRAW, tk() - t0); g_pipe_miss++; g_gs_pipes++;
+    printf("nvn_vk: pipeline with a geometry stage made at a draw: stages %u/%u/%u (geometry code %016llx, %d bytes, primitive class %d), %d colour (format %d), depth %d, samples %d: %.1f ms\n",
+           k->vs, gs->id, k->fs, (unsigned long long)gs->hb, gs->code_len, gs->gprim, k->ncolor, k->cfmt[0], k->dfmt, k->samples, ms);
+    q->next = g_gspipes; g_gspipes = q;
     return p;
 }
 /* Any thread: the compute pipeline of a stage. Returns 1 when this call made it, 2 when it waited for another thread, 0 when it was there. */
@@ -1494,6 +1537,7 @@ static void stage_copy(Stage *st, int s) {
 void nvn_vk_program_set(void *prog) {
     Prog *p = prog;
     SSrc s[3];
+    if (p->st[2].state) { static int nl; if (nl++ < 20) printf("nvn_vk: program #%d has a geometry stage (%d bytes): its stages and pipelines are made at its first draw\n", p->serial, p->st[2].code_len); }
     if (!g_m4_on || p->st[2].state || p->st[3].state || p->st[4].state) return;
     {   static int on = -1;
         if (on < 0) on = getenv("SMO_VK_STAGECOPY") && atoi(getenv("SMO_VK_STAGECOPY"));
@@ -1612,7 +1656,7 @@ static void prewarm_start(void) {
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a fight) is spread over all cores instead of done one by one at the draws.
  * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+typedef struct { Prog *prog[2], *gprog /* SMO: a geometry stage is bound (its draws are not followed: gs_pipe_get) */; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);
@@ -1620,14 +1664,14 @@ static void scan_sig(Scan *s) {
     s->sig_tag = (uint32_t)fnv(0xcbf29ce484222325ULL, &s->sig, sizeof s->sig);
 }
 static void scan_begin(Scan *s) {
-    s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
+    s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->gprog = R.prog[2]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
     scan_sig(s);
 }
 static void scan_draw(Scan *s, unsigned prim) {
     static const uint8_t tclass[7] = {0, 1, 1, 1, 2, 2, 2};
     Prog *p0 = s->prog[0], *p1 = s->prog[1];
-    if (!p0 || prim > 6 || !s->sig_ok || !p0->st[0].code || (p1 && !p1->st[1].code) || p0->dead || (p1 && p1->dead)) return;
+    if (!p0 || prim > 6 || !s->sig_ok || !p0->st[0].code || (p1 && !p1->st[1].code) || p0->dead || (p1 && p1->dead) || s->gprog) return;
     if (s->attr_new) {                             /* which attributes are integers (as draw_prepare) */
         s->ints = s->sints = 0; s->attr_new = 0;
         for (int i = 0; i < 16 && i < s->nattr; i++) {
@@ -1686,7 +1730,9 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         const uint64_t *a = m->a;
         if (m->size < sizeof(Cmd)) break;
         switch (m->op) {
-        case OP_PROGRAM: for (int st = 0; st < 2; st++) if (a[1] & (1u << st)) { Prog *p = P(a[0]); s->prog[st] = p && !p->dead && p->st[st].state ? p : NULL; } break;
+        case OP_PROGRAM: for (int st = 0; st < 2; st++) if (a[1] & (1u << st)) { Prog *p = P(a[0]); s->prog[st] = p && !p->dead && p->st[st].state ? p : NULL; }
+            if (a[1] & 4u) { Prog *p = P(a[0]); s->gprog = p && !p->dead && p->st[2].state ? p : NULL; }
+            break;
         case OP_TARGETS: {
             const TargetRef *col = (const TargetRef *)BLOB(m), *dep = col + 8;
             int n = (int)a[0] < 8 ? (int)a[0] : 8;

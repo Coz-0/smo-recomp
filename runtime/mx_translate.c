@@ -133,6 +133,14 @@ static const char *ICMP(Mx *e, unsigned op, int sgn, const char *a, const char *
     if (sgn && op != 2 && op != 5) return S(e, "(int(%s) %s int(%s))", a, o[op], b);
     return S(e, "(%s %s %s)", a, o[op], b);
 }
+/* operand of a video instruction (suyu ExtractVideoOperandValue): width 0 or 1 = byte `sel` of the register, 2 = half-word
+ * `sel`, 3 = the whole word; zero- or sign-extended */
+static const char *VOP(Mx *e, const char *r, unsigned sel, unsigned width, int sgn) {
+    unsigned bits = width == 2 ? 16 : 8;
+    if (width == 3) return r;
+    if (sgn) return S(e, "uint(bitfieldExtract(int(%s), %u, %u))", r, sel * bits, bits);
+    return S(e, "bitfieldExtract(%s, %u, %u)", r, sel * bits, bits);
+}
 /* extended (.X) integer compare: uses the carry and zero flags of the previous (lower) compare, as suyu */
 static const char *ICMPX(Mx *e, unsigned op, int sgn, const char *a, const char *b) {
     e->uses_cc = 1;
@@ -190,9 +198,20 @@ static const char *fmz_mul(Mx *e, const char *a, const char *b, int fmz) {
 }
 
 /* ---------------------------------------------------------------- attributes */
-static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
+static const char *attr_in(Mx *e, unsigned a, const char *vtx) {      /* vtx: geometry stage, the input vertex (an expression) */
     unsigned c = (a >> 2) & 3, st = (unsigned)e->in->stage;
-    (void)vertex_reg_ok;
+    if (st == MX_GEOMETRY) {                                    /* SMO: the inputs of one vertex of the input primitive */
+        /* the code reads past the primitive's vertices when it has fewer than it handles (it then sets the index to 0x80000000):
+         * clamped to the last vertex, as an index out of range is undefined in GLSL */
+        static const unsigned nv[5] = {1, 2, 3, 4, 6};
+        vtx = S(e, "min(%s, %uu)", vtx, nv[(unsigned)e->in->gs_in_prim % 5] - 1);
+        if (a >= 0x80 && a < 0x280) { unsigned n = (a - 0x80) >> 4; e->in_attr |= 1u << n; e->in_comp[n] |= (uint8_t)(1u << c); return S(e, "U(in_attr%u[%s][%u])", n, vtx, c); }
+        if (a >= 0x70 && a < 0x80) return S(e, "U(gl_in[%s].gl_Position[%u])", vtx, c);
+        if (a == 0x6c) return S(e, "U(gl_in[%s].gl_PointSize)", vtx);
+        if (a == 0x60) return "uint(gl_PrimitiveIDIn)";
+        fail(e, "attribute read", "read of attribute 0x%x in a geometry stage", a);
+        return "0u";
+    }
     if (a >= 0x80 && a < 0x280) {
         unsigned n = (a - 0x80) >> 4;
         e->in_attr |= 1u << n;
@@ -223,9 +242,10 @@ static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
 }
 static void attr_out(Mx *e, unsigned a, const char *v) {
     unsigned c = (a >> 2) & 3;
-    if (e->in->stage != MX_VERTEX) { fail(e, "attribute store", "attribute store in stage %d", e->in->stage); return; }
+    if (e->in->stage != MX_VERTEX && e->in->stage != MX_GEOMETRY) { fail(e, "attribute store", "attribute store in stage %d", e->in->stage); return; }
     if (a >= 0x70 && a < 0x80) emit(e, " gl_Position[%u] = F(%s);", c, v);
     else if (a >= 0x80 && a < 0x280) { e->out_attr |= 1u << ((a - 0x80) >> 4); emit(e, " out_attr%u[%u] = F(%s);", (a - 0x80) >> 4, c, v); }
+    else if (a == 0x6c && e->in->stage == MX_GEOMETRY) emit(e, " gl_PointSize = F(%s);", v);      /* SMO: a geometry stage writes its own (no push constant) */
     else if (a == 0x6c) { e->uses_psize = 1; emit(e, e->in->target == 1 ? " mx_psize = F(%s);" : " gl_PointSize = F(%s);", v); }
     else if (a >= 0x2c0 && a < 0x2e0) { e->clip_out |= 1u << ((a - 0x2c0) >> 2); emit(e, " gl_ClipDistance[%u] = F(%s);", (a - 0x2c0) >> 2, v); }
     else if (a == 0x64) { e->uses_layer_out = 1; emit(e, " gl_Layer = int(%s);", v); }
@@ -731,7 +751,10 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
         case 0x1c: v = "0u"; break;                              /* affinity */
-        case 0x1d: v = "0x00ff0000u"; break;                     /* invocation info (suyu: patch vertices << 16 in tessellation; 0x00ff0000 otherwise) */
+        case 0x1d:                                               /* invocation info (suyu: patch vertices << 16 in tessellation; 0x00ff0000 otherwise) */
+            if (e->in->stage == MX_GEOMETRY) { static const unsigned nv[5] = {1, 2, 3, 4, 6}; v = S(e, "0x%08xu", nv[(unsigned)e->in->gs_in_prim % 5] << 16); }      /* SMO: the vertices of the input primitive */
+            else v = "0x00ff0000u";
+            break;
         case 0x1e: case 0x1f: v = "0x3f800000u"; break;          /* viewport w scale factors: 1.0 */
         case 0x20: v = "(MX_LID_X | (gl_LocalInvocationID.y << 16) | (gl_LocalInvocationID.z << 26))"; break;
         case 0x21: v = "MX_LID_X"; break;
@@ -761,6 +784,16 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         break;
     }
     case MXOP_NOP: case MXOP_DEPBAR: case MXOP_MEMBAR: case MXOP_VOTE_vtg: case MXOP_CCTL: case MXOP_CCTLL: case MXOP_SSY: case MXOP_PBK: case MXOP_PCNT:
+        break;
+    case MXOP_BAR:                                                /* SMO: compute, the work group barrier (three stages of the game, with shared memory) */
+        /* [doc] suyu barrier_operations.cpp: only BAR.SYNC with immediate inputs 0 and 0 (mode bits 0x9B00000000 = 0x8000000000,
+         * a immediate bit 43 with value bits 8-15, b immediate bit 44 with value bits 20-31; predicate bits 39-41, negation 42).
+         * GLSL barrier() also orders the shared memory accesses. A split work group (mx_split_x) would break it. */
+        if ((i & 0x0000009B00000000ull) != 0x0000008000000000ull || !MXB(i, 43, 1) || MXB(i, 8, 8) || !MXB(i, 44, 1) || MXB(i, 20, 12) || (MXB(i, 39, 3) != 7 && MXB(i, 42, 1))) {
+            fail(e, "BAR", "BAR form %016llx", (unsigned long long)i); break;
+        }
+        if (e->in->stage != MX_COMPUTE || mx_split_x(e->in->local_size, e->in->smem_bytes) != 1) { fail(e, "BAR", "BAR outside a compute stage or in a split work group"); break; }
+        emit(e, "barrier();");
         break;
 
     /* ---- float arithmetic */
@@ -997,6 +1030,29 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (PD(e, MXB(i, 0, 3))) emit(e, " %s = %s;", PD(e, MXB(i, 0, 3)), BOP(e, "!cmp", bp, MXB(i, 45, 2)));
         break;
     }
+    case MXOP_VMAD: case MXOP_VSETP: {
+        /* video instructions (suyu video_multiply_add.cpp, video_set_predicate.cpp): operand A from register 8, B from register
+         * 20 (bit 50) or a 16-bit immediate; each operand's selector (bits 36-37 / 28-29) and width (bits 37-38 / 29-30) share
+         * a bit. SMO: only the lightning geometry stages use them (the input vertex count of the invocation info register). */
+        int sa = (int)MXB(i, 48, 1), sbs = (int)MXB(i, 49, 1);
+        const char *va = VOP(e, A8, MXB(i, 36, 2), MXB(i, 37, 2), sa), *vb;
+        if (MXB(i, 50, 1)) vb = VOP(e, R20, MXB(i, 28, 2), MXB(i, 29, 2), sbs);
+        else if (op == MXOP_VSETP && MXB(i, 28, 2)) { fail(e, "VSETP immediate", "VSETP with an immediate whose bits 8-9 are set (suyu reads them as a selector)"); break; }
+        else vb = VOP(e, S(e, "0x%xu", MXB(i, 20, 16)), 0, 2, sbs);
+        if (op == MXOP_VMAD) {
+            if (MXB(i, 47, 1) || MXB(i, 51, 2) || MXB(i, 53, 3)) { fail(e, "VMAD.CC/SCALE/NEG/SAT", "VMAD with CC, a scale, a negation or SAT"); break; }
+            emit(e, "%s = %s * %s + %s;", DST, va, vb, R39);
+        } else {
+            /* compare 0 F, 1 LT, 2 EQ, 3 LE, 4 GT, 5 NE, 6 GE, 7 T from bits 43-44 and 47 (bits 45-46 are the boolean operation);
+             * signed when B is */
+            unsigned cop = MXB(i, 43, 2) | MXB(i, 47, 1) << 2;
+            const char *bp = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1));
+            emit(e, "bool cmp = %s;", ICMP(e, cop, sbs, va, vb));
+            if (PD(e, MXB(i, 3, 3))) emit(e, " %s = %s;", PD(e, MXB(i, 3, 3)), BOP(e, "cmp", bp, MXB(i, 45, 2)));
+            if (PD(e, MXB(i, 0, 3))) emit(e, " %s = %s;", PD(e, MXB(i, 0, 3)), BOP(e, "!cmp", bp, MXB(i, 45, 2)));
+        }
+        break;
+    }
     case MXOP_ICMP_reg: case MXOP_ICMP_rc: case MXOP_ICMP_cr: case MXOP_ICMP_imm: {
         const char *sa, *operand;
         switch (op) {
@@ -1114,10 +1170,13 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned a = MXB(i, 20, 10), n = MXB(i, 47, 2) + 1, rd = MXB(i, 0, 8);
         if (MXB(i, 8, 8) != 255) { fail(e, "ALD.indexed", "indexed attribute load"); break; }
         if (MXB(i, 31, 1)) { fail(e, "ALD.P", "patch attribute load"); break; }
-        if (e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL || e->in->stage == MX_TESS_EVAL) { fail(e, "ALD (vertex array)", "attribute load in stage %d", e->in->stage); break; }
+        if (e->in->stage == MX_TESS_CONTROL || e->in->stage == MX_TESS_EVAL) { fail(e, "ALD (vertex array)", "attribute load in stage %d", e->in->stage); break; }
+        if (e->in->stage == MX_GEOMETRY && MXB(i, 32, 1)) { fail(e, "ALD.O", "output read in a geometry stage"); break; }
+        /* SMO: in a geometry stage the input vertex is the register at bits 39-46 ([doc] yuzu load_store_attribute.cpp ALD) */
+        const char *vtx = e->in->stage == MX_GEOMETRY ? (MXB(i, 39, 8) == 255 ? "0u" : X(e, MXB(i, 39, 8))) : NULL;
         for (unsigned k = 0; k < n; k++) {
             unsigned ad = a + k * 4;
-            const char *v = MXB(i, 32, 1) && e->in->stage == MX_VERTEX && ad >= 0x80 && ad < 0x280 ? S(e, "U(out_attr%u[%u])", (ad - 0x80) >> 4, (ad >> 2) & 3) : attr_in(e, ad, 0);
+            const char *v = MXB(i, 32, 1) && e->in->stage == MX_VERTEX && ad >= 0x80 && ad < 0x280 ? S(e, "U(out_attr%u[%u])", (ad - 0x80) >> 4, (ad >> 2) & 3) : attr_in(e, ad, vtx);
             if (rd != 255) emit(e, " %s = %s;", D(e, rd + k), v);
         }
         break;
@@ -1146,6 +1205,36 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         emit(e, " if (!pv) j = ln; uint sv = subgroupShuffle(%s, j);", A8);
         if (MXB(i, 0, 8) != 255) emit(e, " %s = sv;", DST);
         if (pd != 7) emit(e, " %s = pv;", PD(e, pd));
+        break;
+    }
+    case MXOP_ISBERD: {                                            /* SMO: geometry stage, the attribute buffer entry of an input vertex */
+        /* [doc] yuzu internal_stage_buffer_entry_read.cpp: the value passes through (the input vertex number ALD then takes);
+         * skew bit 31, O bit 32, mode bits 33-34 and shift bits 47-48 are not supported, as there */
+        if (MXB(i, 31, 2) || MXB(i, 33, 2) || MXB(i, 47, 2)) { fail(e, "ISBERD", "ISBERD form %016llx", (unsigned long long)i); break; }
+        emit(e, "%s = %s;", DST, A8);
+        break;
+    }
+    case MXOP_OUT_reg: case MXOP_OUT_imm: case MXOP_OUT_cbuf: {    /* SMO: geometry stage, emit the vertex and / or end the primitive */
+        /* [doc] yuzu output_geometry.cpp: emit bit 39, cut bit 40, stream in Rb / the immediate / the constant (only stream 0
+         * here: a stream other than 0 needs a stream-out the renderer does not have); Rd gets 0 */
+        if (e->in->stage != MX_GEOMETRY) { fail(e, "OUT", "OUT outside a geometry stage"); break; }
+        if (op == MXOP_OUT_imm && MXB(i, 20, 19)) { fail(e, "OUT stream", "OUT to stream %u", MXB(i, 20, 19)); break; }
+        if (MXB(i, 39, 1)) emit(e, " MX_GS_FILL EmitVertex();");
+        if (MXB(i, 40, 1)) emit(e, " EndPrimitive();");
+        if (MXB(i, 0, 8) != 255) emit(e, " %s = 0u;", DST);
+        break;
+    }
+    case MXOP_FSWZADD: {                                           /* SMO: swizzled add, one of four forms per lane of the 2x2 quad */
+        /* [doc] yuzu floating_point_swizzled_add.cpp / its GLSL backend: d = a * A[k] + b * B[k], k = (swizzle >> (2 * quad lane)) & 3,
+         * A = {1, -1, 1, 0}, B = {1, 1, -1, 1} (a + b, b - a, a - b, b); swizzle bits 28-35, NDV bit 38 (not handled, as yuzu),
+         * CC bit 47; the quad lane is gl_SubgroupInvocationID & 3 (Vulkan's quad of a fragment shader). Found offline in one of
+         * SMO's fragment stages (tests/check_all_shaders.py). */
+        if (e->in->target != 1) { fail(e, "FSWZADD", "quad swizzle in the OpenGL text"); break; }
+        if (MXB(i, 38, 1)) { fail(e, "FSWZADD", "FSWZADD.NDV"); break; }
+        unsigned sw = MXB(i, 28, 8);
+        e->uses_shfl = 1;                                          /* gl_SubgroupInvocationID */
+        fres(e, i, S(e, "F(%s) * float[4](1.0, -1.0, 1.0, 0.0)[(%uu >> ((gl_SubgroupInvocationID & 3u) << 1)) & 3u] + F(%s) * float[4](1.0, 1.0, -1.0, 1.0)[(%uu >> ((gl_SubgroupInvocationID & 3u) << 1)) & 3u]",
+                         A8, sw, R20, sw), 0, MXB(i, 47, 1));
         break;
     }
     case MXOP_AL2P: {                                              /* SMO: attribute address = Ra + signed 11-bit offset ([doc] yuzu attribute_logical_to_physical: an add) */
@@ -1272,6 +1361,26 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
             if (cls == 0) emit(e, "imageStore(mx_img%u, %s, vec4(F(%s), F(%s), F(%s), F(%s)));", k, coords, v[0], v[1], v[2], v[3]);
             else emit(e, "imageStore(mx_img%u, %s, %svec4(%s, %s, %s, %s));", k, coords, cls == 1 ? "u" : "i", v[0], v[1], v[2], v[3]);
         }
+        break;
+    }
+    case MXOP_SUATOM: {                                     /* SMO: image atomic (two compute stages: an add on a 1D integer image) */
+        /* [doc] suyu surface_atomic_operations.cpp: bindless bit 54, operation bits 29..32 (0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and,
+         * 6 or, 7 xor, 8 exchange), type bits 33..35 (as SULD), size bits 51..53 (0 U32, 1 S32, 6 SD32 only: a 32-bit integer
+         * image), clamp bits 49..50 (0 only), destination 0..7 (the old value), coordinates from register 8..15, operand register
+         * 20..27, handle offset bits 36..48. Increment and decrement (wrapping) and the array types are not supported, as there. */
+        static const char *const fn[9] = {"imageAtomicAdd", "imageAtomicMin", "imageAtomicMax", NULL, NULL, "imageAtomicAnd", "imageAtomicOr", "imageAtomicXor", "imageAtomicExchange"};
+        unsigned aop = MXB(i, 29, 4), ty = MXB(i, 33, 3), sz = MXB(i, 51, 3), off = MXB(i, 36, 13), r = MXB(i, 0, 8), cr = MXB(i, 8, 8);
+        if (MXB(i, 54, 1)) { fail(e, "SUATOM (bindless)", "SUATOM with an image handle in a register"); break; }
+        if (MXB(i, 49, 2) || aop > 8 || !fn[aop] || (sz != 0 && sz != 1 && sz != 6) || ty == 2 || ty == 4 || ty > 5) { fail(e, "SUATOM", "SUATOM form %016llx", (unsigned long long)i); break; }
+        if (off < 72 || (off & 1) || (off - 72) / 2 >= 8) { fail(e, "SUATOM", "image handle at constant buffer word %u", off); break; }
+        unsigned k = (off - 72) / 2;
+        uint16_t fmt = sz == 1 && (aop == 1 || aop == 2) ? 0x8235 : 0x8236;      /* r32i for a signed minimum / maximum, else r32ui */
+        const char *coords = ty == 3 ? S(e, "ivec2(%s, %s)", IR(e, cr), IR(e, cr + 1)) : ty == 5 ? S(e, "ivec3(%s, %s, %s)", IR(e, cr), IR(e, cr + 1), IR(e, cr + 2)) : IR(e, cr);
+        if ((e->images >> k & 1) && (e->image_type[k] != ty || e->image_fmt[k] != fmt)) { fail(e, "SUATOM", "image %u used with two types or formats", k); break; }
+        e->images |= 1u << k; e->image_type[k] = (uint8_t)ty; e->image_fmt[k] = fmt; e->images_read |= 1u << k; e->images_written |= 1u << k;
+        if (fmt == 0x8235) emit(e, "uint av = uint(%s(mx_img%u, %s, int(%s)));", fn[aop], k, coords, X(e, MXB(i, 20, 8)));
+        else emit(e, "uint av = %s(mx_img%u, %s, %s);", fn[aop], k, coords, X(e, MXB(i, 20, 8)));
+        if (r != 255) emit(e, " %s = av;", DST);
         break;
     }
     case MXOP_LDG: case MXOP_STG: {
@@ -1618,7 +1727,8 @@ int mx_translate(const MxIn *in, MxOut *out) {
         static const unsigned hw[6] = {0, 4, 3, 1, 2, 0};          /* hardware stage order: vertex, tess control, tess eval, geometry, fragment */
         e->ssbo_word0 = in->stage == MX_COMPUTE ? 0x310 / 4 : (0x110 + 0x100 * hw[in->stage]) / 4;
     }
-    if (in->stage != MX_VERTEX && in->stage != MX_FRAGMENT && in->stage != MX_COMPUTE) fail(e, in->stage == MX_GEOMETRY ? "geometry stage" : "tessellation stage", "stage %d is not supported", in->stage);
+    if (in->stage == MX_GEOMETRY && in->target != 1) fail(e, "geometry stage", "a geometry stage in the OpenGL text");      /* SMO: Vulkan only */
+    else if (in->stage != MX_VERTEX && in->stage != MX_FRAGMENT && in->stage != MX_COMPUTE && in->stage != MX_GEOMETRY) fail(e, "tessellation stage", "stage %d is not supported", in->stage);
 
     /* the code that ends the shader (EXIT): fragment outputs from the registers, alpha test, depth */
     if (in->stage == MX_FRAGMENT) {
@@ -1726,6 +1836,33 @@ int mx_translate(const MxIn *in, MxOut *out) {
                 emit(&h, "bool mx_alpha_ok(float a) { uint f = mx_alpha.x; float r = F(mx_alpha.y);\n"
                          "  return f == 0u || f >= 8u ? true : f == 1u ? false : f == 2u ? a < r : f == 3u ? a == r : f == 4u ? a <= r : f == 5u ? a > r : f == 6u ? a != r : a >= r; }\n");
             }
+        } else if (in->stage == MX_GEOMETRY) {
+            /* SMO: program header ([doc] yuzu shader_header.h): word 2 bits 24-31 threads (invocations) per input primitive,
+             * word 3 bits 24-27 output topology (1 points, 6 line strip, 7 triangle strip), word 4 bits 0-11 maximum output
+             * vertices. The input primitive is the draw's (in->gs_in_prim). Outputs as a vertex stage's; outputs the next
+             * stage reads that the code never writes (force_out) are set to (0, 0, 0, 1) before every EmitVertex (MX_GS_FILL). */
+            static const char *const prim[5] = {"points", "lines", "triangles", "lines_adjacency", "triangles_adjacency"};
+            uint32_t w2, w3, w4;
+            memcpy(&w2, in->code + 8, 4); memcpy(&w3, in->code + 12, 4); memcpy(&w4, in->code + 16, 4);
+            unsigned topo = (w3 >> 24) & 15, maxv = w4 & 0xfff, inv = (w2 >> 24) & 0xff;
+            const char *ot = topo == 1 ? "points" : topo == 6 ? "line_strip" : topo == 7 ? "triangle_strip" : NULL;
+            if (!ot) fail(e, "geometry output topology", "output topology %u", topo);
+            emit(&h, "layout(%s) in;\n", prim[(unsigned)in->gs_in_prim % 5]);
+            if (inv > 1) emit(&h, "layout(invocations = %u) in;\n", inv > 32 ? 32 : inv);
+            emit(&h, "layout(%s, max_vertices = %u) out;\n", ot ? ot : "points", maxv ? maxv : 1);
+            emit(&h, "in gl_PerVertex { vec4 gl_Position; float gl_PointSize; } gl_in[];\n");
+            int nclip = 0;
+            for (int k = 0; k < 8; k++) if (e->clip_out >> k & 1) nclip = k + 1;
+            emit(&h, "out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize;");
+            if (nclip) emit(&h, " float gl_ClipDistance[%d];", nclip);
+            emit(&h, " };\n");
+            uint32_t fill = in->force_out & ~e->out_attr;
+            e->out_attr |= in->force_out;
+            for (unsigned n = 0; n < 32; n++) if (e->in_attr >> n & 1) emit(&h, "layout(location = %u) in vec4 in_attr%u[];\n", n, n);
+            for (unsigned n = 0; n < 32; n++) if (e->out_attr >> n & 1) emit(&h, "layout(location = %u) out vec4 out_attr%u;\n", n, n);
+            emit(&h, "#define MX_GS_FILL");
+            for (unsigned n = 0; n < 32; n++) if (fill >> n & 1) emit(&h, " out_attr%u = vec4(0.0, 0.0, 0.0, 1.0);", n);
+            emit(&h, "\n");
         }
         if (in->stage == MX_COMPUTE) {
             {   unsigned k = mx_split_x(in->local_size, in->smem_bytes), lx = in->local_size[0] ? in->local_size[0] : 1;      /* SMO: a split group (mx_translate.h) */
@@ -1786,7 +1923,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
     out->int_dep = in->stage == MX_VERTEX ? e->in_attr : e->tex_units;
     out->ssbos = e->ssbos; out->ssbo_written = e->uses_gstore ? e->ssbos : 0;
     out->images = e->images; out->images_read = e->images_read; out->images_written = e->images_written;
-    memcpy(out->image_gl_format, e->image_fmt, sizeof out->image_gl_format);
+    memcpy(out->image_gl_format, e->image_fmt, sizeof out->image_gl_format); memcpy(out->image_type, e->image_type, sizeof out->image_type);
     out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha;
     out->nsmp = e->nsmp; memcpy(out->smp, e->smp, sizeof out->smp);
 done:

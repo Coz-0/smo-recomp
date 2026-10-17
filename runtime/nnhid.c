@@ -46,7 +46,8 @@ static int scripted(int vk) {
 /* Test aid: SMO_SCRIPT is a timed input sequence, independent of window focus. Space-separated steps
  * "<second>[+<duration>]:<keys>", duration 0.15 s by default, keys held together. Key characters are the
  * keyboard keys of the mapping above (Z X C V Q E A S I J K L), '!' = Enter (Plus), '-' = Backspace (Minus),
- * lower-case u d l r = the arrow keys (left stick) and the digits 8 2 4 6 = right stick up, down, left, right (SMO). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
+ * lower-case u d l r = the arrow keys (left stick) and the digits 8 2 4 6 = right stick up, down, left, right (SMO),
+ * '*' = the amiibo menu's key (SMO, smo_amiibo.c). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
  * Each step is announced on stdout when it starts, so it can be matched against the frame log. */
 #define SCRIPT_MAX 256
 static struct { double at, len; char keys[12]; int said; } g_script[SCRIPT_MAX];
@@ -61,6 +62,7 @@ static int script_vk(char k) {
     case 'd': return VK_DOWN;
     case 'l': return VK_LEFT;
     case 'r': return VK_RIGHT;
+    case '*': return 0x101;                                   /* VK_AMIIBO_MENU (below) */
     default: return k;
     }
 }
@@ -676,22 +678,79 @@ static int key_for(uint32_t id, int vk, int kbidx) {         /* vk = the fixed k
     return down;
 }
 
+static const struct { int vk, bit; } g_keymap[] = {
+    {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},
+    {VK_RETURN, BTN_PLUS}, {VK_BACK, BTN_MINUS}, {'J', BTN_LEFT}, {'I', BTN_UP}, {'L', BTN_RIGHT}, {'K', BTN_DOWN},
+    {0, BTN_STICK_L}, {0, BTN_STICK_R},                      /* no fixed key for the test scripts; bindable keys only */
+};
+static const struct { WORD x; int pos, label; } g_xmap[] = {
+    {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},
+    {0x0100, BTN_L, BTN_L}, {0x0200, BTN_R, BTN_R}, {0x0010, BTN_PLUS, BTN_PLUS}, {0x0020, BTN_MINUS, BTN_MINUS},
+    {0x0040, BTN_STICK_L, BTN_STICK_L}, {0x0080, BTN_STICK_R, BTN_STICK_R},
+    {0x0001, BTN_UP, BTN_UP}, {0x0002, BTN_DOWN, BTN_DOWN}, {0x0004, BTN_LEFT, BTN_LEFT}, {0x0008, BTN_RIGHT, BTN_RIGHT},
+};
+
+/* ---- SMO port: the amiibo menu (smo_amiibo.c).
+ * Opening it: a pad's button combination (controllers.ini [hotkeys] amiibo_menu_pad; checked on each pad's own buttons, once
+ * per press of the whole combination), the window's key (display.c), or '*' in a test sequence (player 1).
+ * While it holds the game: hid_menu_buttons reads every player as fill_pad would, the game does not poll then.
+ * When it closes: what is held then is kept from the game until let go (a stick until it is back near the centre), so
+ * the A that chose an amiibo does not make Mario jump. Then, if the game is waiting for amiibo (smo_nerve.c watches the
+ * waiting states of its amiibo mode and of the amiibo NPC's prompt), right is held on player 1 until the game has read the
+ * amiibo and half a second more, at most 4 s: as a player holds right while tapping the figure. */
+#define VK_AMIIBO_MENU 0x101                                  /* '*' of the test sequences: not a key of the keyboard */
+long long nvn_front_frame_next(void);                         /* nvn_gl.c */
+void amiibo_menu_request(void);                               /* smo_amiibo.c */
+long nfp_amiibo_reads(void);                                  /* nnapplet.c */
+long long nerve_watch_last(void);                             /* smo_nerve.c */
+static uint64_t g_menu_last[8], g_menu_mask[8];
+static int g_menu_last_stick[8], g_menu_stick[8];
+static volatile LONG64 g_hold_after = -1;                     /* frame the menu closed after putting an amiibo on the reader, -1 = nothing to do */
+static long g_hold_reads;
+static long long g_hold_start, g_hold_read_at;
+static int g_hold_on;
+static void combo_check(uint32_t id, uint64_t pad) {
+    static uint64_t was[8];
+    uint64_t combo = (uint64_t)nnpad_hotkey_combo();
+    if (id < 8 && combo && (pad & combo) == combo && (was[id] & combo) != combo) { printf("nn::hid: player %u pressed the amiibo menu's buttons\n", id + 1); amiibo_menu_request(); }
+    if (id < 8) was[id] = pad;
+}
+static void menu_after(uint32_t id, uint64_t *buttons, int *lx, int *ly) {
+    if (id < 8 && (g_menu_mask[id] || g_menu_stick[id])) {
+        g_menu_mask[id] &= *buttons;
+        *buttons &= ~g_menu_mask[id];
+        if (g_menu_stick[id]) { if (abs(*lx) < STICK_MAX / 4 && abs(*ly) < STICK_MAX / 4) g_menu_stick[id] = 0; else *lx = *ly = 0; }
+    }
+    if (id != 0 || g_hold_after < 0) return;
+    long long f = nvn_front_frame_next();
+    if (!g_hold_on) {
+        if (nerve_watch_last() >= g_hold_after) { g_hold_on = 1; g_hold_start = f; g_hold_read_at = 0; printf("nn::hid: the game is waiting for amiibo: right held for it from frame %lld\n", f); }
+        else if (f > g_hold_after + 6) { g_hold_after = -1; printf("nn::hid: the game is not waiting for amiibo: the amiibo stays on the reader until it looks for one (hold right)\n"); }
+    }
+    if (!g_hold_on) return;
+    if (!g_hold_read_at && nfp_amiibo_reads() > g_hold_reads) g_hold_read_at = f;
+    if ((g_hold_read_at && f > g_hold_read_at + 30) || f > g_hold_start + 240) {
+        printf("nn::hid: right let go at frame %lld (%s)\n", f, g_hold_read_at ? "the game read the amiibo" : "the game did not read it in 4 s");
+        g_hold_on = 0; g_hold_after = -1;
+        g_menu_mask[0] |= 1ull << BTN_RIGHT;                  /* a right the player holds now counts only once let go */
+        return;
+    }
+    *buttons |= 1ull << BTN_RIGHT;
+}
+void hid_amiibo_hold_after(long long frame, long reads) { g_hold_reads = reads; g_hold_on = 0; g_hold_after = frame; }
+
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     memset((void *)(uintptr_t)out, 0, 0x28);
     wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
     if (id > 7 || !style_is_fullkey) return;                  /* every controller here is a full-key (Pro) controller */
     if (id == 0) { int fight_seq_ticks(void); for (int n = fight_seq_ticks(); n > 0; n--) seq_tick(); }      /* S11: 1 per poll; SMO_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
+    if (id == 0) { static int was; int on = scripted(VK_AMIIBO_MENU) || script_key(VK_AMIIBO_MENU) || seq_key(VK_AMIIBO_MENU); if (on && !was) amiibo_menu_request(); was = on; }
     if (!player_connected(id)) return;
-    static const struct { int vk, bit; } map[] = {
-        {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},
-        {VK_RETURN, BTN_PLUS}, {VK_BACK, BTN_MINUS}, {'J', BTN_LEFT}, {'I', BTN_UP}, {'L', BTN_RIGHT}, {'K', BTN_DOWN},
-        {0, BTN_STICK_L}, {0, BTN_STICK_R},                      /* no fixed key for the test scripts; bindable keys only */
-    };
     uint64_t buttons = 0;
     int lx = 0, ly = 0, rx = 0, ry = 0, wired = 1;
     if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) &&
         ((int)id == g_keyboard_player || (id == 0 && scripted_run()))) {    /* keyboard, and the test scripts on player 1 */
-        for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (key_for(id, map[i].vk, map[i].bit)) buttons |= 1ull << map[i].bit;
+        for (size_t i = 0; i < sizeof g_keymap / sizeof g_keymap[0]; i++) if (key_for(id, g_keymap[i].vk, g_keymap[i].bit)) buttons |= 1ull << g_keymap[i].bit;
         lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
         ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
         if (sdl_on() || id == 0) { rx = (key_for(id, '6', 22) - key_for(id, '4', 20)) * STICK_MAX; ry = (key_for(id, '8', 21) - key_for(id, '2', 23)) * STICK_MAX; }      /* SMO: digits 8 2 4 6 = right stick in the test scripts */
@@ -702,30 +761,36 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         NnPadState ps;
         if (nnpad_get((int)id, &ps)) {
             wired = ps.wired;
+            {   /* SMO port: the pad's share / capture button = the console's Capture button: a picture to the album
+                 * (nvn_vk_draw.c), once per press, by the same focus rule as the buttons */
+                static int was[8];
+                void smo_capture_request(void);
+                int on = ps.capture && devices_live();
+                if (id < 8) { if (on && !was[id]) smo_capture_request(); was[id] = on; }
+            }
             if (devices_live()) {
                 buttons |= ps.buttons;
                 if (ps.lx || ps.ly) { lx = ps.lx; ly = ps.ly; }
                 if (ps.rx || ps.ry || !rx) { rx = ps.rx; ry = ps.ry; }
+                combo_check(id, ps.buttons);
             }
         }
     } else if (x_present(slot) && devices_live()) {
         const XGamepad *g = &g_x[slot].st.pad;
-        static const struct { WORD x; int pos, label; } xmap[] = {
-            {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},
-            {0x0100, BTN_L, BTN_L}, {0x0200, BTN_R, BTN_R}, {0x0010, BTN_PLUS, BTN_PLUS}, {0x0020, BTN_MINUS, BTN_MINUS},
-            {0x0040, BTN_STICK_L, BTN_STICK_L}, {0x0080, BTN_STICK_R, BTN_STICK_R},
-            {0x0001, BTN_UP, BTN_UP}, {0x0002, BTN_DOWN, BTN_DOWN}, {0x0004, BTN_LEFT, BTN_LEFT}, {0x0008, BTN_RIGHT, BTN_RIGHT},
-        };
-        for (size_t i = 0; i < sizeof xmap / sizeof xmap[0]; i++)
-            if (g->buttons & xmap[i].x) buttons |= 1ull << (g_label_layout ? xmap[i].label : xmap[i].pos);
-        if (g->lt >= 85) buttons |= 1ull << BTN_ZL;
-        if (g->rt >= 85) buttons |= 1ull << BTN_ZR;
+        uint64_t pad = 0;
+        for (size_t i = 0; i < sizeof g_xmap / sizeof g_xmap[0]; i++)
+            if (g->buttons & g_xmap[i].x) pad |= 1ull << (g_label_layout ? g_xmap[i].label : g_xmap[i].pos);
+        if (g->lt >= 85) pad |= 1ull << BTN_ZL;
+        if (g->rt >= 85) pad |= 1ull << BTN_ZR;
+        buttons |= pad;
+        combo_check(id, pad);
         if (g->lx || g->ly) { lx = g->lx < -STICK_MAX ? -STICK_MAX : g->lx; ly = g->ly < -STICK_MAX ? -STICK_MAX : g->ly; }
         rx = g->rx < -STICK_MAX ? -STICK_MAX : g->rx;
         ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
         wired = !g_x[slot].wireless;
     }
     if (id == 0) record_or_replay(&buttons, &lx, &ly);
+    menu_after(id, &buttons, &lx, &ly);                       /* SMO port: after the amiibo menu (above) */
     if (lx < -STICK_MAX / 2) buttons |= 1ull << BTN_SL_LEFT;
     if (lx > STICK_MAX / 2) buttons |= 1ull << BTN_SL_RIGHT;
     if (ly > STICK_MAX / 2) buttons |= 1ull << BTN_SL_UP;
@@ -740,6 +805,57 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     wr32(out + 0x18, (uint32_t)rx);
     wr32(out + 0x1c, (uint32_t)ry);
     wr32(out + 0x20, wired ? 3 : 1);                          /* NpadAttribute: bit 0 connected, bit 1 wired */
+}
+
+/* smo_amiibo.c, while the menu holds the game: the buttons of every player as fill_pad reads them (player 1's test sequence
+ * included; it goes on one step per call, i.e. per menu frame), the left stick as the BTN_SL_* bits */
+uint64_t hid_menu_buttons(void) {
+    uint64_t all = 0;
+    hid_setup();
+    if (sdl_on()) nnpad_poll(0);
+    seq_tick();
+    for (uint32_t id = 0; id < 8; id++) {
+        uint64_t b = 0;
+        int lx = 0, ly = 0;
+        g_menu_last[id] = 0; g_menu_last_stick[id] = 0;
+        if (!player_connected(id)) continue;
+        if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) && ((int)id == g_keyboard_player || (id == 0 && scripted_run()))) {
+            for (size_t i = 0; i < sizeof g_keymap / sizeof g_keymap[0]; i++) if (key_for(id, g_keymap[i].vk, g_keymap[i].bit)) b |= 1ull << g_keymap[i].bit;
+            lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
+            ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
+        }
+        if (sdl_on()) {
+            NnPadState ps;
+            if (nnpad_get((int)id, &ps) && devices_live()) { b |= ps.buttons; if (ps.lx || ps.ly) { lx = ps.lx; ly = ps.ly; } }
+        } else if (x_present(g_source[id]) && devices_live()) {
+            const XGamepad *g = &g_x[g_source[id]].st.pad;
+            for (size_t i = 0; i < sizeof g_xmap / sizeof g_xmap[0]; i++)
+                if (g->buttons & g_xmap[i].x) b |= 1ull << (g_label_layout ? g_xmap[i].label : g_xmap[i].pos);
+            if (g->lt >= 85) b |= 1ull << BTN_ZL;
+            if (g->rt >= 85) b |= 1ull << BTN_ZR;
+            if (g->lx || g->ly) { lx = g->lx; ly = g->ly; }
+        }
+        g_menu_last[id] = b;
+        g_menu_last_stick[id] = abs(lx) >= STICK_MAX / 4 || abs(ly) >= STICK_MAX / 4;
+        if (lx < -STICK_MAX / 2) b |= 1ull << BTN_SL_LEFT;
+        if (lx > STICK_MAX / 2) b |= 1ull << BTN_SL_RIGHT;
+        if (ly > STICK_MAX / 2) b |= 1ull << BTN_SL_UP;
+        if (ly < -STICK_MAX / 2) b |= 1ull << BTN_SL_DOWN;
+        all |= b;
+    }
+    return all;
+}
+void hid_menu_closed(void) { for (int i = 0; i < 8; i++) { g_menu_mask[i] = g_menu_last[i]; g_menu_stick[i] = g_menu_last_stick[i]; } }
+/* the keyboard's own keys of the menu, pressed since the last call: 0 = Escape (back), 1 = Enter (choose); only while
+ * this process has the foreground window (as keyboard_ours, checked here every call: the game does not poll meanwhile) */
+int hid_menu_key(int which) {
+    static int was[2];
+    DWORD pid = 0;
+    HWND fg = GetForegroundWindow();
+    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId() && !scripted_run();
+    int on = ours && (GetAsyncKeyState(which ? VK_RETURN : VK_ESCAPE) & 0x8000) != 0, hit = on && !was[which & 1];
+    was[which & 1] = on;
+    return hit;
 }
 
 static void hid_InitializeNpad(Ctx *c) { (void)c; hid_setup(); }

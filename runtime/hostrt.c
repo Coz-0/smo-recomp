@@ -194,11 +194,14 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
 }
 
 extern int g_nerve_mode;                              /* smo_nerve.c */
+extern volatile uint64_t g_nerve_watch[2];
 void nerve_call(Ctx *c, uint64_t addr);
+void nerve_watch_hit(void);
 
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
     if (g_nerve_mode) nerve_call(c, addr);             /* smo_nerve.c: SMO_NERVELOG, SMO_ACTORPOS, SMO_SEQ @nerve: */
+    if (g_nerve_watch[0] && (addr == g_nerve_watch[0] || addr == g_nerve_watch[1])) nerve_watch_hit();   /* smo_nerve.c: the amiibo menu's watch */
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
         void (*fn)(Ctx *) = lookup_guest(addr);
         if (!fn) guest_trap("indirect call to an address that is not a known function", addr);

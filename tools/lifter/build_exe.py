@@ -31,13 +31,13 @@ HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nv
                 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c',
                 'nncxxlib.c', 'nnlibc2.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c',
                 'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c', 'smo_nerve.c',
-                'smo_fast.c', 'gamedll.c']
+                'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'gamedll.c']
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', RT, '-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(SDL3, 'include'), '-I', VKH]
-LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi']
+LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32']
 
 
 def build_game_dll(force):

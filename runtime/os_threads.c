@@ -463,6 +463,7 @@ void os_signal_event(uint64_t key) {
     WakeAllConditionVariable(&o->cv);
     LeaveCriticalSection(&o->cs);
 }
+void os_clear_event(uint64_t key) { Obj *o = obj(key); EnterCriticalSection(&o->cs); o->signaled = 0; LeaveCriticalSection(&o->cs); }
 static void ev_clear(Ctx *c) { Obj *o = obj(A0); EnterCriticalSection(&o->cs); o->signaled = 0; LeaveCriticalSection(&o->cs); }
 static int ev_wait_ms(Obj *o, DWORD ms) {
     int ok = 1;
@@ -632,6 +633,19 @@ static void mq_tryjam(Ctx *c) { RET(mq_put(obj(A0), A1, 1, 0)); }
 static void mq_receive(Ctx *c) { mq_get(obj(A1), A0, INFINITE); }
 static void mq_tryreceive(Ctx *c) { RET(mq_get(obj(A1), A0, 0)); }
 static void mq_timedreceive(Ctx *c) { RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
+/* SMO port: PeekMessageQueue / TryPeekMessageQueue (out, queue): the oldest message without taking it (sead::MessageQueue::peek). */
+static int mq_peek(Obj *o, uint64_t out, DWORD ms) {
+    int ok = 1;
+    EnterCriticalSection(&o->cs);
+    while (o->len == 0) {
+        if (!SleepConditionVariableCS(&o->cv, &o->cs, ms)) { ok = o->len > 0; break; }
+    }
+    if (ok) wr64(out, o->buf[o->head]);
+    LeaveCriticalSection(&o->cs);
+    return ok;
+}
+static void mq_peek_h(Ctx *c) { mq_peek(obj(A1), A0, INFINITE); }
+static void mq_trypeek(Ctx *c) { RET(mq_peek(obj(A1), A0, 0)); }
 
 /* ---------------------------------------------------------------- multi-wait (polling implementation) */
 static void mw_init(Ctx *c) { obj_reset(A0); }
@@ -792,10 +806,23 @@ static const ImportDef thread_imports[] = {
 /* SMO port: SDK 3.5.1 forms the game imports. SetThreadNamePointer(ThreadType*, const char*): [doc] the thread's name is
  * the given string (kept by pointer); recorded for the thread reports. */
 static void os_SetThreadNamePointer(Ctx *c) { obj(A0)->name = A1; }
+/* GetThreadNamePointer(thread): the name set for it; a thread never named gets "Thread_0x<address>" as nn::os names it
+ * (kept, so the pointer stays valid). Read by sead::nnsdk::PrintThreadInformation. */
+static void os_GetThreadNamePointer(Ctx *c) {
+    Obj *o = obj(A0);
+    if (!o->name) { char *s = malloc(32); if (s) { snprintf(s, 32, "Thread_0x%llx", (unsigned long long)A0); o->name = (uint64_t)(uintptr_t)s; } }
+    RET(o->name);
+}
 static const ImportDef smo_thread_imports[] = {
     {OS("19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"), ev_timedwait},
     {OS("20SetThreadNamePointerEPNS0_10ThreadTypeEPKc"), os_SetThreadNamePointer},
     {"nnosSetThreadNamePointer", os_SetThreadNamePointer},
+    /* SMO port: imported by the game and without a handler before. TryWaitEvent: the movie player (MovieDecoderPlayer::update
+     * polls its decoder's buffer events with it) and the sound library's loaders (nn::atk ...Loader::IsInUse, Finalize). */
+    {OS("12TryWaitEventEPNS0_9EventTypeE"), ev_trywait},
+    {OS("16PeekMessageQueueEPmPKNS0_16MessageQueueTypeE"), mq_peek_h},
+    {OS("19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE"), mq_trypeek},
+    {OS("20GetThreadNamePointerEPKNS0_10ThreadTypeE"), os_GetThreadNamePointer},
 };
 /* SMO port: the system-event entry points, also for lifted SDK callers (sdklift_rules.txt cuts them) */
 static const ImportDef sev_all[] = {

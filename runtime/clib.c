@@ -167,6 +167,15 @@ static int guest_format(char *out, size_t size, const char *fmt, Args *a) {
     return (int)n;
 }
 
+/* SMO port: printf-style text of a guest call's own variadic arguments (format in x<fmt_reg>, the values from the next
+ * register on), for the nn::diag log and abort functions in smo_nn.c. */
+int clib_format_call(Ctx *c, int fmt_reg, char *out, size_t size) {
+    Args a;
+    if (!size) return 0;
+    if (!c->x[fmt_reg]) { out[0] = 0; return 0; }
+    args_direct(&a, c, fmt_reg + 1);
+    return guest_format(out, size, (const char *)(uintptr_t)c->x[fmt_reg], &a);
+}
 static void c_sprintf(Ctx *c) { Args a; args_direct(&a, c, 2); RET((int64_t)guest_format((char *)(uintptr_t)A0, 1u << 20, STR(1), &a)); }
 static void c_snprintf(Ctx *c) { Args a; args_direct(&a, c, 3); RET((int64_t)guest_format((char *)(uintptr_t)A0, (size_t)A1, STR(2), &a)); }
 static void c_vsnprintf(Ctx *c) { Args a; args_va(&a, c, A3); RET((int64_t)guest_format((char *)(uintptr_t)A0, (size_t)A1, STR(2), &a)); }
@@ -475,6 +484,14 @@ static void m_exp2(Ctx *c) { double r = exp2(c->v[0].df[0]); vzero(&c->v[0]); c-
 static void m_erfcf(Ctx *c) { float r = erfcf(c->v[0].f[0]); vzero(&c->v[0]); c->v[0].f[0] = r; }
 static void m_modff(Ctx *c) { float ip, r = modff(c->v[0].f[0], &ip); memcpy((void *)(uintptr_t)A0, &ip, 4); vzero(&c->v[0]); c->v[0].f[0] = r; }
 static void m_frexpf(Ctx *c) { int e; float r = frexpf(c->v[0].f[0], &e); wr32(A0, (uint32_t)e); vzero(&c->v[0]); c->v[0].f[0] = r; }
+/* SMO port: libm / libc functions SMO imports that had no handler (a call returned the argument register unchanged).
+ * ldexpf: al::SpectrumTexture (the ocean wave texture), al::VastGridMesh and al::ApertureMesh; modf: the Snow Kingdom
+ * racers (YukimaruRacerTiago); strtod: agl's shader text (agl::detail::TextToReal); abs, wcslen: the network library. */
+static void m_ldexpf(Ctx *c) { float r = ldexpf(c->v[0].f[0], (int)(uint32_t)A0); vzero(&c->v[0]); c->v[0].f[0] = r; }
+static void m_modf(Ctx *c) { double ip, r = modf(c->v[0].df[0], &ip); memcpy((void *)(uintptr_t)A0, &ip, 8); vzero(&c->v[0]); c->v[0].df[0] = r; }
+static void c_strtod(Ctx *c) { char *e = NULL; double r = strtod(STR(0), &e); if (A1) wr64(A1, (uint64_t)(uintptr_t)e); vzero(&c->v[0]); c->v[0].df[0] = r; }
+static void c_abs(Ctx *c) { int v = (int)(uint32_t)A0; RET((uint32_t)(v < 0 ? -v : v)); }
+static void c_wcslen(Ctx *c) { uint64_t p = A0, n = 0; while (rd32(p + 4 * n)) n++; RET(n); }     /* the console's wchar_t is 4 bytes */
 
 static const ImportDef clib_imports[] = {
     {"sprintf", c_sprintf}, {"snprintf", c_snprintf}, {"vsnprintf", c_vsnprintf}, {"printf", c_printf}, {"fprintf", c_fprintf},
@@ -489,6 +506,7 @@ static const ImportDef clib_imports[] = {
     {"memset_s", c_memset_s}, {"rand", c_rand}, {"srand", c_srand}, {"time", c_time}, {"clock", c_clock},
     {"getenv", c_getenv}, {"atexit", c_atexit},
     {"exp2", m_exp2}, {"erfcf", m_erfcf}, {"modff", m_modff}, {"frexpf", m_frexpf},
+    {"ldexpf", m_ldexpf}, {"modf", m_modf}, {"strtod", c_strtod}, {"abs", c_abs}, {"wcslen", c_wcslen},
 };
 
 void register_clib_imports(void) {

@@ -9,7 +9,8 @@ The end of every log has the counts that tell whether a run was healthy:
 
 | Line | Healthy |
 |---|---|
-| `nvn_vk: N frames presented, ... 0 Vulkan call failures, ... 0 calls of operations that are not implemented` | both zero |
+| `nvn_vk: N frames presented, ... 0 Vulkan call failures, ... 0 calls of operations that are not implemented` | both zero. An operation the renderer lacks is named once (`NOT IMPLEMENTED in the Vulkan back end, skipped`), counted here and skipped; `SMO_VK_MISSING=exit` stops the game at the first one instead |
+| `nvn_vk: images: ...; draws with a geometry stage: ...; indirect: ...` | how often the less common paths ran (storage images, geometry stages, indirect draws and dispatches) |
 | `nvn_gl: ... command lists (0 unknown handles) ...` | zero: a non-zero count means draws were dropped (scenery missing or flickering) |
 | `nvn: command lists freed: ...` | lists freed when the game finalizes them or records over them; `by the budget` should be 0 |
 | `audio: device sink: ... 0 samples dropped ..., 0 underruns ...` | both zero |
@@ -26,6 +27,11 @@ The end of every log has the counts that tell whether a run was healthy:
   (`pass_<frame>_<n>_<format>.bmp`), for defects that show in some frames only. `SMO_VK_PASSSHOT_RAW=1` adds the
   texels as read, for exact values.
 - `SMO_VK_DIAG_NODEPTH=1` draws without depth testing (to see whether something is hidden or missing).
+- `SMO_CAPTURE_AT=<frame>[,<frame>...]` presses the Capture button at those frames (the picture goes to the save
+  folder's `album`, as when you press F12); `SMO_CAPTURE_GS=<n>` presses it at n frames that drew with a geometry stage
+  (the lightning), at least 60 frames apart.
+- `SMO_AMIIBO_SHOT_DIR=<folder>` saves the first three different pictures of each opening of the amiibo menu as
+  `amiibo_menu_<opening>_<n>.png` (the menu's frames are not game frames, so `SMO_SHOT` does not see them).
 
 ## Shaders
 
@@ -39,6 +45,14 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_MX_NOSTRUCT=1` translates with the old `switch(pc)` control flow instead of structured blocks;
   `SMO_MX_MUTATE=1` plants a known bug, to check that the equivalence harness catches it.
 - Equivalence harness: `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of vk_prog_*.bin> [max]`.
+- `tests\check_all_shaders.py` takes every shader stage out of the game's shader archives (agl `.sharcb`, g3d `.bfsha`,
+  the effect `.ptcl`, nested archives, `main` and `sdk`) into `build\shaders_all`, translates each with the Vulkan back
+  end's settings and compiles it with the renderer's compiler; `--list` adds a line per stage, `--extract-only` stops
+  after the extraction. A geometry stage is checked for point, line and triangle input.
+- `SMO_VK_GS_DEBUG=<mode>` for draws with a geometry stage: `1` measures them (`nvn_vk_gs:` lines: the GPU's pipeline
+  statistics of 16 of them, and the colour target read back before and after every 20th, which says how many pixels
+  each draw brightened and by how much), `2` leaves them out (to compare pictures), `3` draws them in bright magenta
+  without the depth test and measures them as 1 does.
 
 ## Missing or flickering draws
 
@@ -116,9 +130,27 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_AUDIO=0` turns the audio output off; `SMO_AUDIO_WAV=<file>` also writes the final mix to a WAV file.
 - `SMO_HIDLOG=1` logs the pad values the game reads, when they change.
 - `SMO_PAD_SELFTEST=1` runs the controller self-test with SDL3 virtual devices and exits.
+- amiibo: the log says when the menu opens and closes (`amiibo menu:`), what the NFC reader does (`nfp:` an amiibo held to
+  it, found when the game searches, its model information read by the game, taken away) and whether → is held for the
+  game (`nn::hid:`). `SMO_NERVELOG=HelpAmiibo` shows the game's amiibo mode (Wait, CountHold, Active, IconClose).
+
+## Starting elsewhere in the game
+
+- `tools\dev\save_warp.py <save folder> --out <new folder> --stage <StageName> [--world <n>]` copies a save folder so
+  that its game file continues in another stage (at the stage's default entrance; the world number comes from
+  `SystemData\WorldList.szs` for a kingdom's home stage, e.g. `BossRaidWorldHomeStage` = 11). Run it with
+  `scripts\run.py <name> --userdata <new folder>`: a late kingdom can be tried without playing to it. The source folder is
+  only read; never give your own save folder as `--out`.
 
 ## Other switches
 
+- `SMO_IMPORT_SELFTEST=1` checks the system calls implemented from the list of the game's imports rather than met in
+  play (C library, threads and message queues, files, C++ library pieces, `nn::util`, diagnostics and time, the web
+  applet, the NFC reader with an amiibo held to it, the amiibo menu's list and picture): run when every handler is
+  registered, before the game starts; one line per group, then it exits with the number of failed checks as exit code.
+  `SMO_AMIIBO_SHOT=<file.png>` also saves the menu picture it composes.
+- `SMO_MANUAL=<folder>` takes the game's manual from that folder instead of `build\manual`; `SMO_WEB_NOOPEN=1` prepares
+  the Help pages without opening the browser.
 - `SMO_STRICT=1` stops at the first call to a system call that only has a placeholder handler; `SMO_STRICT=report`
   lists them without stopping.
 - `SMO_VK_CSLOG=1` logs compute dispatches with large work groups.

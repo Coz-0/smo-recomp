@@ -1217,7 +1217,12 @@ static void decoder_ctor(Ctx *c) {                    /* Decoder(DecoderType, De
     d->type = (int)A1; d->fmt = (int)A2; d->mode = (int)A3;
     d->is_video = d->type >= 1 && d->type <= 3;
     d->nin = 8;                                       /* compressed-data buffers: only bound how far the feed runs ahead of the codec */
-    d->nout = d->is_video ? 48 : 64;                                     /* decoded frames the game may hold or leave queued before the codec stalls: it queues more than a second of video before showing the first frame */
+    /* decoded frames the game may hold or leave queued before the codec stalls. SMO port: the game's VideoRenderer queues
+     * at most 32 ([game] VideoRenderer::open: 0x200 bytes of 16-byte entries; MovieDecoderPlayer::VideoOutputBufferAvailableEvent
+     * moves every ready frame into it, and onOutputAvailable writes through a null entry when it is full); it takes one
+     * frame per update and releases it at once. 16 stays well inside that (half a second of 30 fps video). The 48 of
+     * ssbu-recomp (its player queued more than a second before the first frame) made SMO's queue overflow. */
+    d->nout = d->is_video ? 16 : 64;
     d->mem = calloc((size_t)d->nin, SLOT_BYTES);
     wr64(A0, (uint64_t)(uintptr_t)g_dec_vtable);
     wr64(A0 + 8, (uint64_t)(uintptr_t)d);

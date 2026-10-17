@@ -49,6 +49,7 @@ Nothing of it is copied into the repository.
 deps       check Python packages, clang, the Vulkan SDK and SDL3
 extract    dump -> ExeFS, main.elf / sdk.elf, NACP, version.json        tools/extract/extract.py
 romfs      the game's RomFS -> build/romfs (about 5.1 GB)               tools/extract/romfs.py
+manual     the game's electronic manual (Help) -> build/manual          tools/extract/romfs.py --manual
 fonts      the system's shared fonts from your firmware                 tools/extract/fw_fonts.py
 functions  every function of main, with exact boundaries                tools/extract/functions.py
 lift       AArch64 -> C for every function -> build/lift/main          tools/lifter/recomp.py
@@ -81,6 +82,11 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   sets one of the runtime's switches (see [`docs/DEBUGGING.md`](docs/DEBUGGING.md)).
 - Graphics and controller settings live in `build\config\graphics.ini` and `build\config\controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
+- amiibo: press F1, or both stick buttons of a pad, while you play. The game waits and a menu like its pause menu lists
+  the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F1 again) to close. When the game is
+  waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
+  and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]` (a file
+  written before this section existed keeps working with these defaults).
 - Translated shaders are cached in `build\cache\vk`. The first run compiles them as the game meets them and is slower;
   later runs reuse them.
 
@@ -100,8 +106,8 @@ code 0 when every checkpoint was reached and every health counter is zero.
 - **Keys not found:** give `--keys <your prod.keys>`; the extraction prints which file it used.
 - **The first minutes are slow, or loading screens pause:** shaders are being translated and compiled; the cache in
   `build\cache\vk` makes the next run faster.
-- **The game stops with "NOT IMPLEMENTED in the Vulkan back end":** an NVN feature the renderer does not have yet; the
-  log names it. Please report it with the log.
+- **"NOT IMPLEMENTED in the Vulkan back end, skipped" in the log:** an NVN feature the renderer does not have yet; the
+  game keeps running, but that part of the picture is not the game's. Please report it with the log.
 - **A crash:** the log has a `HOST EXCEPTION` block with the guest function, the registers and the host call stack
   (named from the linker map); `SMO_CRASH_DUMP` and `SMO_WATCH` give more (see `docs/DEBUGGING.md`).
 - **No new frame for 5 seconds:** a watchdog writes every thread's state to the log and to `<exe name>_freeze.txt`.

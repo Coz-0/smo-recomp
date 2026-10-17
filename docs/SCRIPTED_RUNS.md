@@ -28,8 +28,12 @@ and counted in pad polls (the game polls player 1 once per frame), so it does no
 | `@movie` | wait until a movie is opened |
 
 Keys: `Z` `X` `C` `V` = A B X Y, `Q` `E` = L R, `A` `S` = ZL ZR, `!` = Plus, `-` = Minus, `I` `J` `K` `L` = d-pad
-up/left/down/right, `u` `d` `l` `r` = left stick, `8` `2` `4` `6` = right stick up/down/left/right. Every step is
-announced in the log with its poll and frame number.
+up/left/down/right, `u` `d` `l` `r` = left stick, `8` `2` `4` `6` = right stick up/down/left/right, `*` = the amiibo
+menu's key. Every step is announced in the log with its poll and frame number.
+
+While the amiibo menu is open the game is held, but the sequence goes on, one poll per frame of the menu: for example
+`@nerve:StageSceneNrvPlay 240 1:* 30 1:E/4 20 1:Z 900` opens it, moves a page down (to Peach), chooses it and lets the
+game read it (the log's `amiibo menu:`, `nfp:` and `nn::hid:` lines say what happened).
 
 ## The game's state
 

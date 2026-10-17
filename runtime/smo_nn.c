@@ -23,6 +23,8 @@
  *                                      This port has no video capture: the call does nothing. It is a DO-NOTHING
  *                                      handler on purpose and stays listed as such by the strict audit. */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include "hostrt.h"
 #include "sdklift.h"
@@ -227,7 +229,158 @@ static void oe_GetDisplayVersion(Ctx *c) {
     if (!said++) printf("nn::oe::GetDisplayVersion: \"%s\" (from %s%s)\n", v, path, f ? "" : ": NOT READ");
     memcpy((void *)(uintptr_t)c->x[0], v, 16);
 }
+/* ---- nn::diag, the forms SMO imports that had no handler (a call returned 0 and the game went on) [doc]:
+ *   AbortImpl(condition, function, file, line, const Result *, format, ...)  the program stops with that message.
+ *   OnAssertionFailure(type, condition, function, file, line)  an SDK assertion failed: the program stops.
+ *   LogImpl(meta, format, ...) / PutImpl(meta, text, length)  the program's debug log (NN_LOG; sead's print goes to
+ *     PutImpl): written to the run log here (the first 500 lines, then counted).
+ *   GetBacktrace(addresses, max) -> count  the return addresses of the calling frames: the caller's, then the guest
+ *     frame-pointer chain (frame record: previous frame, return address).
+ *   GetSymbolName(out, size, address) -> start of the symbol, or 0; GetSymbolSize(address) -> its size, or 0: the
+ *     function that contains the address and the game's own dynamic symbol for it (a function without one: not found).
+ *   GetRequiredBufferSizeForGetAllModuleInfo() / GetAllModuleInfo(out, buffer, size) -> count: the module list; the port
+ *     reports none (SIMPLIFIED). sead calls these only to print an exception report, which the port writes itself
+ *     (hostrt.c crash report). */
+int clib_format_call(Ctx *c, int fmt_reg, char *out, size_t size);      /* clib.c */
+static const char *sstr(uint64_t p) { return p ? (const char *)(uintptr_t)p : "(null)"; }
+static void diag_AbortImpl_result(Ctx *c) {
+    char msg[1024];
+    clib_format_call(c, 5, msg, sizeof msg);
+    printf("\nnn::diag abort: %s  in %s  (%s:%d), result 0x%x: %s\n", sstr(c->x[0]), sstr(c->x[1]), sstr(c->x[2]), (int)c->x[3],
+           c->x[4] ? rd32(c->x[4]) : 0u, msg);
+    fflush(stdout);
+    guest_trap("guest called nn::diag::detail::AbortImpl", c->x[30] - 4);
+}
+static void diag_OnAssertionFailure(Ctx *c) {
+    printf("\nnn::diag assertion failed (type %d): %s  in %s  (%s:%d)\n", (int)c->x[0], sstr(c->x[1]), sstr(c->x[2]), sstr(c->x[3]), (int)c->x[4]);
+    fflush(stdout);
+    guest_trap("guest called nn::diag::detail::OnAssertionFailure", c->x[30] - 4);
+}
+static volatile LONG g_diag_log_lines;
+static void diag_log_line(const char *s, size_t n) {
+    LONG k = InterlockedIncrement(&g_diag_log_lines);
+    if (k > 500) { if (k == 501) printf("nn::diag log: more lines are not printed\n"); return; }
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) n--;
+    printf("nn::diag log: %.*s\n", (int)n, s);
+}
+static void diag_LogImpl(Ctx *c) { char msg[1024]; int n = clib_format_call(c, 1, msg, sizeof msg); diag_log_line(msg, n < 0 ? 0 : (size_t)n < sizeof msg ? (size_t)n : sizeof msg - 1); }
+static void diag_PutImpl(Ctx *c) { if (c->x[1]) diag_log_line((const char *)(uintptr_t)c->x[1], (size_t)c->x[2]); }
+static int readable(uint64_t p, size_t n) {
+    MEMORY_BASIC_INFORMATION mb;
+    if (!p || VirtualQuery((void *)(uintptr_t)p, &mb, sizeof mb) != sizeof mb || mb.State != MEM_COMMIT) return 0;
+    if (mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return p + n <= (uint64_t)(uintptr_t)mb.BaseAddress + mb.RegionSize;
+}
+static void diag_GetBacktrace(Ctx *c) {
+    uint64_t out = c->x[0], fp = c->x[29];
+    int max = (int)c->x[1], n = 0;
+    if (n < max && c->x[30]) wr64(out + 8 * (uint64_t)n++, c->x[30]);
+    while (n < max && !(fp & 7) && readable(fp, 16)) {
+        uint64_t next = rd64(fp), lr = rd64(fp + 8);
+        if (!lr) break;
+        wr64(out + 8 * (uint64_t)n++, lr);
+        if (next <= fp) break;                       /* frames go up the stack */
+        fp = next;
+    }
+    c->x[0] = (uint64_t)n;
+}
+static int fn_index(uint64_t addr) {                 /* the lifted function that contains a guest address, or -1 */
+    int lo = 0, hi = fn_table_count - 1, best = -1;
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (fn_table[mid].addr <= addr) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+    return best;
+}
+static const char *sym_at(uint64_t start) {           /* the game's dynamic symbol at a function start */
+    static uint64_t *addr;
+    static const char **name;
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        addr = malloc(sizeof *addr * (size_t)dyn_sym_count); name = malloc(sizeof *name * (size_t)dyn_sym_count);
+        for (int i = 0; addr && name && i < dyn_sym_count; i++)
+            if (dyn_syms[i].defined && dyn_syms[i].value) {      /* insertion into the sorted array would be slow: append, then sort */
+                addr[n] = GUEST_BASE + dyn_syms[i].value; name[n] = dyn_syms[i].name; n++;
+            }
+        for (int gap = n / 2; gap > 0; gap /= 2)          /* shell sort by address, the names along */
+            for (int i = gap; i < n; i++)
+                for (int j = i; j >= gap && addr[j - gap] > addr[j]; j -= gap) {
+                    uint64_t t = addr[j]; addr[j] = addr[j - gap]; addr[j - gap] = t;
+                    const char *s = name[j]; name[j] = name[j - gap]; name[j - gap] = s;
+                }
+    }
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (addr[mid] == start) return name[mid]; if (addr[mid] < start) lo = mid + 1; else hi = mid - 1; }
+    return NULL;
+}
+static void diag_GetSymbolName(Ctx *c) {             /* (char *out, size_t size, uintptr_t address) -> uintptr_t */
+    int i = fn_index(c->x[2]);
+    const char *s = i >= 0 ? sym_at(fn_table[i].addr) : NULL;
+    if (c->x[1]) { size_t n = s ? strlen(s) : 0; if (n >= c->x[1]) n = (size_t)c->x[1] - 1; if (n) memcpy((void *)(uintptr_t)c->x[0], s, n); wr8(c->x[0] + n, 0); }
+    c->x[0] = s ? fn_table[i].addr : 0;
+}
+static void diag_GetSymbolSize(Ctx *c) {             /* (uintptr_t address) -> size_t */
+    int i = fn_index(c->x[0]);
+    c->x[0] = i >= 0 && i + 1 < fn_table_count && sym_at(fn_table[i].addr) ? fn_table[i + 1].addr - fn_table[i].addr : 0;
+}
+static void diag_GetRequiredBufferSizeForGetAllModuleInfo(Ctx *c) { c->x[0] = 0; }
+static void diag_GetAllModuleInfo(Ctx *c) { if (c->x[0]) wr64(c->x[0], 0); c->x[0] = 0; }
+
+/* ---- nn::time library state [doc]: IsInitialized() is true between Initialize() and Finalize() (it used to answer
+ * false always; sead::DateTime then initializes again, which was harmless). Replaces nnsdk.c's ret0 handlers. */
+static volatile LONG g_time_init;
+static void time_Initialize(Ctx *c) { InterlockedExchange(&g_time_init, 1); c->x[0] = 0; }
+static void time_IsInitialized(Ctx *c) { c->x[0] = g_time_init != 0; }
+static void time_Finalize(Ctx *c) { InterlockedExchange(&g_time_init, 0); c->x[0] = 0; }
+
+/* ---- nn::oe [doc]
+ *   SetScreenShotImageOrientation(orientation)  the orientation of screenshots taken from now on (0 normal, 1 rotated
+ *     by 90, 2 by 180, 3 by 270 degrees): SMO's snapshot mode sets it when the camera is turned. Kept for the screenshot
+ *     of the capture button (smo_screenshot_orientation).
+ *   SetUserInactivityDetectionTimeExtended(on) / IsUserInactivityDetectionTimeExtended()  while on, the console waits
+ *     much longer before it dims the screen (SMO turns it on for the ending): here the display is kept on meanwhile
+ *     (a power request of its own, apart from the auto-sleep sections of nnmisc.c). */
+static volatile LONG g_shot_orientation;
+int smo_screenshot_orientation(void) { return (int)g_shot_orientation; }
+static void oe_SetScreenShotImageOrientation(Ctx *c) { InterlockedExchange(&g_shot_orientation, (LONG)(c->x[0] & 3)); }
+static HANDLE g_inact_req;
+static int g_inact_ext;
+static void oe_SetUserInactivityDetectionTimeExtended(Ctx *c) {
+    int on = (int)(c->x[0] & 1);
+    if (!g_inact_req) {
+        REASON_CONTEXT rc;
+        memset(&rc, 0, sizeof rc);
+        rc.Version = POWER_REQUEST_CONTEXT_VERSION; rc.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+        rc.Reason.SimpleReasonString = L"Super Mario Odyssey (smo-recomp): the game asked for a longer time before the screen dims";
+        g_inact_req = PowerCreateRequest(&rc);
+        if (g_inact_req == INVALID_HANDLE_VALUE) g_inact_req = NULL;
+    }
+    if (g_inact_req && on != g_inact_ext) { if (on) PowerSetRequest(g_inact_req, PowerRequestDisplayRequired); else PowerClearRequest(g_inact_req, PowerRequestDisplayRequired); }
+    g_inact_ext = on;
+}
+static void oe_IsUserInactivityDetectionTimeExtended(Ctx *c) { c->x[0] = (uint64_t)g_inact_ext; }
+
+/* ---- nn::nifm, offline [doc]: HandleNetworkRequestResult() shows the console's error screen for a network request
+ * that failed and returns what the player did; the game ([game] al::NexNetworkStateHolder::exeConnectToInternet) takes
+ * 0 as "connected now", the Result 0x17c6e (nifm 190: the error was shown and dealt with) as "not connected, stop", and
+ * anything else as an error. This console has no network, so: 0x17c6e (it used to answer 0 and the game went on to its
+ * account check as if connected). SetLocalNetworkMode(bool): local communication only; nothing to set. */
+static void nifm_HandleNetworkRequestResult(Ctx *c) { c->x[0] = 0x17c6e; }
+static void nifm_SetLocalNetworkMode(Ctx *c) { (void)c; }
+
 static const ImportDef smo_imports[] = {
+    {"_ZN2nn4nifm26HandleNetworkRequestResultEv", nifm_HandleNetworkRequestResult},
+    {"_ZN2nn4nifm19SetLocalNetworkModeEb", nifm_SetLocalNetworkMode},
+    {"_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z", diag_AbortImpl_result},
+    {"_ZN2nn4diag6detail18OnAssertionFailureENS0_13AssertionTypeEPKcS4_S4_i", diag_OnAssertionFailure},
+    {"_ZN2nn4diag6detail7LogImplERKNS0_11LogMetaDataEPKcz", diag_LogImpl},
+    {"_ZN2nn4diag6detail7PutImplERKNS0_11LogMetaDataEPKcm", diag_PutImpl},
+    {"_ZN2nn4diag12GetBacktraceEPmi", diag_GetBacktrace},
+    {"_ZN2nn4diag13GetSymbolNameEPcmm", diag_GetSymbolName}, {"_ZN2nn4diag13GetSymbolSizeEm", diag_GetSymbolSize},
+    {"_ZN2nn4diag40GetRequiredBufferSizeForGetAllModuleInfoEv", diag_GetRequiredBufferSizeForGetAllModuleInfo},
+    {"_ZN2nn4diag16GetAllModuleInfoEPPNS0_10ModuleInfoEPvm", diag_GetAllModuleInfo},
+    {"_ZN2nn4time10InitializeEv", time_Initialize}, {"_ZN2nn4time13IsInitializedEv", time_IsInitialized}, {"_ZN2nn4time8FinalizeEv", time_Finalize},
+    {"_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE", oe_SetScreenShotImageOrientation},
+    {"_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", oe_SetUserInactivityDetectionTimeExtended},
+    {"_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv", oe_IsUserInactivityDetectionTimeExtended},
     {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", oe_GetDisplayVersion},
     {"_ZN2nn2os17SetMemoryHeapSizeEm", os_SetMemoryHeapSize},
     {"_ZN2nn2os19AllocateMemoryBlockEPmm", os_AllocateMemoryBlock},

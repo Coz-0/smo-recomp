@@ -76,13 +76,18 @@ Say in the pull request which of these you ran:
 - **Lifter changes:** `tools\lifter\difftest.py all` (0 different) and `tools\lifter\difftest_mutation.py` (the
   harness still catches planted bugs).
 - **Shader translator changes:** `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of dumped
-  stages>` (0 different); stages are dumped with `SMO_SHADERDUMP=<folder>` and `SMO_VK_DUMP_MINBYTES=<n>`.
+  stages>` (0 different); stages are dumped with `SMO_SHADERDUMP=<folder>` and `SMO_VK_DUMP_MINBYTES=<n>`. And
+  `tests\check_all_shaders.py`: every stage of the game's shader archives must still translate and compile.
+- **System call changes:** `scripts\run.py selftest --env SMO_IMPORT_SELFTEST=1` (0 failed checks).
 - **Texture layout changes:** `tests\bntx_layout_check.py` (every texture of the RomFS equal).
 - **Changes to the largest-index scan (`runtime/nvn_vk_draw.c`) or the command-list overwrite index
   (`runtime/nvn_gl.c`):** `tests\check_fast_paths.py` (`PASS`: both equal to the plain code on random input).
 - **Anything that can change game behaviour, rendering or timing:** `tests\run_cap_kingdom.py <new run name>` must
   print `RESULT: PASS`.
 - **Input changes:** `scripts\run.py padtest --env SMO_PAD_SELFTEST=1` (every check passes).
+- **Changes to the amiibo menu or the NFC reader:** the `SMO_IMPORT_SELFTEST=1` run above (its `nfp` and `amiibo menu`
+  lines), and a scripted run that opens the menu and scans an amiibo (`docs/SCRIPTED_RUNS.md`): the log must show the
+  game reading it (`nfp: the game read the amiibo's model information`).
 
 Known: `SMO_SDK_SELFTEST=1`, inherited from ssbu-recomp, stops at `log2f`, a function *Super Mario Odyssey* does not
 import; the test, not the runtime, needs adapting.

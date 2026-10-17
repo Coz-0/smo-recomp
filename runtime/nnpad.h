@@ -12,6 +12,7 @@ typedef struct {
     int has_motion;             /* the device has a gyro and accelerometer */
     float accel[3];             /* in G, Nintendo axes (see nnpad_sdl.c; the frame is NOT VERIFIED against a console) */
     float gyro[3];              /* in revolutions per second, same axes */
+    int capture;                /* the pad's share / capture button (SDL misc1) is down: the console's Capture button, not seen by the game */
 } NnPadState;
 
 int  nnpad_init(void);                           /* SDL up (no video, no window); 0 = failed. Also loads controllers.ini. */
@@ -23,6 +24,8 @@ void nnpad_disconnect(int player);               /* DisconnectNpad: hidden until
 void nnpad_swap(int a, int b);                   /* SwapNpadAssignment */
 int  nnpad_keyboard_player(void);                /* 0..7, -1 = nobody; fixed once resolved (see controllers.ini) */
 int  nnpad_kb_vk(int idx);                       /* configured virtual key: 0..15 = Pro buttons, 16..19 = left stick left/up/right/down, 20..23 = right stick; 0 = unbound */
+int  nnpad_hotkey_vk(int which);                 /* [hotkeys]: 0 = the amiibo menu's key (virtual key, 0 = none) */
+unsigned nnpad_hotkey_combo(void);               /* [hotkeys]: Pro button bits a pad holds together to open the amiibo menu, 0 = none */
 int  nnpad_tool(int argc, char **argv);          /* --pad-test / --pad-map <n> / SMO_PAD_TEST: returns the exit code, or -1 if this is no tool request */
 
 /* self-test hooks implemented by nnhid.c (they call the handlers the game calls) */

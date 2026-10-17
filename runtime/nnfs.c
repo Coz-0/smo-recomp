@@ -91,6 +91,7 @@ static void fs_roots(void) {
     CreateDirectoryA(g_user_root, NULL);
 }
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
+const char *fs_rom_root(void) { fs_roots(); return g_rom_root; }           /* smo_ui.c: the game's own files for the host menus */
 
 static int is_dir(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
@@ -586,6 +587,18 @@ static void fs_GetFileSize(Ctx *c) {                  /* (s64 *out, handle) */
     wr64(A0, (uint64_t)size.QuadPart);
     RET(0);
 }
+/* SMO port: SetFileSize (handle, size): the file grows (zero-filled) or is cut to `size`; only on a handle opened for
+ * writing (on a journaled mount that is the working copy, committed with the rest). sead::NinFileDeviceBase::doOpen_
+ * calls it when it opens a file to write it new. FlushFile (handle): what was written reaches the disk. */
+static void fs_SetFileSize(Ctx *c) {
+    LARGE_INTEGER pos;
+    if (!(open_mode((HANDLE)A0, 0) & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
+    if ((int64_t)A1 < 0) { RET(RESULT_OUT_OF_RANGE); return; }
+    pos.QuadPart = (LONGLONG)A1;
+    if (!SetFilePointerEx((HANDLE)A0, pos, NULL, FILE_BEGIN) || !SetEndOfFile((HANDLE)A0)) { RET(RESULT_GENERIC_FAILURE); return; }
+    RET(0);
+}
+static void fs_FlushFile(Ctx *c) { if (open_mode((HANDLE)A0, 0) & 2) FlushFileBuffers((HANDLE)A0); RET(0); }
 /* Where a new entry goes: the working folder of a journaled mount. Result code; `path` = host path to create. */
 static uint32_t create_target(const char *guest, Mount **mount, char *rel, char *path) {
     char host[MAX_PATH];
@@ -837,6 +850,7 @@ static const ImportDef fs_imports[] = {
     {FS("8OpenFileEPNS0_10FileHandleEPKci"), fs_OpenFile}, {FS("9CloseFileENS0_10FileHandleE"), fs_CloseFile},
     {FS("8ReadFileENS0_10FileHandleElPvm"), fs_ReadFile}, {FS("8ReadFileEPmNS0_10FileHandleElPvm"), fs_ReadFileCount},
     {FS("9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE"), fs_WriteFile}, {FS("11GetFileSizeEPlNS0_10FileHandleE"), fs_GetFileSize},
+    {FS("11SetFileSizeENS0_10FileHandleEl"), fs_SetFileSize}, {FS("9FlushFileENS0_10FileHandleE"), fs_FlushFile},
     {FS("10CreateFileEPKcl"), fs_CreateFile}, {FS("10DeleteFileEPKc"), fs_DeleteFile}, {FS("15CreateDirectoryEPKc"), fs_CreateDirectory},
     {FS("12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc"), fs_GetEntryType}, {FS("13OpenDirectoryEPNS0_15DirectoryHandleEPKci"), fs_OpenDirectory},
     {AC("10InitializeEv"), fs_ok}, {AC("12ListAllUsersEPiPNS0_3UidEi"), acc_ListAllUsers},

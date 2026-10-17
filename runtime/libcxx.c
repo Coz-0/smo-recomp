@@ -114,6 +114,16 @@ static void str_substr_ctor(Ctx *c) { t_ctx = c;
     s_init(P(0), s_data(o) + pos, n);
 }
 static void str_dtor(Ctx *c) { t_ctx = c; Str *s = P(0); if (s_long(s)) sbuf_free(s_data(s), "dtor"); }
+/* SMO port: __init(n, ch): n copies of ch (std::ostream's operator<< pads with it: SessionMusicianNpc formats with a
+ * std::stringstream). */
+static void str_init_fill(Ctx *c) { t_ctx = c;
+    size_t n = (size_t)A1;
+    char *tmp = malloc(n ? n : 1);
+    if (!tmp) { guest_trap("libc++ basic_string::__init(n, c): out of host memory", c->x[30] - 4); return; }
+    memset(tmp, (int)(A2 & 0xff), n);
+    s_init(P(0), tmp, n);
+    free(tmp);
+}
 static void str_copy_assign(Ctx *c) { t_ctx = c; Str *o = P(1); if (P(0) != P(1)) s_assign(P(0), s_data(o), s_size(o)); }
 static void str_reserve(Ctx *c) { t_ctx = c; s_reserve(P(0), (size_t)A1); }
 static void str_resize(Ctx *c) { t_ctx = c;
@@ -281,7 +291,8 @@ static const ImportDef cxx_imports[] = {
     {"_Z" STR "6appendEPKc", str_append_cstr}, {"_Z" STR "6appendEPKcm", str_append_n},
     {"_Z" STR "9push_backEc", str_push_back},
     {"_Z" STR "C1ERKS5_", str_copy_ctor}, {"_Z" STR "C1ERKS5_mmRKS4_", str_substr_ctor},
-    {"_Z" STR "D2Ev", str_dtor}, {"_Z" STR "aSERKS5_", str_copy_assign},
+    {"_Z" STR "D2Ev", str_dtor}, {"_Z" STR "D1Ev", str_dtor} /* SMO imports the complete-object form: the same for a string */,
+    {"_Z" STR "6__initEmc", str_init_fill}, {"_Z" STR "aSERKS5_", str_copy_assign},
     {"_Z" STR "7reserveEm", str_reserve}, {"_Z" STR "6resizeEmc", str_resize}, {"_Z" STR "5eraseEmm", str_erase},
     {"_Z" STR "6insertEmPKc", str_insert_cstr}, {"_Z" STR "2atEm", str_at}, {"_Z" STR "9__grow_byEmmmmmm", str_grow_by},
     {"_ZNK" "St3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm", str_find_char},

@@ -51,6 +51,13 @@ static int old_pacing(void) {
 }
 static void vsync_test_key(void);
 
+/* SMO port: while the amiibo menu (smo_amiibo.c) holds the game, the game's vsync event is not signalled: its VSync Count
+ * Thread would count every refresh of the wait and the game would step that many frames at once when it goes on. The menu
+ * paces itself on the same refresh clock (display_menu_wait). */
+static volatile LONG g_menu_hold;
+void display_menu_hold(int on) { InterlockedExchange(&g_menu_hold, on); }
+static int vsync_signal_ok(void) { return !g_menu_hold; }
+
 /* TEST ONLY, SMO_SPEED=<n> (debug_mode.c, tests\DEBUG_MODE.md): 2, 4 (any number > 0) = the refresh clock runs n times
  * faster; 0 = uncapped. Not set or 1 = nothing changes. In this mode there is no free-running vsync thread: the refresh is
  * given when the frame the game queued is due, ONE refresh per queued frame (interval 1), the event is signalled and the
@@ -69,13 +76,26 @@ static void speed_init(void) {
 }
 
 int oe_exit_request(void);                            /* nnmisc.c */
+static volatile LONG g_closing;
+int display_closing(void) { return g_closing != 0; }  /* smo_amiibo.c: the menu gives way to the game when the window is being closed */
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+        InterlockedExchange(&g_closing, 1);
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
         if (!oe_exit_request()) report_and_exit(0);
         return 0;
     }
     if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) {      /* SMO port: F12 = the console's Capture button (once per press) */
+        void smo_capture_request(void);
+        smo_capture_request();
+        return 0;
+    }
+    if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && !(l & (1 << 30))) {   /* SMO port: the amiibo menu's key (controllers.ini [hotkeys], F1 by default) */
+        int nnpad_hotkey_vk(int which); void amiibo_menu_request(void);
+        int vk = nnpad_hotkey_vk(0);
+        if (vk && (int)w == vk) { amiibo_menu_request(); return 0; }
+    }
     return DefWindowProcA(h, m, w, l);
 }
 
@@ -151,7 +171,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
-            if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
+            if (g_vsync_event && vsync_signal_ok()) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
             AcquireSRWLockExclusive(&g_vsync_lock);
             InterlockedExchange64(&g_vsync_n, n);
             ReleaseSRWLockExclusive(&g_vsync_lock);
@@ -166,7 +186,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         QueryPerformanceCounter(&now);
         LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / g_freq.QuadPart;
         if (ms > 0) Sleep((DWORD)ms); else next = now;
-        if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
+        if (g_vsync_event && vsync_signal_ok()) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
         vsync_test_key();
     }
 }
@@ -318,6 +338,15 @@ int display_wait_refresh(void) {
     QueryPerformanceCounter(&b);
     nvn_pf_pace(b.QuadPart - a.QuadPart);
     return 1;
+}
+/* smo_amiibo.c: the menu's own pace while it holds the game: until the next refresh of the clock (16 ms where there is no
+ * refresh clock: SMO_SPEED, SMO_OLD_PACING) */
+void display_menu_wait(void) {
+    if (old_pacing() || g_lockstep) { Sleep(16); return; }
+    LONG64 n = g_vsync_n;
+    AcquireSRWLockExclusive(&g_vsync_lock);
+    while (g_vsync_n == n) if (!SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0)) break;
+    ReleaseSRWLockExclusive(&g_vsync_lock);
 }
 /* Before a present: a frame queued earlier that nobody waited for (a caller that does not wait on the window sync). */
 void display_before_present(void) {

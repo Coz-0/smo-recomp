@@ -15,8 +15,10 @@
  *   SMO_VK_VALIDATE=1        enable VK_LAYER_KHRONOS_validation and print its messages (says so if not installed)
  *   SMO_VK_DEVICE=<i>        take physical device i of the printed list instead of the preferred one
  *   SMO_VK_PRESENT=mailbox|immediate|fifo   present mode (default: mailbox, else immediate, else fifo: the pacing is ours)
- *   SMO_VK_MISSING=warn      development only: an operation that is not implemented is reported once, counted and
- *                             skipped instead of stopping the game (the picture is then NOT the game's)
+ *   SMO_VK_MISSING=exit      an operation that is not implemented stops the game (exit code 7) at once, naming it. The
+ *                             default is to report it once, count it ("calls of operations that are not implemented" at
+ *                             exit, which the tests require to be 0) and skip it: a player sees a wrong picture for that
+ *                             operation instead of a closed game. (=warn, the earlier switch for the default, is accepted.)
  *
  * Vulkan declarations: vk_min.h (see there why it is not the Khronos header). The loader is vulkan-1.dll. */
 #include <stdio.h>
@@ -144,20 +146,21 @@ static int vk_ok(const char *what, VkResult r) {
     return 0;
 }
 
-/* An NVN operation this back end does not implement yet: named, and the game stops (exit code 7). */
+/* An NVN operation this back end does not implement: named once and counted; the caller skips it. SMO_VK_MISSING=exit: the
+ * game stops (exit code 7). */
 void nvn_vk_missing(const char *what) {
     static const char *seen[64];
     static int nseen;
-    if (g_vk_missing_warn < 0) { const char *e = getenv("SMO_VK_MISSING"); g_vk_missing_warn = e && !strcmp(e, "warn"); }
+    if (g_vk_missing_warn < 0) { const char *e = getenv("SMO_VK_MISSING"); g_vk_missing_warn = !(e && !strcmp(e, "exit")); }
     InterlockedIncrement64(&g_vk_missing_calls);
     if (!g_vk_missing_warn) {
-        printf("nvn_vk: NOT IMPLEMENTED in the Vulkan back end: %s. The game stops here (plan\\phases\\V1_vulkan.md; SMO_RENDERER=gl is the working renderer).\n", what);
+        printf("nvn_vk: NOT IMPLEMENTED in the Vulkan back end: %s. SMO_VK_MISSING=exit: the game stops here.\n", what);
         fflush(stdout);
         ExitProcess(7);
     }
     for (int i = 0; i < nseen; i++) if (seen[i] == what) return;
     if (nseen < 64) seen[nseen++] = what;
-    printf("nvn_vk: NOT IMPLEMENTED (SMO_VK_MISSING=warn: skipped, the picture is not the game's): %s\n", what);
+    printf("nvn_vk: NOT IMPLEMENTED in the Vulkan back end, skipped (the picture is not the game's there): %s\n", what);
     fflush(stdout);
 }
 

@@ -500,6 +500,8 @@ static uint64_t desired_language(void) {
     return v;
 }
 static void oe_GetDesiredLanguage(Ctx *c) { RET(desired_language()); }   /* LanguageCode (8 chars) by value in x0 */
+/* smo_amiibo.c: the same language as text ("en-US", ...), for the game's message files of the host menus */
+const char *oe_language(void) { static char code[9]; uint64_t v = desired_language(); memcpy(code, &v, 8); code[8] = 0; return code; }
 
 /* ---------------------------------------------------------------- nn::err
  * [sdk] ErrorResultVariant { uint32_t state @0 (0 none, 1 Result, 2 ErrorCode); payload @4:

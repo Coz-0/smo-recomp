@@ -87,3 +87,16 @@ family ^_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4u
 family ^_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE$
 # the vibration queue's one request to the hid module (runtime/nnhid.c hid_SendVibrationValues)
 cut _ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi
+
+# nn::util: the NintendoWare binary file helpers and the UTF-8 / UTF-16 conversions, pure functions over guest memory.
+# Relocate is lifted with Unrelocate, so that one undoes exactly what the other did (it replaces runtime/nnsdk.c's host
+# Relocate, which added a section's base without taking off the section's position). Users in the game: unloading of
+# g3d / font / ui2d / vfx resources, the IsValid checks of g3d and gfx resource files, nn::font's formatted text.
+family ^_ZN2nn4util15RelocationTable(8Relocate|10Unrelocate)Ev$
+family ^_ZN2nn4util16BinaryFileHeader12SetRelocatedEb$
+family ^_ZNK2nn4util16BinaryFileHeader7IsValidEliii$
+family ^_ZN2nn4util30ConvertString(Utf16NativeToUtf8EPciPKti|Utf8ToUtf16NativeEPtiPKci)$
+
+# nn::web: the offline page's argument (TLV writers) and return value (readers) of SMO's Help (al::HtmlViewer::call);
+# ShowOfflineHtmlPage itself is the host's (runtime/nnapplet.c: the page opens in the PC's web browser)
+family ^_ZNK?2nn3web(22ShowOfflineHtmlPageArg|26OfflineHtmlPageReturnValue|36ShowOfflineHtmlPageArgWithPlayReport)

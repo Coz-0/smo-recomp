@@ -35,6 +35,8 @@ typedef struct {
     char ignore[16][40]; int nignore;   /* [general] ignore = <GUID>: devices that are never used */
     int kb_player;                      /* -2 auto, -1 none, 0..7 */
     int kb_vk[24];
+    int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
+    unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -163,6 +165,13 @@ static const char *const g_default_ini =
 "LSTICK_LEFT = LEFT\r\nLSTICK_UP = UP\r\nLSTICK_RIGHT = RIGHT\r\nLSTICK_DOWN = DOWN\r\n"
 "RSTICK_LEFT = none\r\nRSTICK_UP = none\r\nRSTICK_RIGHT = none\r\nRSTICK_DOWN = none\r\n"
 "\r\n"
+"[hotkeys]\r\n"
+"; The amiibo menu (in the style of the game's pause menu; the game waits while it is open): a key of the keyboard (as above;\r\n"
+"; pressed again it closes the menu) and the Pro Controller buttons any pad holds together for it, joined with +; none = no key /\r\n"
+"; no combination. Without this section: F1 and STICK_L+STICK_R (both sticks pressed in).\r\n"
+"amiibo_menu = F1\r\n"
+"amiibo_menu_pad = STICK_L+STICK_R\r\n"
+"\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
 "; name = Example pad\r\n"
@@ -188,6 +197,22 @@ static void cfg_defaults(Cfg *c) {
     c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
+    c->hk_vk = VK_F1;
+    c->hk_combo = 1u << 4 | 1u << 5;                      /* STICK_L + STICK_R */
+}
+static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -> Pro button bits; none / unknown names -> 0 */
+    unsigned bits = 0;
+    for (char *tok = v; tok && *tok; ) {
+        char *plus = strchr(tok, '+');
+        if (plus) *plus = 0;
+        while (*tok == ' ' || *tok == '\t') tok++;
+        for (char *p = tok + strlen(tok); p > tok && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
+        int found = 0;
+        for (int b = 0; b < 16; b++) if (!_stricmp(tok, g_pro[b])) { bits |= 1u << b; found = 1; }
+        if (!found) return 0;
+        tok = plus ? plus + 1 : NULL;
+    }
+    return bits;
 }
 static int parse_vk(const char *t) {
     char b[24];
@@ -252,6 +277,7 @@ static void cfg_parse(Cfg *c, char *text) {
             if (e) *e = 0;
             if (!_stricmp(line + 1, "general")) sect = 1; else if (!_stricmp(line + 1, "players")) sect = 2;
             else if (!_stricmp(line + 1, "keyboard")) sect = 3;
+            else if (!_stricmp(line + 1, "hotkeys")) sect = 5;
             else if (!_strnicmp(line + 1, "device ", 7)) { char *g = line + 8; while (*g == ' ') g++; cur = cfg_find(c, g, 1); sect = cur ? 4 : 0; }
             else sect = 0;
             continue;
@@ -274,6 +300,9 @@ static void cfg_parse(Cfg *c, char *text) {
         } else if (sect == 3) {
             if (!_stricmp(key, "player")) c->kb_player = !_stricmp(val, "auto") ? -2 : !_stricmp(val, "none") ? -1 : atoi(val) >= 1 && atoi(val) <= 8 ? atoi(val) - 1 : -2;
             else for (int i = 0; i < 24; i++) if (!_stricmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
+        } else if (sect == 5) {
+            if (!_stricmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
+            else if (!_stricmp(key, "amiibo_menu_pad")) c->hk_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
         }
     }
 }
@@ -588,6 +617,9 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
         *px = (int)(x * k * 32767.0f + (x * k >= 0 ? 0.5f : -0.5f)); *py = (int)(y * k * 32767.0f + (y * k >= 0 ? 0.5f : -0.5f));
     }
     sensors(d, o);
+    /* SMO port: SDL's misc1 is the Switch Pro Controller's capture button, the Xbox Series pad's share button, the
+     * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
+    o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
 
@@ -673,6 +705,14 @@ int nnpad_keyboard_player(void) {
 int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return idx >= 0 && idx < 24 ? g_cfg.kb_vk[idx] : 0;
+}
+int nnpad_hotkey_vk(int which) {
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    return which == 0 ? g_cfg.hk_vk : 0;
+}
+unsigned nnpad_hotkey_combo(void) {
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    return g_cfg.hk_combo;
 }
 
 /* ================================================================ tools: --pad-test, --pad-map */
@@ -936,6 +976,24 @@ int nnpad_selftest(const NnHidHooks *h) {
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_GUIDE, true); settle(); h->state(0, &btn, st, &attr);
         check(btn == 0, "guide/home is not mapped (no Pro bit)");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
+    }
+
+    /* ---- SMO port: the amiibo menu's button combination ([hotkeys], default both stick buttons): asked for once per press of the
+     * whole combination, not by one of its buttons alone */
+    {
+        int amiibo_menu_take_request(void);
+        int took[4];
+        amiibo_menu_take_request();
+        check(nnpad_hotkey_vk(0) == VK_F1 && nnpad_hotkey_combo() == (1u << 4 | 1u << 5), "[hotkeys] defaults: the amiibo menu on F1 and on STICK_L+STICK_R");
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[0] = amiibo_menu_take_request();
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[1] = amiibo_menu_take_request();
+        h->state(0, &btn, st, &attr); took[2] = amiibo_menu_take_request();
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6); settle(); h->state(0, &btn, st, &attr);
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, true); SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, true);
+        settle(); h->state(0, &btn, st, &attr); took[3] = amiibo_menu_take_request();
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6); settle(); h->state(0, &btn, st, &attr);
+        check(!took[0] && took[1] && !took[2] && took[3], "amiibo menu combination: not by the left stick button alone, once when both are down, not again while held, again after release");
     }
 
     /* ---- axes */

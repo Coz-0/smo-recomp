@@ -279,6 +279,31 @@ void nerve_call(Ctx *c, uint64_t addr) {
     g_nerve_lock = 0;
 }
 
+/* SMO port, the amiibo menu (smo_amiibo.c, nnhid.c): two nerve states watched without the tracker. hostrt.c call_indirect
+ * compares each indirect call with their execute functions (two compares while a watch is set, none before) and the frame
+ * either last ran is kept. The names are resolved with the tracker's list (loaded here once if the tracker is off). */
+volatile uint64_t g_nerve_watch[2];
+static volatile LONG64 g_watch_frame = -1;
+void nerve_watch_hit(void) { g_watch_frame = nvn_front_frame_next(); }
+long long nerve_watch_last(void) { return g_watch_frame; }
+int nerve_watch_set(const char *a, const char *b) {
+    static int loaded;
+    if (g_nerve_mode < 0) nerve_init();
+    if (g_nrv_count == 0 && !loaded) { loaded = 1; nerve_load(); }
+    uint64_t found[2] = {0, 0};
+    for (int i = 0; i < g_nrv_count; i++) {
+        if (!strcmp(g_nrv[i].name, a)) found[0] = g_nrv[i].addr;
+        if (b && !strcmp(g_nrv[i].name, b)) found[1] = g_nrv[i].addr;
+    }
+    static int said;
+    if (!said++) printf("nerve: watching %s (%s) and %s (%s)\n", a, found[0] ? "found" : "NOT found", b ? b : "-", found[1] ? "found" : "NOT found");
+    if (!found[0]) found[0] = found[1];                   /* call_indirect tests the first one first */
+    if (!found[1]) found[1] = found[0];
+    g_nerve_watch[1] = found[1];
+    g_nerve_watch[0] = found[0];
+    return found[0] != 0;
+}
+
 /* SMO_SEQ "@nerve:<name>": did that nerve run in this frame or the one before? Unknown names are reported once. */
 int nerve_active(const char *name) {
     if (g_nerve_mode < 0) nerve_init();

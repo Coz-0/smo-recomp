@@ -21,7 +21,7 @@
 typedef void *shc_compiler;
 typedef void *shc_options;
 typedef void *shc_result;
-enum { SHC_VERTEX = 0, SHC_FRAGMENT = 1, SHC_COMPUTE = 2 };            /* shaderc_shader_kind */
+enum { SHC_VERTEX = 0, SHC_FRAGMENT = 1, SHC_COMPUTE = 2, SHC_GEOMETRY = 3 };      /* shaderc_shader_kind */
 enum { SHC_ENV_VULKAN = 0 };                                           /* shaderc_target_env_vulkan */
 #define SHC_ENV_VULKAN_1_3 ((1u << 22) | (3 << 12))                    /* shaderc_env_version_vulkan_1_3 */
 #define SHC_SPIRV_1_6 0x010600u                                        /* shaderc_spirv_version_1_6 */
@@ -79,8 +79,8 @@ __declspec(dllexport) int smo_glsl_to_spirv(int stage, const char *src, uint32_t
     if (log && log_size) log[0] = 0;
     *words = NULL; *count = 0;
     if (!InitOnceExecuteOnce(&g_once, init_once, NULL, NULL)) { if (log) snprintf(log, log_size, "%s", g_load_error); return 0; }
-    int kind = stage == 0 ? SHC_VERTEX : stage == 1 ? SHC_FRAGMENT : stage == 5 ? SHC_COMPUTE : -1;
-    if (kind < 0) { if (log) snprintf(log, log_size, "stage %d is not vertex (0), fragment (1) or compute (5)", stage); return 0; }
+    int kind = stage == 0 ? SHC_VERTEX : stage == 1 ? SHC_FRAGMENT : stage == 2 ? SHC_GEOMETRY : stage == 5 ? SHC_COMPUTE : -1;
+    if (kind < 0) { if (log) snprintf(log, log_size, "stage %d is not vertex (0), fragment (1), geometry (2) or compute (5)", stage); return 0; }
     shc_result r = S.compile_into_spv(g_compiler, src, strlen(src), kind, "nvn_stage", "main", g_options);
     if (!r) { if (log) snprintf(log, log_size, "shaderc_compile_into_spv returned no result"); return 0; }
     const char *msg = S.result_get_error_message(r);

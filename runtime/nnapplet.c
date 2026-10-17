@@ -1,6 +1,6 @@
 /* Library applets and small device services, as an OFFLINE console answers them:
  * nn::web (offline HTML page, web page, YouTube, lobby), nn::swkbd::ShowKeyboard, nn::ec shop pages,
- * the amiibo settings applets, nn::nfp (NFC reader with no amiibo ever presented), nn::oe volume balance.
+ * the amiibo settings applets, nn::nfp (an NFC reader to which the amiibo menu holds amiibo), nn::oe volume balance.
  *
  * Everything that only fills a caller structure (nn::web *Arg constructors and setters, *ReturnValue
  * constructors and getters, nn::swkbd MakePreset / Set*Text / SetInitialText / SetTextCheckCallback /
@@ -48,11 +48,29 @@
  * variable the dialog is used unless an input script (SMO_SEQ / SMO_PRESS / SMO_SCRIPT) is active.
  *
  * ---- nn::nfp
- * Console modelled: the player-1 controller has an NFC reader (as a Pro Controller / right Joy-Con does)
- * and no amiibo is ever held to it. [sdk] 0x309900 GetState: 0 before Initialize, the service's state
- * after (1 = initialised); [sdk] 0x309a84 GetDeviceState: 5 before Initialize. [doc] suyu nfc_types.h
- * DeviceState 0 Initialized, 1 SearchingForTag, 2 TagFound, 3 TagRemoved, 4 TagMounted, 5 Unavailable;
- * nfp_result.h (module 115): DeviceNotFound 64, InvalidArgument 65, WrongDeviceState 73.
+ * Console modelled: the player-1 controller has an NFC reader (as a Pro Controller / right Joy-Con does).
+ * An amiibo is held to it only by the amiibo menu (smo_amiibo.c, nfp_place_amiibo): the reader then finds
+ * it the next time the game searches, the game mounts it and reads its tag and model information, and the
+ * amiibo is taken away again once the game has read it (one touch). [sdk] 0x309900 GetState: 0 before
+ * Initialize, the service's state after (1 = initialised); [sdk] 0x309a84 GetDeviceState: 5 before
+ * Initialize. [doc] suyu nfc_types.h DeviceState 0 Initialized, 1 SearchingForTag, 2 TagFound,
+ * 3 TagRemoved, 4 TagMounted, 5 Unavailable; nfp_result.h (module 115): DeviceNotFound 64,
+ * InvalidArgument 65, WrongDeviceState 73, TagRemoved 97.
+ * The transitions are suyu's (core/hle/service/nfc/common/device.cpp): StartDetection from Initialized or
+ * TagRemoved to SearchingForTag; a tag in the field: TagFound, the deactivate event cleared and the
+ * activate event signalled; Mount: TagFound -> TagMounted; Unmount: back to TagFound; the tag leaving the
+ * field: TagRemoved (unmounted first), the activate event cleared and the deactivate event signalled;
+ * StopDetection: the tag closed if there is one, then Initialized.
+ * The events are attached as AutoClear ([smo sdk.elf] 0x12e220: AttachReadableHandleToSystemEvent with
+ * clear mode 1). How the game uses the reader (al::NfpControllerThread, [game] 0x95efa8): AttachEvent,
+ * then StartDetection; TagDetect polls GetDeviceState and waits 100 us on the activate event every 60 ms;
+ * Mount(handle, ModelType 0, MountTarget 1); TagRead: GetTagInfo and GetModelInfo; Deactive: Unmount,
+ * then GetDeviceState every 60 ms while it says TagFound, and StartDetection again once the tag is gone.
+ * TagInfo ([doc] suyu nfc_types.h, 0x58 bytes): uuid[10] @0, uuid length @0xa, protocol u32 @0x20
+ * (1 = type A), tag type u32 @0x24 (2 = type 2: an amiibo is an NTAG215). ModelInfo (0x40 bytes) as
+ * the game reads it ([game] 0x960478 al::isEqualCharacterId, 0x960530 al::isEqualNumberingId): the
+ * amiibo's identification block as stored on the tag, bytes 0 and 1 (game and character), 2 (variant),
+ * 3 (type), the model number at 4 as a little-endian u16 (big-endian on the tag), 6 (series).
  * [sdk] 0x308814 amiibo settings applet closed without a change: Result 0x1a073 (module 115, description 208).
  * NOT VERIFIED on a console: the DeviceHandle value (8 bytes; the npad id 0 is used), and the Result of
  * calls made before Initialize (WrongDeviceState is returned). */
@@ -71,6 +89,8 @@
 #define P(v) ((uint64_t)(uintptr_t)(v))
 
 void os_init_event(uint64_t key, int autoclear);          /* os_threads.c */
+void os_signal_event(uint64_t key);
+void os_clear_event(uint64_t key);
 
 /* ================================================================ nn::web */
 #define WEB_RESULT_TERMINATED 0x2d2u
@@ -123,7 +143,142 @@ static void web_fill_tlv(uint64_t ret, uint32_t shim_kind) {   /* 0x2000 bytes *
  * reason is 0x14 or 0xc and 1 for anything else -- so the unknown exit reason IS visible to the game there;
  * [game] 0x71017634cc / 0x7103341bac ShowYouTubeVideo: reads IsMediaPlayerAutoClosedByCompletion (TLV 9, absent here =
  * false). */
-static void web_ShowOfflineHtmlPage(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowOfflineHtmlPage", A1); web_fill_common(ret); RET(0); }
+/* SMO port: ShowOfflineHtmlPage with the game's own offline document: SMO's Help (al::HtmlViewer::call asks for
+ * "htmlcontents.htdocs/html/<region and language>/index.html<query>"). On the console the browser applet shows the page
+ * full screen and the game waits until the player closes it. Here the page opens in the PC's web browser from the
+ * extracted document (scripts/setup.py step `manual` -> build\manual, read as ..\manual from the exe's folder, or
+ * SMO_MANUAL=<folder>), and the call returns at once as closed by the player.
+ * The page's script uses the console browser's window.nx (footer buttons L / R / B, endApplet, play reports) before
+ * anything else and stops without it; so it is shown from a copy next to it (<name>_pc.html, written once) that first
+ * loads nx_pc.js (written into the document's js folder): the footer buttons answer to the keyboard (Q / E or Page Up /
+ * Page Down for L / R, Escape or Backspace for B; the page's own arrow keys stay) and to a pad through the browser's
+ * Gamepad API (shoulder buttons L / R, bottom face button B, right face button A, D-pad = arrow keys), endApplet closes
+ * the tab, play reports do nothing. A file URL with a query cannot be opened by name, so a small page in %TEMP%
+ * forwards to it. Without the document the page is answered as closed, as before. */
+static const char g_nx_pc_js[] =
+    "/* smo-recomp: window.nx of the console's browser applet, for SMO's Help in a PC browser (written by the runtime) */\n"
+    "(function () {\n"
+    "  var keys = {};\n"
+    "  function press(b) { if (keys[b]) keys[b](); }\n"
+    "  function arrow(code) { if (document.onkeydown) document.onkeydown({ keyCode: code, preventDefault: function () {} }); }\n"
+    "  document.addEventListener('keydown', function (e) {\n"
+    "    var k = e.key;\n"
+    "    if (k === 'Escape' || k === 'Backspace') { e.preventDefault(); press('B'); }\n"
+    "    else if (k === 'q' || k === 'Q' || k === 'PageUp') { e.preventDefault(); press('L'); }\n"
+    "    else if (k === 'e' || k === 'E' || k === 'PageDown') { e.preventDefault(); press('R'); }\n"
+    "  }, true);\n"
+    "  var was = [];\n"
+    "  function poll() {\n"
+    "    var pads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
+    "    for (var i = 0; i < pads.length; i++) {\n"
+    "      var p = pads[i];\n"
+    "      if (!p || p.mapping !== 'standard') continue;\n"
+    "      var w = was[i] || [];\n"
+    "      for (var b = 0; b < p.buttons.length && b < 16; b++) {\n"
+    "        var on = p.buttons[b].pressed;\n"
+    "        if (on && !w[b]) {\n"
+    "          if (b === 0) press('B'); else if (b === 4) press('L'); else if (b === 5) press('R');\n"
+    "          else if (b === 1 && document.activeElement && document.activeElement.click) document.activeElement.click();\n"
+    "          else if (b === 12) arrow(38); else if (b === 13) arrow(40); else if (b === 14) arrow(37); else if (b === 15) arrow(39);\n"
+    "        }\n"
+    "        w[b] = on;\n"
+    "      }\n"
+    "      was[i] = w;\n"
+    "    }\n"
+    "    requestAnimationFrame(poll);\n"
+    "  }\n"
+    "  requestAnimationFrame(poll);\n"
+    "  window.nx = {\n"
+    "    footer: { setAssign: function (b, label, fn) { keys[b] = fn; }, unsetAssign: function (b) { delete keys[b]; } },\n"
+    "    playReport: { setCounterSetIdentifier: function () {}, incrementCounter: function () {} },\n"
+    "    endApplet: function () {\n"
+    "      window.close();\n"
+    "      setTimeout(function () { document.body.innerHTML = '<p style=\"color:#fff;font:20px sans-serif;padding:2em\">Close this tab to return to the game.</p>'; }, 300);\n"
+    "    }\n"
+    "  };\n"
+    "})();\n";
+static int write_if_differs(const char *path, const char *data, size_t n) {
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        char *old = malloc(n + 1);
+        size_t got = old ? fread(old, 1, n + 1, f) : 0;
+        fclose(f);
+        int same = old && got == n && !memcmp(old, data, n);
+        free(old);
+        if (same) return 1;
+    }
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    int ok = fwrite(data, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+static void url_append(char *url, size_t cap, const char *s) {      /* a path as a file URL: forward slashes, %XX escapes */
+    size_t n = strlen(url);
+    for (; *s && n + 4 < cap; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch == '\\') url[n++] = '/';
+        else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || strchr("/:._-~", ch)) url[n++] = (char)ch;
+        else n += (size_t)snprintf(url + n, cap - n, "%%%02X", ch);
+    }
+    url[n] = 0;
+}
+static int web_open_offline(const char *doc) {
+    char root[MAX_PATH], path[MAX_PATH], full[MAX_PATH], pc[MAX_PATH], js[MAX_PATH];
+    const char *env = getenv("SMO_MANUAL"), *q = strpbrk(doc, "?#");
+    size_t plen = q ? (size_t)(q - doc) : strlen(doc);
+    snprintf(root, sizeof root, "%s", env && env[0] ? env : "..\\manual");
+    snprintf(path, sizeof path, "%s\\html-document\\%.*s", root, (int)plen, doc);
+    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
+    if (!GetFullPathNameA(path, sizeof full, full, NULL) || GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES) {
+        printf("nn::web::ShowOfflineHtmlPage: %s not found (run scripts\\setup.py --only manual)\n", full);
+        return 0;
+    }
+    /* nx_pc.js: <document root>\htmlcontents.htdocs\js\nx_pc.js, the page's own js folder when the path has that form */
+    char *html = strstr(full, "\\html\\");
+    snprintf(js, sizeof js, "%.*s\\js\\nx_pc.js", html ? (int)(html - full) : 0, full);
+    if (!html || !write_if_differs(js, g_nx_pc_js, sizeof g_nx_pc_js - 1)) { printf("nn::web::ShowOfflineHtmlPage: cannot write %s\n", js); return 0; }
+    /* <name>_pc.html: the page with nx_pc.js loaded first */
+    FILE *f = fopen(full, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *src = malloc((size_t)size + 1), *out = malloc((size_t)size + 256);
+    if (!src || !out || fread(src, 1, (size_t)size, f) != (size_t)size) { fclose(f); free(src); free(out); return 0; }
+    fclose(f);
+    src[size] = 0;
+    const char *tag = "<script src=\"../../js/nx_pc.js\"></script>";
+    char *head = NULL;
+    for (char *p = src; *p && !head; p++) if (!_strnicmp(p, "<head", 5)) head = strchr(p, '>');
+    size_t at = head ? (size_t)(head + 1 - src) : 0, n = 0;
+    memcpy(out, src, at); n = at;
+    n += (size_t)sprintf(out + n, "%s", tag);
+    memcpy(out + n, src + at, (size_t)size - at); n += (size_t)size - at;
+    snprintf(pc, sizeof pc, "%.*s_pc.html", (int)(strlen(full) - 5), full);       /* ...\index.html -> ...\index_pc.html */
+    int ok = strlen(full) > 5 && !_stricmp(full + strlen(full) - 5, ".html") && write_if_differs(pc, out, n);
+    free(src); free(out);
+    if (!ok) { printf("nn::web::ShowOfflineHtmlPage: cannot write %s\n", pc); return 0; }
+    /* the forwarding page, then the default browser */
+    char url[4096] = "file:///", fwd[MAX_PATH], tmp[MAX_PATH], page[8192];
+    url_append(url, sizeof url, pc);
+    if (q) snprintf(url + strlen(url), sizeof url - strlen(url), "%s", q);
+    if (!GetTempPathA(sizeof tmp, tmp)) return 0;
+    snprintf(fwd, sizeof fwd, "%ssmo-recomp-help.html", tmp);
+    int pn = snprintf(page, sizeof page, "<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url=%s\">"
+                      "<title>Super Mario Odyssey - Help</title><a href=\"%s\">Help</a>\n", url, url);
+    if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
+    if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }    /* self-test */
+    HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
+    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
+    return (INT_PTR)r > 32;
+}
+static void web_ShowOfflineHtmlPage(Ctx *c) {
+    uint64_t ret = A0;
+    const char *doc = web_arg_string(A1, 6);
+    if (!doc || !web_open_offline(doc)) web_log(c, "nn::web::ShowOfflineHtmlPage", A1);
+    web_fill_common(ret);
+    RET(0);
+}
 static void web_ShowLobbyPage(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowLobbyPage", A1); web_fill_common(ret); RET(0); }
 static void web_ShowWebPage(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowWebPage", A1); web_fill_tlv(ret, 5); RET(0); }     /* [doc] ShimKind::Web = 5 */
 static void web_ShowYouTubeVideo(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowYouTubeVideo", A1); web_fill_tlv(ret, 5); RET(0); }
@@ -350,12 +505,60 @@ static void swkbd_ShowKeyboard(Ctx *c) {
 #define NFP_RESULT(desc) ((uint32_t)(115 | ((desc) << 9)))
 #define NFP_WRONG_STATE NFP_RESULT(73)
 #define NFP_INVALID_ARGUMENT NFP_RESULT(65)
+#define NFP_TAG_REMOVED NFP_RESULT(97)
 #define NFP_SETTINGS_CLOSED 0x1a073u
-static volatile LONG g_nfp_init, g_nfp_searching;
-static void nfp_Initialize(Ctx *c) { (void)c; g_nfp_init = 1; g_nfp_searching = 0; }
-static void nfp_Finalize(Ctx *c) { (void)c; g_nfp_init = 0; g_nfp_searching = 0; }
+enum { NFP_INITIALIZED, NFP_SEARCHING, NFP_FOUND, NFP_REMOVED, NFP_MOUNTED, NFP_UNAVAILABLE };
+/* The reader. Its calls come from the game's NFC thread, the amiibo from the amiibo menu on the game's main thread. */
+static SRWLOCK g_nfp_lock = SRWLOCK_INIT;
+static int g_nfp_init, g_nfp_state = NFP_UNAVAILABLE;
+static uint64_t g_nfp_ev_on, g_nfp_ev_off;                 /* the game's activate / deactivate SystemEventType, 0 = not attached */
+static struct { int held, read; uint8_t id[8], uid[7]; } g_tag;   /* the amiibo held to the reader; read = the game has its model information */
+static volatile LONG g_nfp_reads;                          /* amiibo the game has read (smo_amiibo.c shows it) */
+static void nfp_lock(void) { AcquireSRWLockExclusive(&g_nfp_lock); }
+static void nfp_unlock(void) { ReleaseSRWLockExclusive(&g_nfp_lock); }
+static void nfp_tag_arrives(void) {                       /* lock held, state SearchingForTag, an amiibo held */
+    g_nfp_state = NFP_FOUND;
+    if (g_nfp_ev_off) os_clear_event(g_nfp_ev_off);
+    if (g_nfp_ev_on) os_signal_event(g_nfp_ev_on);
+    printf("nfp: amiibo %02x%02x%02x%02x %02x%02x%02x%02x found by the reader\n", g_tag.id[0], g_tag.id[1], g_tag.id[2], g_tag.id[3], g_tag.id[4], g_tag.id[5], g_tag.id[6], g_tag.id[7]);
+}
+static void nfp_tag_leaves(void) {                        /* lock held, state TagFound or TagMounted */
+    g_nfp_state = NFP_REMOVED;
+    if (g_nfp_ev_on) os_clear_event(g_nfp_ev_on);
+    if (g_nfp_ev_off) os_signal_event(g_nfp_ev_off);
+    if (g_tag.read) { g_tag.held = 0; printf("nfp: amiibo taken away from the reader after the game read it\n"); }
+}
+/* smo_amiibo.c: hold an amiibo (its 8-byte identification block) to the reader, in place of the one there; NULL takes it away. */
+void nfp_place_amiibo(const uint8_t *id) {
+    nfp_lock();
+    if (g_nfp_state == NFP_FOUND || g_nfp_state == NFP_MOUNTED) nfp_tag_leaves();        /* the one there is taken away first */
+    memset(&g_tag, 0, sizeof g_tag);
+    if (id) {
+        uint32_t h = 2166136261u;                          /* a serial number of its own per kind of amiibo: 0x04 (NXP) + 6 bytes */
+        g_tag.held = 1;
+        memcpy(g_tag.id, id, 8);
+        g_tag.uid[0] = 0x04;
+        for (int i = 1; i < 7; i++) { for (int k = 0; k < 8; k++) h = (h ^ id[k]) * 16777619u; h = (h ^ (uint32_t)i) * 16777619u; g_tag.uid[i] = (uint8_t)(h >> 13); }
+        printf("nfp: amiibo %02x%02x%02x%02x %02x%02x%02x%02x held to the reader (reader %s)\n", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+               g_nfp_state == NFP_SEARCHING ? "searching" : g_nfp_init ? "not searching: found at the next search" : "not initialised");
+        if (g_nfp_state == NFP_SEARCHING) nfp_tag_arrives();
+    }
+    nfp_unlock();
+}
+/* smo_amiibo.c: is an amiibo held that the game has not read yet; how many the game has read so far */
+int nfp_amiibo_waiting(void) { nfp_lock(); int w = g_tag.held && !g_tag.read; nfp_unlock(); return w; }
+long nfp_amiibo_reads(void) { return g_nfp_reads; }
+
+static void nfp_Initialize(Ctx *c) { (void)c; nfp_lock(); g_nfp_init = 1; g_nfp_state = NFP_INITIALIZED; nfp_unlock(); }
+static void nfp_Finalize(Ctx *c) {
+    (void)c;
+    nfp_lock();
+    if (g_nfp_state == NFP_FOUND || g_nfp_state == NFP_MOUNTED) nfp_tag_leaves();
+    g_nfp_init = 0; g_nfp_state = NFP_UNAVAILABLE;
+    nfp_unlock();
+}
 static void nfp_GetState(Ctx *c) { RET(g_nfp_init ? 1 : 0); }
-static void nfp_GetDeviceState(Ctx *c) { RET(!g_nfp_init ? 5 : g_nfp_searching ? 1 : 0); }
+static void nfp_GetDeviceState(Ctx *c) { RET(g_nfp_state); }
 static void nfp_ListDevices(Ctx *c) {                      /* (DeviceHandle *out, int *outCount, int max) */
     if (A1) wr32(A1, 0);
     if (!g_nfp_init) { RET(NFP_WRONG_STATE); return; }
@@ -365,17 +568,79 @@ static void nfp_ListDevices(Ctx *c) {                      /* (DeviceHandle *out
     RET(0);
 }
 static void nfp_GetNpadId(Ctx *c) { if (!g_nfp_init) { RET(NFP_WRONG_STATE); return; } wr32(A0, 0); RET(0); }   /* (uint32_t *out, handle) */
-static void nfp_AttachEvent(Ctx *c) { os_init_event(A0, 0); RET(g_nfp_init ? 0 : NFP_WRONG_STATE); }            /* never signalled: no tag ever appears */
+static void nfp_attach(Ctx *c, uint64_t *slot) {           /* (SystemEventType *out, handle) */
+    nfp_lock();
+    os_init_event(A0, 1);
+    *slot = A0;
+    if (slot == &g_nfp_ev_on ? g_nfp_state == NFP_FOUND || g_nfp_state == NFP_MOUNTED : g_nfp_state == NFP_REMOVED) os_signal_event(A0);
+    RET(g_nfp_init ? 0 : NFP_WRONG_STATE);
+    nfp_unlock();
+}
+static void nfp_AttachEvent(Ctx *c) { nfp_attach(c, &g_nfp_ev_on); }                  /* AttachActivateEvent */
+static void nfp_AttachDeactivateEvent(Ctx *c) { nfp_attach(c, &g_nfp_ev_off); }
 static void nfp_AttachAvailabilityChangeEvent(Ctx *c) { os_init_event(A0, 0); RET(0); }
 static void nfp_StartDetection(Ctx *c) {
-    if (!g_nfp_init || g_nfp_searching) { RET(NFP_WRONG_STATE); return; }
-    g_nfp_searching = 1;
-    RET(0);
+    nfp_lock();
+    if (!g_nfp_init || (g_nfp_state != NFP_INITIALIZED && g_nfp_state != NFP_REMOVED)) RET(NFP_WRONG_STATE);
+    else {
+        g_nfp_state = NFP_SEARCHING;
+        if (g_tag.held && !g_tag.read) nfp_tag_arrives();
+        RET(0);
+    }
+    nfp_unlock();
 }
 static void nfp_StopDetection(Ctx *c) {
-    if (!g_nfp_init || !g_nfp_searching) { RET(NFP_WRONG_STATE); return; }
-    g_nfp_searching = 0;
-    RET(0);
+    nfp_lock();
+    if (g_nfp_state == NFP_FOUND || g_nfp_state == NFP_MOUNTED) nfp_tag_leaves();
+    if (g_nfp_state == NFP_INITIALIZED) RET(0);
+    else if (g_nfp_state == NFP_SEARCHING || g_nfp_state == NFP_REMOVED) { g_nfp_state = NFP_INITIALIZED; RET(0); }
+    else RET(NFP_WRONG_STATE);
+    nfp_unlock();
+}
+static void nfp_Mount(Ctx *c) {                            /* (handle, ModelType, MountTarget) */
+    nfp_lock();
+    if (A1 != 0) RET(NFP_INVALID_ARGUMENT);                /* ModelType 0 = amiibo, the only one */
+    else if (g_nfp_state != NFP_FOUND) RET(g_nfp_state == NFP_REMOVED ? NFP_TAG_REMOVED : NFP_WRONG_STATE);
+    else { g_nfp_state = NFP_MOUNTED; RET(0); }
+    nfp_unlock();
+}
+static void nfp_Unmount(Ctx *c) {
+    nfp_lock();
+    if (g_nfp_state != NFP_MOUNTED) RET(g_nfp_state == NFP_REMOVED ? NFP_TAG_REMOVED : NFP_WRONG_STATE);
+    else {
+        g_nfp_state = NFP_FOUND;
+        if (g_tag.read) nfp_tag_leaves();                  /* one touch: the amiibo is taken away once the game has read it */
+        RET(0);
+    }
+    nfp_unlock();
+}
+static void nfp_GetTagInfo(Ctx *c) {                       /* (TagInfo *out, handle) */
+    nfp_lock();
+    if (g_nfp_state != NFP_FOUND && g_nfp_state != NFP_MOUNTED) RET(g_nfp_state == NFP_REMOVED ? NFP_TAG_REMOVED : NFP_WRONG_STATE);
+    else {
+        uint8_t *t = (uint8_t *)(uintptr_t)A0;
+        memset(t, 0, 0x58);
+        memcpy(t, g_tag.uid, 7);
+        t[0xa] = 7;
+        wr32(A0 + 0x20, 1);                                /* NfcProtocol TypeA */
+        wr32(A0 + 0x24, 2);                                /* TagType Type2 */
+        RET(0);
+    }
+    nfp_unlock();
+}
+static void nfp_GetModelInfo(Ctx *c) {                     /* (ModelInfo *out, handle) */
+    nfp_lock();
+    if (g_nfp_state != NFP_MOUNTED) RET(g_nfp_state == NFP_REMOVED ? NFP_TAG_REMOVED : NFP_WRONG_STATE);
+    else {
+        uint8_t *m = (uint8_t *)(uintptr_t)A0;
+        memset(m, 0, 0x40);
+        m[0] = g_tag.id[0]; m[1] = g_tag.id[1]; m[2] = g_tag.id[2]; m[3] = g_tag.id[3];
+        m[4] = g_tag.id[5]; m[5] = g_tag.id[4];            /* the model number, big-endian on the tag */
+        m[6] = g_tag.id[6];
+        if (!g_tag.read) { g_tag.read = 1; InterlockedIncrement(&g_nfp_reads); printf("nfp: the game read the amiibo's model information\n"); }
+        RET(0);
+    }
+    nfp_unlock();
 }
 static void nfp_needs_tag(Ctx *c) { RET(NFP_WRONG_STATE); }                 /* every call that needs a found or mounted tag */
 static void nfp_GetApplicationArea(Ctx *c) { if (A1) wr64(A1, 0); RET(NFP_WRONG_STATE); }   /* (void *out, size_t *outSize, handle, size) */
@@ -386,8 +651,8 @@ static void nfp_GetApplicationArea(Ctx *c) { if (A1) wr64(A1, 0); RET(NFP_WRONG_
  * could not run or when the first byte of its 0x188-byte answer is 0, and only otherwise are the outputs (device handle from
  * answer+4, the "registered" flag = bit 2, RegisterInfo) written ([sdk] 0x308844..0x308858, 0x308a84..0x308ab8).
  * The applet's answer is the system's: [suyu] am/frontend/applet_cabinet.cpp DisplayCompleted -> Cancel() when the reader's
- * state is neither TagFound nor TagMounted: answer byte 0 (CabinetResult::Cancel).  No amiibo is ever on the reader here, so
- * that is the path: 0x1a073 and no output written. */
+ * state is neither TagFound nor TagMounted: answer byte 0 (CabinetResult::Cancel).  There is no amiibo settings applet here
+ * (and SMO does not import these four), so every call takes that path: 0x1a073 and no output written. */
 static void nfp_settings_applet(Ctx *c) {
     trace_printf("     nn::nfp amiibo settings applet -> closed without a change (0x1a073)\n");
     RET(NFP_SETTINGS_CLOSED);
@@ -413,14 +678,15 @@ static const ImportDef applet_imports[] = {
     {NFP("9GetNpadIdEPjRKNS0_12DeviceHandleE"), nfp_GetNpadId},
     {NFP("29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE"), nfp_AttachAvailabilityChangeEvent},
     {NFP("19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE"), nfp_AttachEvent},
-    {NFP("21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE"), nfp_AttachEvent},
+    {NFP("21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE"), nfp_AttachDeactivateEvent},
     {NFP("14StartDetectionERKNS0_12DeviceHandleE"), nfp_StartDetection}, {NFP("13StopDetectionERKNS0_12DeviceHandleE"), nfp_StopDetection},
-    {NFP("5MountERKNS0_12DeviceHandleENS0_9ModelTypeE"), nfp_needs_tag}, {NFP("7UnmountERKNS0_12DeviceHandleE"), nfp_needs_tag},
+    {NFP("5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE"), nfp_Mount},
+    {NFP("5MountERKNS0_12DeviceHandleENS0_9ModelTypeE"), nfp_needs_tag}, {NFP("7UnmountERKNS0_12DeviceHandleE"), nfp_Unmount},
     {NFP("19OpenApplicationAreaERKNS0_12DeviceHandleEj"), nfp_needs_tag}, {NFP("5FlushERKNS0_12DeviceHandleE"), nfp_needs_tag},
-    {NFP("7RestoreERKNS0_12DeviceHandleE"), nfp_needs_tag}, {NFP("10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
+    {NFP("7RestoreERKNS0_12DeviceHandleE"), nfp_needs_tag}, {NFP("10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE"), nfp_GetTagInfo},
     {NFP("15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
     {NFP("13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
-    {NFP("12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
+    {NFP("12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE"), nfp_GetModelInfo},
     {NFP("18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm"), nfp_GetApplicationArea},
     {NFP("18SetApplicationAreaERKNS0_12DeviceHandleEPKvm"), nfp_needs_tag},
     {NFP("21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE"), nfp_needs_tag},
@@ -465,6 +731,47 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     }
     return 0;
 }
+/* An amiibo held to the reader, in the order the game's NFC thread asks ([game] 0x95efa8): found at StartDetection with the
+ * activate event signalled; Mount; TagInfo / ModelInfo; Unmount takes it away (deactivate event); searching again finds
+ * nothing. Run by both self-tests (SMO_SDK_SELFTEST in nnapplet_selftest, SMO_IMPORT_SELFTEST in smo_selftest.c). */
+int nfp_amiibo_selftest(Ctx *c) {
+    static const uint8_t peach_wedding[8] = {0x00, 0x02, 0x00, 0x00, 0x03, 0x72, 0x09, 0x02};
+    uint64_t handle = 0, on[8], off[8];
+    uint8_t tag[0x60], model[0x48];
+    int ok;
+    memset(tag, 0xee, sizeof tag); memset(model, 0xee, sizeof model);
+    long reads = nfp_amiibo_reads();
+    nfp_Initialize(c);
+    c->x[0] = P(on); c->x[1] = P(&handle); nfp_AttachEvent(c); ok = c->x[0] == 0;
+    c->x[0] = P(off); c->x[1] = P(&handle); nfp_AttachDeactivateEvent(c); ok = ok && c->x[0] == 0;
+    nfp_place_amiibo(peach_wedding);
+    ok = ok && nfp_amiibo_waiting();
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == NFP_INITIALIZED;        /* not searching: nothing found yet */
+    c->x[0] = P(&handle); nfp_StartDetection(c); ok = ok && c->x[0] == 0;
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == NFP_FOUND;
+    c->x[0] = P(on); h("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE")(c); ok = ok && (c->x[0] & 1);
+    c->x[0] = P(on); h("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE")(c); ok = ok && !(c->x[0] & 1);   /* AutoClear */
+    c->x[0] = P(&handle); c->x[1] = 1; c->x[2] = 1; nfp_Mount(c); ok = ok && c->x[0] == NFP_INVALID_ARGUMENT;        /* ModelType 1 */
+    c->x[0] = P(&handle); c->x[1] = 0; c->x[2] = 1; nfp_Mount(c); ok = ok && c->x[0] == 0;
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == NFP_MOUNTED;
+    c->x[0] = P(tag); c->x[1] = P(&handle); nfp_GetTagInfo(c);
+    ok = ok && c->x[0] == 0 && tag[0] == 0x04 && tag[0xa] == 7 && rd32(P(tag) + 0x20) == 1 && rd32(P(tag) + 0x24) == 2 && guard_ok(tag, 0x58, sizeof tag, 0xee);
+    c->x[0] = P(model); c->x[1] = P(&handle); nfp_GetModelInfo(c);
+    ok = ok && c->x[0] == 0 && model[0] == 0x00 && model[1] == 0x02 && model[2] == 0x00 && rd16(P(model) + 4) == 882 && model[6] == 0x09 && guard_ok(model, 0x40, sizeof model, 0xee);
+    ok = ok && nfp_amiibo_reads() == reads + 1 && !nfp_amiibo_waiting();
+    c->x[0] = P(&handle); nfp_Unmount(c); ok = ok && c->x[0] == 0;
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == NFP_REMOVED;
+    c->x[0] = P(off); h("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE")(c); ok = ok && (c->x[0] & 1);
+    c->x[0] = P(tag); c->x[1] = P(&handle); nfp_GetTagInfo(c); ok = ok && c->x[0] == NFP_TAG_REMOVED;
+    c->x[0] = P(&handle); nfp_StartDetection(c); ok = ok && c->x[0] == 0;
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == NFP_SEARCHING;             /* read once: not found again */
+    c->x[0] = P(&handle); nfp_StopDetection(c); ok = ok && c->x[0] == 0;
+    nfp_place_amiibo(NULL);
+    nfp_Finalize(c);
+    printf("  nfp: an amiibo held to the reader: found at StartDetection (activate event, AutoClear), Mount, TagInfo (type A, type 2, 7-byte serial), ModelInfo (0x000200 #882 series 9), taken away at Unmount (deactivate event, TagRemoved): %s\n", ok ? "ok" : "FAILED");
+    return !ok;
+}
+
 int nnapplet_selftest(Ctx *c) {
     int bad = 0, ok;
     uint8_t *buf = malloc(0x8000), *buf2 = malloc(0x8000);
@@ -565,6 +872,7 @@ int nnapplet_selftest(Ctx *c) {
     nfp_Finalize(c);
     printf("  nfp: Initialize / ListDevices (1 reader) / StartDetection / StopDetection state machine, tag calls refused: %s\n", ok ? "ok" : "FAILED");
     bad += !ok;
+    bad += nfp_amiibo_selftest(c);
     {   /* amiibo settings applets: 0x1a073 and no output written ([sdk] 0x308844..0x308858, 0x308a84) */
         static const char *const names[4] = {
             NFP("29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"),
