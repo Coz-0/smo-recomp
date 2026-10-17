@@ -311,7 +311,22 @@ static void dump_guest_registers(void) {
 }
 
 /* ---------------------------------------------------------------- imports */
+/* Every handler registered, whether this game version imports its name or not: an SDK C wrapper may forward to a C++
+ * name the game does not import itself (1.4.1 imports nnosGetThreadCoreMask, not nn::os::GetThreadCoreMask). The pairs
+ * are copied (a caller may pass an ImportDef of its own stack); the names are the callers' lasting strings. */
+static struct { const char *name; ImportFn fn; } *g_known;
+static int g_known_count, g_known_cap;
+
 void register_imports(const ImportDef *defs, int count) {
+    for (int d = 0; d < count; d++) {
+        if (!defs[d].name) continue;
+        if (g_known_count == g_known_cap) {
+            int cap = g_known_cap ? 2 * g_known_cap : 8192;
+            void *p = realloc(g_known, (size_t)cap * sizeof *g_known);
+            if (p) { g_known = p; g_known_cap = cap; }
+        }
+        if (g_known_count < g_known_cap) { g_known[g_known_count].name = defs[d].name; g_known[g_known_count].fn = defs[d].fn; g_known_count++; }
+    }
     for (int d = 0; d < count; d++) {
         int found = 0;
         for (int i = 0; i < dyn_sym_count; i++) {
@@ -325,6 +340,13 @@ void register_imports(const ImportDef *defs, int count) {
 ImportFn import_lookup(const char *name) {
     for (int i = 0; i < dyn_sym_count; i++)
         if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0) return g_handlers[i];
+    return NULL;
+}
+
+/* The handler last registered under a name, imported by this game version or not; NULL if no table has it. */
+ImportFn handler_by_name(const char *name) {
+    for (int k = g_known_count - 1; k >= 0; k--)          /* the last registration wins, as in register_imports */
+        if (strcmp(g_known[k].name, name) == 0) return g_known[k].fn;
     return NULL;
 }
 

@@ -33,6 +33,7 @@ extern const SdkData sdk_data[];
 extern const int sdk_data_count;
 void register_imports(const ImportDef *defs, int count);
 ImportFn import_lookup(const char *name);    /* registered handler of an imported function, or NULL */
+ImportFn handler_by_name(const char *name);  /* the handler registered under a name, imported or not, or NULL */
 void call_guest(Ctx *c, uint64_t addr);
 uint64_t guest_function_of(uint64_t host_rip);
 void print_import_summary(FILE *out);
