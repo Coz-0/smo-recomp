@@ -15,7 +15,8 @@ real address (0x7100000000), so guest pointers are host pointers.
     python recomp.py cover                       per-instruction-word translation coverage of the listed functions
     python recomp.py lift  <out.c> <root>[,...]  lift roots and their callees (debugging)
 Environment: RECOMP_ELF (default build/dump/base/elf/main.elf), RECOMP_FUNCS (default
-build/functions/main_functions.tsv), RECOMP_BASE (default 0x7100000000).
+build/functions/main_functions.tsv), RECOMP_BASE (default 0x7100000000). The default paths follow SMO_TARGET
+(tools/target.py): for an update target, build/dump/update and build/<version>/.
 """
 import os
 import struct
@@ -23,8 +24,10 @@ import sys
 import collections
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ELF = os.environ.get('RECOMP_ELF') or os.path.join(_REPO, 'build', 'dump', 'base', 'elf', 'main.elf')
-FUNCS = os.environ.get('RECOMP_FUNCS') or os.path.join(_REPO, 'build', 'functions', 'main_functions.tsv')
+sys.path.insert(0, os.path.join(_REPO, 'tools'))
+import target as _T  # noqa: E402  (SMO_TARGET: the defaults below are the target's, tools/target.py)
+ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
+FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
 BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
 FILE_OFF = 0x1000
 
@@ -438,6 +441,8 @@ class Fn:
                     total = nb * nstruct
             else:
                 opcode, s_bit = bits(w, 15, 13), bits(w, 12, 12)
+                if bits(w, 21, 21) and opcode in (0, 1, 2, 3, 4, 5):
+                    return self.ldst_lanes(w, rt, rn, rm, q, post, load, size, opcode, s_bit)
                 if bits(w, 21, 21):
                     raise Unimpl('ldN')
                 if opcode == 6 and load:
@@ -464,6 +469,33 @@ class Fn:
                 wb = '%s += %s;' % (XS(rn), ('%dULL' % total) if rm == 31 else X(rm))
             return '{ uint64_t a = %s; %s %s }' % (XS(rn), body, wb)
         raise Unimpl('ldst%d' % g)
+
+    def ldst_lanes(self, w, rt, rn, rm, q, post, load, size, opcode, s_bit):
+        """SMO addition (audio DSP of the 7.3.2 SDK): LD2 / ST2 (opcode 0, 2, 4) and LD4 / ST4 (opcode 1, 3, 5), one
+        element (lane) of two or four consecutive registers to or from consecutive memory."""
+        nstruct = 4 if opcode & 1 else 2
+        base = opcode & 6
+        if base == 0:
+            es, idx = 0, (q << 3) | (s_bit << 2) | size
+        elif base == 2 and not size & 1:
+            es, idx = 1, (q << 2) | (s_bit << 1) | (size >> 1)
+        elif base == 4 and size == 0:
+            es, idx = 2, (q << 1) | s_bit
+        elif base == 4 and size == 1 and not s_bit:
+            es, idx = 3, q
+        else:
+            raise Unimpl('ldN')
+        nb = 1 << es
+        if load:
+            body = ' '.join('uint64_t e%d = rd%d(a + %d);' % (k, 8 << es, k * nb) for k in range(nstruct))
+            body += ' ' + ' '.join('vset(&c->v[%d], %d, %d, e%d);' % ((rt + k) & 31, es, idx, k) for k in range(nstruct))
+        else:
+            body = ' '.join('wr%d(a + %d, vget(&c->v[%d], %d, %d));' % (8 << es, k * nb, (rt + k) & 31, es, idx)
+                            for k in range(nstruct))
+        wb = ''
+        if post:
+            wb = '%s += %s;' % (XS(rn), ('%dULL' % (nb * nstruct)) if rm == 31 else X(rm))
+        return '{ uint64_t a = %s; %s %s }' % (XS(rn), body, wb)
 
     # ---- data processing, register
     def dp_reg(self, w, pc):
@@ -745,9 +777,10 @@ class Fn:
                     return 'v_bitsel(%s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), size, q)
                 op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS',
-                      # SMO additions (audio DSP in the SDK): saturating add / subtract
-                      (0, 0x01): 'I_SQADD', (1, 0x01): 'I_UQADD', (0, 0x05): 'I_SQSUB', (1, 0x05): 'I_UQSUB'}.get((u, opc))
-                if op is None:
+                      # SMO additions (audio DSP in the SDK): saturating add / subtract, multiply-accumulate (7.3.2)
+                      (0, 0x01): 'I_SQADD', (1, 0x01): 'I_UQADD', (0, 0x05): 'I_SQSUB', (1, 0x05): 'I_UQSUB',
+                      (0, 0x12): 'I_MLA'}.get((u, opc))
+                if op is None or (op == 'I_MLA' and size == 3):
                     raise Unimpl('simd-i3')
                 return 'v_i3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, size, icount(size))
             if bits(w, 20, 17) == 0 and bits(w, 11, 10) == 2:    # two registers, miscellaneous
@@ -772,6 +805,11 @@ class Fn:
                 acc = {0xc: 0, 0x8: 1, 0xa: 2}.get(bits(w, 15, 12))  # SMULL/UMULL, SMLAL/UMLAL, SMLSL/UMLSL (and the "2" forms)
                 if acc is not None:
                     return 'v_mull(%s, %s, %s, %d, %d, %d, %d, -1);' % (V(rd), V(rn), V(rm), size, q, u, acc)
+            # SMO addition (audio DSP of the 7.3.2 SDK): ADDV, across lanes
+            if not scalar and not u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x1b and bits(w, 11, 10) == 2:
+                if size == 3 or (size == 2 and not q):
+                    raise Unimpl('simd-across')
+                return 'v_addv(%s, %s, %d, %d);' % (V(rd), V(rn), size, icount(size))
             raise Unimpl('simd-e')
         if bits(w, 27, 24) == 0xe:
             if bits(w, 15, 15) == 0 and bits(w, 10, 10) == 1:    # copy: dup / ins / umov / smov
@@ -839,10 +877,12 @@ class Fn:
         # SMO addition (audio DSP in the SDK): saturating narrowing shifts. es = DESTINATION element size; the shift is
         # 2 * esize - immh:immb. U=0 0x12/0x13 SQSHRN/SQRSHRN, U=1 0x12/0x13 UQSHRN/UQRSHRN, U=1 0x10/0x11 SQSHRUN/SQRSHRUN.
         if opc in (0x12, 0x13) or (u and opc in (0x10, 0x11)):
-            if scalar or es > 2:
+            if es > 2:
                 raise Unimpl('simd-shift')
             src_signed = 0 if (u and opc in (0x12, 0x13)) else 1
             dst_signed = 0 if u else 1
+            if scalar:                                   # the scalar forms (7.3.2 SDK): one element
+                return 'v_qshrn_s(%s, %s, %d, %d, %d, %d, %d);' % (V(rd), V(rn), (16 << es) - immhb, es, opc & 1, src_signed, dst_signed)
             return 'v_qshrn(%s, %s, %d, %d, %d, %d, %d, %d);' % (V(rd), V(rn), (16 << es) - immhb, es, opc & 1, src_signed, dst_signed, q)
         raise Unimpl('simd-shift')
 
@@ -1287,7 +1327,7 @@ if __name__ == '__main__':
     if sys.argv[1] == 'cover':
         cmd_cover()
     elif sys.argv[1] == 'full':
-        cmd_full2(sys.argv[2] if len(sys.argv) > 2 else os.path.join(_REPO, 'build', 'lift', 'main'),
+        cmd_full2(sys.argv[2] if len(sys.argv) > 2 else _T.build('lift', 'main'),
                   int(sys.argv[3]) if len(sys.argv) > 3 else 16)
     else:
         ov = {}

@@ -38,7 +38,7 @@ def shape_of(md, w, cache):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--top', type=int, default=60)
-    ap.add_argument('--out', default=os.path.join(recomp._REPO, 'build', 'lift', 'insnfreq.json'))
+    ap.add_argument('--out', default=recomp._T.build('lift', 'insnfreq.json'))
     a = ap.parse_args()
     env = recomp.Env()
     env.imports = set()
