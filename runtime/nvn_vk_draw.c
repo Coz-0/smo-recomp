@@ -1500,22 +1500,47 @@ static struct { VkImageView view; VkSampler smp; VkImageLayout layout; } g_dtex[
 static int g_ndtex;
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64_t row_stride, int64_t image_stride);
+/* SMO, 1.4.1: a sampler whose handle the game keeps in one of its uniform buffers (mx_translate.c bindless_unit: unit
+ * 32 + 8 * hardware buffer + 64-bit word; hardware buffer n >= 3 is the stage's uniform buffer slot n - 3), read at the draw.
+ * 0 when the buffer is not bound or too short (the shader of 1.4.1's primitive drawer then draws untextured itself). */
+static uint64_t uniform_handle(int s, unsigned u) {
+    unsigned cb = (u - 32) / 8, off = (u - 32) % 8 * 8;
+    if (u < 32 || cb < 3 || cb >= 19) return 0;
+    const Range *b = &R.ubo[s][cb - 3];
+    if (!b->addr || b->size < off + 8) return 0;
+    uint64_t h;
+    memcpy(&h, (const void *)(uintptr_t)(b->addr + off), 8);
+    return h;
+}
 static void resolve_sampler(int s, VStage *v, int i) {
     unsigned u = v->smp[i].unit;
     Tex *t = NULL;
     View view;
     SamplerParams sp;
-    int r = u < 32 ? nvn_front_handle(R.tpool, R.spool, R.nvn_tex[s][u], &t, &view, &sp) : 0;
+    uint64_t handle = u < 32 ? R.nvn_tex[s][u] : uniform_handle(s, u);
+    int r = u < 32 || handle ? nvn_front_handle(R.tpool, R.spool, handle, &t, &view, &sp) : 0;
+    if (u >= 32) {      /* the first draw of each program that takes a texture this way: what it got (says where the game uses it) */
+        static int said[64], nsaid;
+        int serial = R.prog[s] ? R.prog[s]->serial : -1, k;
+        for (k = 0; k < nsaid && said[k] != serial; k++) {}
+        if (k == nsaid && nsaid < 64) {
+            said[nsaid++] = serial;
+            printf("nvn_vk: program #%d, %s stage: texture handle %llx from uniform buffer %u + %u (first draw, frame %lld) -> %s",
+                   serial, s ? "fragment" : "vertex", (unsigned long long)handle, (u - 32) / 8 - 3, (u - 32) % 8 * 8,
+                   (long long)nvn_front_frame_next(), (r & 1) ? "" : "no texture (an untextured draw)\n");
+            if (r & 1) printf("texture format 0x%x, %d x %d\n", t->b.format, t->b.width, t->b.height);
+        }
+    }
     {   /* SMO port, with SMO_VK_PASSSHOT: what each draw of that frame samples (pass_shot's frame) */
         static int want = -2;
         want = passshot_frame() ? 1 : -1;
         if (want >= 0) {
             Tex *c0 = R.ncol ? R.col[0].tex : NULL;
             printf("nvn_vk_bind: stage %d unit %u handle %llx -> %s tex %p fmt 0x%x %dx%d mem %p gpu_written %d | target tex %p fmt 0x%x mem %p\n",
-                   s, u, (unsigned long long)(u < 32 ? R.nvn_tex[s][u] : 0), (r & 1) ? "live" : "NO TEXTURE", (void *)((r & 1) ? t : NULL),
+                   s, u, (unsigned long long)handle, (r & 1) ? "live" : "NO TEXTURE", (void *)((r & 1) ? t : NULL),
                    (r & 1) ? (unsigned)t->b.format : 0u, (r & 1) ? t->b.width : 0, (r & 1) ? t->b.height : 0, (void *)((r & 1) ? t->mem : NULL),
                    (r & 1) ? t->gpu_written : -1, (void *)c0, c0 ? (unsigned)c0->b.format : 0u, (void *)(c0 ? c0->mem : NULL));
-            if (!(r & 1) && u < 32 && R.nvn_tex[s][u]) printf("nvn_vk_bind:   why: %s\n", nvn_front_handle_why(R.tpool, R.nvn_tex[s][u]));
+            if (!(r & 1) && handle) printf("nvn_vk_bind:   why: %s\n", nvn_front_handle_why(R.tpool, handle));
             if ((r & 1) && t->b.target == 2 && t->b.format == 0x3f && t->b.width * t->b.height * t->b.depth <= 4096) {      /* SMO debug aid: a small R11G11B10F volume (colour-grading LUT): its contents */
                 static uint32_t px[4096];
                 int rr[6] = {0, 0, 0, t->b.width, t->b.height, t->b.depth}, n = t->b.width * t->b.height * t->b.depth;
@@ -3460,6 +3485,12 @@ swap: ;
     g_isem = (g_isem + 1) % 8;
     if (!g_sem[g_isem][0]) { VkSemaphoreCreateInfo smi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][0])); VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][1])); }
     VkSemaphore acq = g_sem[g_isem][0], rend = g_sem[g_isem][1];
+    if (V.swapchain) {      /* the window changed size (F11, display.c): a driver need not say so with OUT_OF_DATE / SUBOPTIMAL */
+        RECT rc;
+        if (GetClientRect(V.hwnd, &rc) && rc.right > 0 && rc.bottom > 0 && ((uint32_t)rc.right != V.extent.width || (uint32_t)rc.bottom != V.extent.height)) {
+            cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated);
+        }
+    }
     int ok = V.swapchain || swapchain_create();
     InterlockedIncrement64(&g_wd_try);
     if (ok) {
