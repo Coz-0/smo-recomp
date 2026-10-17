@@ -41,7 +41,7 @@ static int load_image(void) {
     const char *g_elf = __argc > 1 ? __argv[1] : NULL;       /* same argument boot.c uses for main.elf */
     if (env && env[0]) snprintf(path, sizeof path, "%s", env);
     else {
-        snprintf(path, sizeof path, "%s", g_elf ? g_elf : "..\\dump\\base\\elf\\main.elf");
+        snprintf(path, sizeof path, "%s", g_elf ? g_elf : GAME_ELF_DEFAULT);
         char *slash = strrchr(path, '\\'), *slash2 = strrchr(path, '/');
         if (slash2 > slash) slash = slash2;
         snprintf(slash ? slash + 1 : path, 16, "sdk.elf");
