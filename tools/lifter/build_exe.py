@@ -4,7 +4,9 @@ runtime + gamedll.c), as ssbu-recomp's build.py `link` step (GPL-3.0-or-later) d
     python tools/lifter/build_exe.py [--exe smo_native.exe] [--force]
 
 Needs: build/obj/main/*.obj (build_main.py), build/gen/* (gen_tables.py, gen_sdktest.py), SDL3 (deps/SDL3-3.4.18 or
-SDL3_ROOT), Vulkan headers (VULKAN_HEADERS, default the Vulkan SDK's Include folder), clang 9 (LLVM_ROOT).
+SDL3_ROOT), the WebView2 SDK (deps/webview2-<version>, from the Microsoft.Web.WebView2 NuGet package, or WEBVIEW2_ROOT:
+its header and WebView2Loader.dll, for the Help page in the game window), Vulkan headers (VULKAN_HEADERS, default the
+Vulkan SDK's Include folder), clang 9 (LLVM_ROOT).
 Host files are recompiled when they or any runtime header / generated file changed. Prints every compiler error.
 """
 import concurrent.futures
@@ -25,6 +27,7 @@ OBJ_GAME = T.build('obj', 'main')
 BIN = T.build('bin')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 SDL3 = os.environ.get('SDL3_ROOT') or os.path.join(REPO, 'deps', 'SDL3-3.4.18')
+WEBVIEW2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
 VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
 
 # ssbu-recomp's HOST_SOURCES without the Smash-only modules (nnro.c, nro_registry.c, debug_mode.c), plus smo_port.c
@@ -33,12 +36,12 @@ HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nv
                 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c',
                 'nncxxlib.c', 'nnlibc2.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c',
                 'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c', 'smo_nerve.c',
-                'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'gamedll.c']
+                'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c', 'gamedll.c']
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', RT, '-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
-              '-I', os.path.join(SDL3, 'include'), '-I', VKH]
+              '-I', os.path.join(SDL3, 'include'), '-I', VKH, '-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')]
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32']
 
 
@@ -110,6 +113,7 @@ def main():
         print((r.stdout + r.stderr)[-8000:])
         return 1
     copy_if_changed(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(BIN, 'SDL3.dll'))
+    copy_if_changed(os.path.join(WEBVIEW2, 'build', 'native', 'x64', 'WebView2Loader.dll'), os.path.join(BIN, 'WebView2Loader.dll'))
     print('linked %s (%.1f MB)' % (out, os.path.getsize(out) / 2 ** 20))
     return build_shader_shim()
 
