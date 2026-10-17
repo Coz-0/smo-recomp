@@ -2,10 +2,12 @@
  *
  * A state of an al::NerveKeeper is a const al::Nerve; al::NerveKeeper::update calls its execute(NerveKeeper *) once per
  * frame through the vtable, so through call_indirect (hostrt.c). The function list (tools/extract/functions.py -> build\functions\
- * main_functions.tsv) names 5,824 such execute functions. The others are named here (nerve_load): from the
- * <Class>::exe<State> function their code branches to (FrogNrvWait), or, for an execute that runs a sub-state, from the
- * nerves of its class around it (FrogNrv_38d710). When one of them is called, the frame is noted for that nerve and it
- * becomes the keeper's current nerve.
+ * main_functions.tsv) names such execute functions: by symbol or the decompilation's name (1.0.0: 5,998), and by the
+ * class RTTI gives (1.0.0: 6,410, the same names wherever both exist; 1.4.1: the only source). The others are named
+ * here (nerve_load): from the <Class>::exe<State> function their code branches to (FrogNrvWait), for an execute that
+ * runs a sub-state from the nerves of its class around it (FrogNrv_38d710), and a HostTypeNrv<State> class (the game's
+ * own name, the same in many host classes) by the class of the object that first runs it. When one of them is called,
+ * the frame is noted for that nerve and it becomes the keeper's current nerve.
  *
  *   SMO_NERVELOG=<s>[,<s>...]   print "nerve: frame F keeper K: A -> B" when a keeper's nerve changes and A or B contains
  *                               one of the substrings ("*" = every keeper)
@@ -35,7 +37,7 @@ long long nvn_front_frame_next(void);                     /* nvn_gl.c: the numbe
 #define NRV_MAX 16384
 #define NRV_HASH 32768
 #define KEEP_HASH 65536
-static struct { uint64_t addr; char *name; volatile LONG64 last_frame; char log_ok, pos_ok; } g_nrv[NRV_MAX];
+static struct { uint64_t addr; char *volatile name; volatile LONG64 last_frame; char log_ok, pos_ok, host; } g_nrv[NRV_MAX];   /* host: see host_name */
 static int g_nrv_count;
 static int g_nrv_hash[NRV_HASH];                          /* index + 1 into g_nrv, 0 = empty */
 static struct { uint64_t keeper; int nrv; long long pos_frame, last_frame; } g_keep[KEEP_HASH];
@@ -54,9 +56,11 @@ static unsigned hash_addr(uint64_t a, unsigned n) { return (unsigned)(((a >> 2) 
 /* "_ZNK12_GLOBAL__N_135OpeningStageStartDemoNrvWaitStandUp7executeEPN2al11NerveKeeperE" -> "OpeningStageStartDemoNrvWaitStandUp";
  * nested classes are joined with "::". Returns 0 if the name is not a nerve's execute function. */
 static int nerve_name(const char *m, char *out, size_t n) {
-    static const char tail[] = "7executeEPN2al11NerveKeeperE";
+    static const char tail[] = "7executeEPN2al11NerveKeeperE", tail_al[] = "7executeEPNS_11NerveKeeperE";   /* a class in namespace al: `al` is S_ */
     size_t len = strlen(m), tl = sizeof tail - 1;
-    if (len <= tl + 4 || strcmp(m + len - tl, tail) || strncmp(m, "_ZNK", 4)) return 0;
+    if (len > sizeof tail_al - 1 + 4 && !strcmp(m + len - (sizeof tail_al - 1), tail_al)) tl = sizeof tail_al - 1;
+    else if (len <= tl + 4 || strcmp(m + len - tl, tail)) return 0;
+    if (strncmp(m, "_ZNK", 4)) return 0;
     const char *p = m + 4, *end = m + len - tl;
     size_t o = 0;
     out[0] = 0;
@@ -119,21 +123,25 @@ static void nerve_add(uint64_t a, const char *nm) {
 typedef struct { uint64_t addr; char *name; } ExeFn;
 static int exe_cmp(const void *a, const void *b) { uint64_t x = ((const ExeFn *)a)->addr, y = ((const ExeFn *)b)->addr; return x < y ? -1 : x > y; }
 
-/* Nerves come from the function list by their names. Many of them have no name there (the classes the decompilation
- * has not named yet, e.g. Frog): a small unnamed function that branches (B or BL) to <Class>::exe<State>() is taken
- * as that class's nerve and named <Class>Nrv<State>, from its code in the loaded image. */
+/* Nerves come from the function list by their names: the symbol, else the decompilation's name, else the name RTTI
+ * gives (column 9, tools/extract/functions.py: the only one for 1.4.1, whose main has no symbols). Many classes are
+ * called HostTypeNrv<State> by the game itself (a nerve macro of each host class, in its own anonymous namespace):
+ * those names say nothing. A small unnamed function, or one with such a name, that branches (B or BL) to
+ * <Class>::exe<State>() is taken as that class's nerve and named <Class>Nrv<State>, from its code in the loaded image;
+ * a HostType nerve still unnamed then is named when it first runs, from the class of the object that runs it
+ * (host_name). */
 static void nerve_load(void) {
     const char *path = getenv("SMO_FUNCTIONS");
     FILE *f = fopen(path ? path : "..\\functions\\main_functions.tsv", "r");
     if (!f) { printf("nerve: cannot open the function list %s (set SMO_FUNCTIONS); nerve tracking off\n", path ? path : "..\\functions\\main_functions.tsv"); return; }
     char line[4096], nm[256];
-    ExeFn *exe = NULL;
+    ExeFn *exe = NULL, *host = NULL;
     uint64_t (*cand)[2] = NULL;                           /* unnamed functions of at most 0x80 bytes: start, end */
-    int nexe = 0, cexe = 0, ncand = 0, ccand = 0, named = 0, derived = 0;
+    int nexe = 0, cexe = 0, ncand = 0, ccand = 0, named = 0, derived = 0, from_rtti = 0, nhost = 0, chost = 0, have_rtti = 0;
     while (fgets(line, sizeof line, f)) {
-        char *col[8];
+        char *col[9];
         int nc = 0;
-        for (char *s = line; nc < 8; ) {
+        for (char *s = line; nc < 9; ) {
             col[nc++] = s;
             char *t = strchr(s, '\t');
             if (!t) { s[strcspn(s, "\r\n")] = 0; break; }
@@ -144,8 +152,17 @@ static void nerve_load(void) {
         uint64_t a = GUEST_BASE + strtoull(col[0], NULL, 16), e = GUEST_BASE + strtoull(col[1], NULL, 16);
         char *mangled = col[5][0] ? col[5] : col[6];
         mangled[strcspn(mangled, "|")] = 0;
+        int rtti_other = 0;                               /* an RTTI name that is not a state (a class's own executeOnEnd) */
+        if (nc > 8 && col[8][0]) have_rtti = 1;
         if (nerve_name(mangled, nm, sizeof nm)) { nerve_add(a, nm); named++; continue; }
-        if (!mangled[0] && e > a && e - a <= 0x80) {
+        if (nc > 8 && col[8][0]) {
+            if (nerve_name(col[8], nm, sizeof nm)) {
+                if (strncmp(nm, "HostTypeNrv", 11)) { nerve_add(a, nm); from_rtti++; continue; }
+                if (nhost == chost) { chost = chost ? chost * 2 : 1024; host = realloc(host, (size_t)chost * sizeof *host); }
+                host[nhost].addr = a; host[nhost].name = _strdup(nm); nhost++;
+            } else rtti_other = 1;
+        }
+        if (!mangled[0] && !rtti_other && e > a && e - a <= 0x80) {
             if (ncand == ccand) { ccand = ccand ? ccand * 2 : 4096; cand = realloc(cand, (size_t)ccand * sizeof *cand); }
             cand[ncand][0] = a; cand[ncand][1] = e; ncand++;
         } else if (exe_name(mangled, nm, sizeof nm)) {
@@ -167,11 +184,18 @@ static void nerve_load(void) {
     }
     for (int i = 0; i < nexe; i++) free(exe[i].name);
     free(exe);
+    int hosted = 0;
+    for (int i = 0; i < nhost; i++) {                    /* HostType nerves the exe functions did not name: named when they run */
+        if (nrv_index(host[i].addr) < 0) { nerve_add(host[i].addr, host[i].name); g_nrv[g_nrv_count - 1].host = 1; hosted++; }
+        free(host[i].name);
+    }
+    free(host);
     /* Nerves whose execute runs a sub-state (al::updateNerveState / updateNerveStateAndNextNerve) call no exe function:
      * an unnamed candidate that loads the keeper's parent (ldr xN, [x1] in its first six instructions) and lies between
      * two nerves of the same class (the compiler keeps a class's nerves together; neighbours named with the function
-     * list's placeholder class HostType are skipped) is named <Class>Nrv_<address>. */
-    int nall = g_nrv_count, block = 0;
+     * list's placeholder class HostType are skipped) is named <Class>Nrv_<address>. Not when the list has RTTI names:
+     * they name every nerve class, so what is left unnamed is not a nerve (1.4.1: 80 such guesses). */
+    int nall = have_rtti ? 0 : g_nrv_count, block = 0;
     ExeFn *all = malloc(sizeof *all * (size_t)(nall ? nall : 1));
     for (int i = 0; i < nall; i++) { all[i].addr = g_nrv[i].addr; all[i].name = g_nrv[i].name; }
     qsort(all, (size_t)nall, sizeof *all, exe_cmp);
@@ -194,8 +218,9 @@ static void nerve_load(void) {
     }
     free(all);
     free(cand);
-    printf("nerve: %d nerve states: %d named in the function list, %d named here from the exe function they call, %d from their class's block\n",
-           g_nrv_count, named, derived, block);
+    printf("nerve: %d nerve states: %d named in the function list, %d from RTTI, %d named here from the exe function they call, "
+           "%d from their class's block, %d HostType ones named by the class of the object that first runs them\n",
+           g_nrv_count, named, from_rtti, derived, block, hosted);
 }
 
 static void nerve_init(void) {                           /* first indirect call (any thread); the others wait for it */
@@ -236,6 +261,45 @@ static int actor_trans(uint64_t keeper, float out[3]) {
     } __except (1) { return 0; }
 }
 
+/* The class of a game object from its RTTI: vtable -> typeinfo (vtable - 8) -> the type's mangled name ("4Frog",
+ * "N12_GLOBAL__N_17FooBarE", ...) -> its last component. 0 if a read faults or the name has another form (templates). */
+static int class_of(uint64_t obj, char *out, size_t n) {
+    __try {
+        uint64_t vt = rd64(obj), ti = vt ? rd64(vt - 8) : 0, nm = ti ? rd64(ti + 8) : 0;
+        const char *p = (const char *)(uintptr_t)nm, *last = NULL;
+        long last_len = 0;
+        if (!p) return 0;
+        int nested = *p == 'N';
+        p += nested;
+        while (*p >= '1' && *p <= '9') {
+            char *q;
+            long k = strtol(p, &q, 10);
+            if (k <= 0 || k > 200) return 0;
+            last = q; last_len = k; p = q + k;
+            if (!nested) break;
+        }
+        if (!last || (nested && *p != 'E') || (size_t)last_len + 1 > n) return 0;
+        memcpy(out, last, (size_t)last_len);
+        out[last_len] = 0;
+        return 1;
+    } __except (1) { return 0; }
+}
+
+/* A HostType nerve (host = 1) gets its real name the first time it runs: HostTypeNrv<State> -> <Class>Nrv<State>, the
+ * class being that of the keeper's parent (NerveKeeper +0: the object whose exe<State> the nerve calls). host = 2 when
+ * named, 3 when the class could not be read (the name stays). Called with g_nerve_lock held. */
+static void host_name(int i, uint64_t keeper) {
+    char cls[200], nm[256];
+    uint64_t parent = 0;
+    __try { parent = rd64(keeper); } __except (1) { parent = 0; }
+    if (!parent || !class_of(parent, cls, sizeof cls)) { g_nrv[i].host = 3; return; }
+    snprintf(nm, sizeof nm, "%sNrv%s", cls, g_nrv[i].name + 11);
+    g_nrv[i].log_ok = (char)filter_match(nm);
+    g_nrv[i].pos_ok = (char)(g_pos_every > 0 && pos_match(nm));
+    g_nrv[i].name = _strdup(nm);                          /* the old name stays allocated: another thread may be reading it */
+    g_nrv[i].host = 2;
+}
+
 static int filter_match(const char *name) {
     if (g_filter_all) return 1;
     if (!g_filter[0] || !name) return 0;
@@ -258,6 +322,7 @@ void nerve_call(Ctx *c, uint64_t addr) {
     unsigned h = hash_addr(keeper, KEEP_HASH);
     while (g_keep[h].keeper && g_keep[h].keeper != keeper) h = (h + 1) % KEEP_HASH;
     int old = g_keep[h].keeper ? g_keep[h].nrv : -1;
+    if (g_nrv[i].host == 1) host_name(i, keeper);
     if (!g_keep[h].keeper) { g_keep[h].keeper = keeper; g_keep[h].pos_frame = -1; g_keep_used++; }
     g_keep[h].nrv = i;
     g_keep[h].last_frame = frame;
