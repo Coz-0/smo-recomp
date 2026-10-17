@@ -23,6 +23,11 @@ git). One script does all of it, in resumable steps:
 - The **Vulkan SDK** 1.4: its headers and `vulkan-1.lib`, and its `shaderc_shared.dll`, which `smo_glslang.dll` (built
   from `runtime/vk_shaderc_shim.c`) uses to turn GLSL into SPIR-V. `VULKAN_HEADERS` overrides the header folder.
 - **SDL3** 3.4.18 (the development package for Visual C++) in `deps\SDL3-3.4.18`, or `SDL3_ROOT` pointing at it.
+- The **WebView2 SDK** (Microsoft's NuGet package `Microsoft.Web.WebView2`, developed with 1.0.2903.40; a `.nupkg` is
+  a zip file): its `build\native\include` and `build\native\x64` folders in `deps\webview2-<version>\build\native\`, or
+  `WEBVIEW2_ROOT` pointing at the unpacked package. The build copies its `WebView2Loader.dll` next to the exe. The game's
+  Help (its Action Guide) is shown in the game window with it; the **WebView2 Runtime** it needs is part of Windows 11
+  (on Windows 10, install Microsoft's Evergreen WebView2 Runtime). Without the runtime, Help opens in your web browser.
 
 `scripts\setup.py` checks for each of these first and names what is missing.
 
@@ -99,6 +104,12 @@ With the update package in the dump folder, `--target` builds the game as the up
   sets one of the runtime's switches (see [`docs/DEBUGGING.md`](docs/DEBUGGING.md)).
 - Graphics and controller settings live in `build\config\graphics.ini` and `build\config\controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
+- The window: by default a borderless window of the size in `graphics.ini`, centred (drag it anywhere to move it). F11,
+  or a double-click on it, switches between that and borderless fullscreen; `window = borderless_fullscreen` starts that
+  way, and `windowed` (with a title bar) and `fullscreen` (on top) are there too.
+- Help (the pause menu's Action Guide) opens inside the game window and the game waits while it is open, as on the
+  console: stick or d-pad and A to choose and open, L / R to turn pages, B to go back and to close (keyboard: arrows,
+  Enter, Q / E, Escape).
 - amiibo: press F1, or both stick buttons of a pad, while you play. The game waits and a menu like its pause menu lists
   the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F1 again) to close. When the game is
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
