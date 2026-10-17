@@ -81,6 +81,11 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
     LARGE_INTEGER fq, t0, now;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
+    /* The wait for the next frame boundary sleeps on a high-resolution timer. It used to Sleep(1) until 2 ms before the
+     * boundary and then call SwitchToThread in a loop: 2 of every 5 ms busy on a time-critical thread (69% of a core in
+     * all, measured), taken from the game's threads when the PC is busy. The output has 120 ms queued, so a frame a
+     * fraction of a millisecond late changes nothing; the schedule stays on the performance counter. */
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     double period = 0;
     long long tick = 0;                          /* frames since t0: the schedule (g_frames only counts) */
     for (;;) {
@@ -107,7 +112,10 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
             double due = frame * p;
             if (!n || t >= due) { if (t > due + 10 * p) { t0 = now; tick = 0; } break; }
             double left = due - t;
-            if (left > 0.002) Sleep(1); else SwitchToThread();
+            LARGE_INTEGER rel;
+            rel.QuadPart = -(LONGLONG)(left * 1e7) - 1;              /* relative, 100 ns units */
+            if (timer && SetWaitableTimer(timer, &rel, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100);
+            else if (left > 0.002) Sleep(1); else SwitchToThread();
         }
         if (!n) Sleep(1);
     }

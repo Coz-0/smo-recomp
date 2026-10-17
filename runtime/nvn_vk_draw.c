@@ -209,7 +209,7 @@ static struct {
     VkCommandBuffer cmd;
     /* stream ring */
     VkBuffer ring; VMem ring_mem; uint64_t ring_pos, ring_size, ring_lap; uint32_t gen;
-    struct { uint64_t addr, size, off; uint32_t gen; } acache[8192];
+    struct { uint64_t addr, size, off; uint32_t gen, batch, wpos; } acache[8192];      /* wpos: host writes logged up to here were checked (ring_put) */
     VkBuffer zero; VMem zero_mem;
     /* pass */
     int in_pass, pass_w, pass_h;
@@ -305,10 +305,13 @@ static LONG64 g_ts_n;
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_fight[FRSTAT_N];
 static LONG64 g_cur_frame, g_battle_frames;
+void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
     LONG64 t0 = tk();
+    nvn_tl(13, (int)(s - R.slot));
     VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, 20000000000ull);
+    nvn_tl(14, (int)(s - R.slot));
     g_tm[0] += tk() - t0;
     if (r != VK_SUCCESS) vkd_fail("a submitted command buffer did not finish within 20 s (%s): the GPU is stuck or the device is lost", vk_result_name(r));
     VKC(vkResetFences(V.device, 1, &s->fence));
@@ -356,6 +359,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (wait) { sb.waitSemaphoreCount = 1; sb.pWaitSemaphores = &wait; sb.pWaitDstStageMask = &stage; }
     if (signal) { sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &signal; }
     sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
+    nvn_tl(15, (int)R.frame_draws);               /* SMO_FRAMETL: a submission, with the draws of the frame so far */
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
     s->pending = 1; s->serial = ++R.serial;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
@@ -375,6 +379,34 @@ static void cb_ring_wrap(void);
  * again. SMO_VK_RING_DRAIN=1: wait for everything at a wrap, as before. */
 static int g_ring_drain = -1;
 static LONG64 g_ring_waits, g_ring_bytes;
+/* The range caches (the ring's copies of guest ranges, the largest index of an index range) hold for one generation,
+ * R.gen: a new batch starts one (the game writes its memory between batches), and so does a ring wrap. The host's own
+ * writes into guest memory during a batch (UpdateUniformBuffer, reports and timestamps, occlusion results, buffer copies
+ * and clears, compute results copied back) used to start one as well, about 60 times a frame in Cascade Kingdom (52 of
+ * them UpdateUniformBuffer), and 9 of the 22 MB the ring copied each frame were ranges copied again within their batch.
+ * Now such a write is logged with its range, and a cached range is checked against the writes logged since it was copied
+ * or last checked: only a range a write overlaps is copied (or scanned) again. A full log starts a new generation.
+ * Counted for the perf line every 300 frames (why: 0 batch, 1 ring wrap, 2 copy-back of compute results, 3 occlusion
+ * results, 4 UpdateUniformBuffer, 5 report value or timestamp, 6 buffer copy or clear, 7 texture read into a buffer,
+ * 8 write log full, 9 a logged write overlaps the index range of a draw: index_max keeps its cache by generation only). */
+enum { GEN_BATCH, GEN_WRAP, GEN_CB, GEN_OCC, GEN_UBO, GEN_REPORT, GEN_BUF, GEN_TEXBUF, GEN_LOGFULL, GEN_INDEXW, GEN_N };
+static LONG64 g_gen_why[GEN_N], g_wlog_why[GEN_N];
+#define WLOG_N 1024
+static struct { uint64_t lo, hi; } g_wlog[WLOG_N];
+static uint32_t g_wlog_n;                          /* host writes logged in this generation */
+#define GEN_BUMP(why) (R.gen++, g_wlog_n = 0, g_gen_why[why]++)
+static void host_wrote(uint64_t addr, uint64_t size, int why) {
+    if (!size) return;
+    if (g_wlog_n == WLOG_N) { GEN_BUMP(GEN_LOGFULL); return; }
+    g_wlog[g_wlog_n].lo = addr; g_wlog[g_wlog_n].hi = addr + size; g_wlog_n++;
+    g_wlog_why[why]++;
+}
+static int wlog_overlap(uint32_t from, uint64_t lo, uint64_t hi) {      /* a write logged since `from` overlaps [lo, hi) */
+    for (uint32_t w = from; w < g_wlog_n; w++) if (g_wlog[w].lo < hi && lo < g_wlog[w].hi) return 1;
+    return 0;
+}
+static LONG64 g_rput_calls, g_rput_hits, g_rput_again, g_rput_again_bytes;      /* ring_put: calls, cache hits, copies of a range already copied in this batch */
+static uint32_t g_batch_no;
 static void ring_reuse(uint64_t lo, uint64_t hi) {   /* [lo, hi) of this lap is about to be written: whoever read it in the lap before has finished */
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
@@ -391,7 +423,7 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
     if (g_ring_drain < 0) g_ring_drain = getenv("SMO_VK_RING_DRAIN") && atoi(getenv("SMO_VK_RING_DRAIN"));
     if (R.ring_pos + n > R.ring_size) {
         if (g_ring_drain) { cmd_wait_all(); cb_ring_wrap(); }      /* everything that reads the ring has finished */
-        R.ring_pos = 0; R.ring_lap++; R.gen++; R.ring_wraps++; g_fr_wraps++;
+        R.ring_pos = 0; R.ring_lap++; GEN_BUMP(GEN_WRAP); R.ring_wraps++; g_fr_wraps++;
     }
     if (!g_ring_drain && R.ring_lap) ring_reuse(R.ring_pos, R.ring_pos + n);
     uint64_t off = R.ring_pos;
@@ -401,14 +433,28 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
 }
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
     unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19;
+    g_rput_calls++;
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
-        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) return R.acache[i].off;
+        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) {
+            if (R.acache[i].wpos == g_wlog_n || !wlog_overlap(R.acache[i].wpos, addr, addr + size)) { R.acache[i].wpos = g_wlog_n; g_rput_hits++; return R.acache[i].off; }
+            h = i; break;                          /* the host wrote into the range since it was copied: copied again, same entry */
+        }
         if (R.acache[i].gen != R.gen) { h = i; break; }
     }
-    uint64_t off = ring_raw(P(addr), size);
     h &= 8191;
-    R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen;
+    if (R.acache[h].addr == addr && R.acache[h].size == size && R.acache[h].batch == g_batch_no) { g_rput_again++; g_rput_again_bytes += (LONG64)size; }
+    uint64_t off = ring_raw(P(addr), size);
+    R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen; R.acache[h].batch = g_batch_no; R.acache[h].wpos = g_wlog_n;      /* after ring_raw: a wrap starts a generation */
+    return off;
+}
+/* Constant buffer 2 of a stage (R.c2: the texture sizes the translated shaders read) in the ring: copied again only when
+ * a texture binding changed it or a new generation began (it used to be copied at every draw: 2.2 MB a frame). */
+static struct { uint64_t off; uint32_t gen; int valid; } g_c2r[6];
+static uint64_t c2_ring(int s) {
+    if (g_c2r[s].valid && g_c2r[s].gen == R.gen) return g_c2r[s].off;
+    uint64_t off = ring_raw(R.c2[s], sizeof R.c2[s]);
+    g_c2r[s].off = off; g_c2r[s].gen = R.gen; g_c2r[s].valid = 1;
     return off;
 }
 
@@ -1619,6 +1665,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
     for (int i = 0; i < 256; i++) {
         CB *c = &g_cb[i];
         if (!c->state) continue;
+        if (c->dirty) host_wrote(c->addr, c->size, GEN_CB);      /* guest memory changes: ranges the ring copied from it are copied again */
         if (c->dirty && !c->snap) { memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
         else if (c->dirty) {
             /* Session 5: the copy-back is DEFERRED (up to the next batch), so the guest may have written into the range since
@@ -1645,7 +1692,6 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
     nvn_front_ccmp_landed();                       /* SMO_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
     g_tm[1] += tk() - t0;
-    R.gen++;                                       /* guest memory changed: ranges are streamed again */
 }
 static void cb_ring_wrap(void) { if (g_cb_pending) cb_land(0); else cb_masks(); }      /* after cmd_wait_all: the mask words in the ring are about to be reused */
 static void cb_poll(void) {                        /* pending CBs whose submission has finished are copied back; never waits */
@@ -1717,7 +1763,6 @@ static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
 /* The queued entries in their order: the first `need` of them are waited for where the GPU has not finished them yet,
  * the ones after those as long as their submission has finished. */
 static void occ_resolve(int need) {
-    int wrote = 0;
     while (g_occ_qn) {
         OccEntry *e = &g_occ_q[g_occ_qh];
         if (!occ_done(e->serial, need > 0)) break;
@@ -1729,14 +1774,13 @@ static void occ_resolve(int need) {
         if (e->kind == 0 && e->dst) {
             uint64_t d[2] = {g_occ_total, vk_now_ns()};
             memcpy(P(e->dst), d, 16);
-            wrote = 1;
+            host_wrote(e->dst, 16, GEN_OCC);      /* ranges the ring copied from there are copied again */
             if (nvn_front_frame_next() > e->frame) g_occ_late++;
             if (e->log) printf("nvn_vk_occ: frame %lld report %llu samples to %llx (segments %llu..%llu), written in frame %lld\n", (long long)e->frame, (unsigned long long)g_occ_total,
                                (unsigned long long)e->dst, (unsigned long long)e->lo, (unsigned long long)e->hi, nvn_front_frame_next());      /* SMO debug aid (SMO_VK_PASSSHOT) */
         }
         g_occ_qh = (g_occ_qh + 1) % OCC_Q; g_occ_qn--; need--;
     }
-    if (wrote) R.gen++;                            /* guest memory changed: ranges are streamed again */
 }
 static void occ_push(int kind, uint64_t dst) {     /* queues an entry for the segments since the last one */
     occ_end();
@@ -1778,12 +1822,16 @@ static void cb_batch_end(void) {
     for (int i = 0; i < 256; i++) if (g_cb[i].state == 1) g_cb[i].state = 2;
     g_cb_pending = g_cb_live; g_cb_live = 0;
 }
+/* The CBs of this batch (state 1), in the order they were made: the first g_cb_live entries (every change of a CB out of
+ * state 1 sets g_cb_live to 0). Every range a draw reads is looked up here while compute results are live, about 10,000
+ * a frame: walking the 256 slots for the dozen CBs of a frame cost 0.5-0.7 ms a frame once they stayed live longer. */
+static int16_t g_cb_live_list[256];
 static CB *cb_inside(uint64_t addr, uint64_t size) {
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];
+    for (int k = 0; k < g_cb_live; k++) { CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr >= c->addr && addr + size <= c->addr + c->size) return c; }
     return NULL;
 }
 static int cb_overlap(uint64_t addr, uint64_t size) {
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr < g_cb[i].addr + g_cb[i].size && g_cb[i].addr < addr + size) return 1;
+    for (int k = 0; k < g_cb_live; k++) { const CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr < c->addr + c->size && c->addr < addr + size) return 1; }
     return 0;
 }
 static CB *cb_new(uint64_t addr, uint64_t size) {
@@ -1825,7 +1873,7 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         memcpy(c->mem.map, c->snap, (size_t)size);
     } else
     memcpy(c->mem.map, P(addr), (size_t)size);
-    g_cb_live++;
+    g_cb_live_list[g_cb_live++] = (int16_t)(c - g_cb);
     return c;
 }
 typedef struct { uint64_t off, size; int zero; VkBuffer buf; } BufRef;
@@ -1910,7 +1958,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = ring_raw(R.c2[5], sizeof R.c2[5]); b->size = sizeof R.c2[5]; }
+            if (n == 2) { b->off = c2_ring(5); b->size = sizeof R.c2[5]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b);
             else b->zero = 1;                      /* c0 outside the storage descriptors, or nothing bound: zeros (OpenGL: nothing bound) */
@@ -2032,7 +2080,7 @@ static int draw_prepare(unsigned prim) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = ring_raw(R.c2[s], sizeof R.c2[s]); b->size = sizeof R.c2[s]; }
+            if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
             else b->zero = 1;
@@ -2472,7 +2520,7 @@ static void exec(const Cmd *m, int depth) {
                 if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) && (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11)) isint = k == 3 || k == 8 || k == 11 ? 2 : 1;
                 if (nf == 0x3E) isint = 1;
             }
-            memcpy(&R.c2[stage][48 + 2 * u], dims, 16);
+            if (memcmp(&R.c2[stage][48 + 2 * u], dims, 16)) { memcpy(&R.c2[stage][48 + 2 * u], dims, 16); g_c2r[stage].valid = 0; }
             R.tex_int[stage] = (R.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
             R.tex_sint[stage] = (R.tex_sint[stage] & ~(1u << u)) | ((uint32_t)(isint == 2) << u);
         }
@@ -2526,14 +2574,14 @@ static void exec(const Cmd *m, int depth) {
     /* SMO port: reports, as nvn_gl.c's replay writes them (NVNcounterData {counter, timestamp in ns}), after the work
      * recorded before them has run (cb_sync). Counter type 0 carries only the timestamp; types measured by the GPU
      * (samples passed, primitives, shader invocations: Vulkan queries) are not implemented yet and stop with the type. */
-    case OP_REPORT_VALUE: if (a[1]) { cb_sync(); uint64_t d[2] = {(uint32_t)a[0], vk_now_ns()}; memcpy(P(a[1]), d, 16); R.gen++; } break;
+    case OP_REPORT_VALUE: if (a[1]) { cb_sync(); uint64_t d[2] = {(uint32_t)a[0], vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); } break;
     /* NVN counter types: 0 TIMESTAMP (bottom of pipe: after earlier work), 16 TIMESTAMP_TOP (top of pipe: when reached,
      * no wait); 1..15 are measured by the GPU (samples passed ... ZCULL stats), as nvn_gl.c's counter_target lists */
     case OP_COUNTER_RESET: if (a[0] == 1) { occ_reset(); break; } if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferResetCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); } break;
     case OP_COUNTER_REPORT:
         if (a[0] == 1) { occ_report(a[1]); break; }
         if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferReportCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); break; }
-        if (a[1]) { if (a[0] == 0) cb_sync(); uint64_t d[2] = {0, vk_now_ns()}; memcpy(P(a[1]), d, 16); R.gen++; }
+        if (a[1]) { if (a[0] == 0) cb_sync(); uint64_t d[2] = {0, vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
         break;
     case OP_CONSRASTER: if (a[0] & 1) nvn_vk_missing("conservative rasterisation (nvnCommandBufferSetConservativeRasterEnable)"); break;
     case OP_DEPTHBOUNDS: if (a[0] & 1) nvn_vk_missing("the depth bounds test (nvnCommandBufferSetDepthBounds)"); break;
@@ -2568,9 +2616,12 @@ static void exec(const Cmd *m, int depth) {
         if (a[0] & 6) tex_barrier();
         break;
     case OP_DISPATCH: { LONG64 t0 = tk(); compute_dispatch((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); g_tm[2] += tk() - t0; break; }
-    case OP_COPY_BUF_BUF: cb_sync(); if (a[0] && a[1]) memmove(P(a[1]), P(a[0]), (size_t)a[2]); R.gen++; break;      /* guest memory is read / written: what compute wrote must be there (as OpenGL's compute_flush) */
-    case OP_UPDATE_UBO: cb_sync(); if (a[0]) memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); R.gen++; break;
-    case OP_CLEAR_BUF: cb_sync(); if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); } R.gen++; break;
+    case OP_COPY_BUF_BUF: cb_sync(); if (a[0] && a[1]) { memmove(P(a[1]), P(a[0]), (size_t)a[2]); host_wrote(a[1], a[2], GEN_BUF); } break;      /* guest memory is read / written: what compute wrote must be there (as OpenGL's compute_flush) */
+    case OP_UPDATE_UBO:                            /* only compute results in the range written must be in guest memory first (it used to be all of them: a wait for the GPU at the first update after a dispatch) */
+        if (g_cb_pending || (g_cb_live && cb_overlap(a[0] + a[2], a[3]))) cb_sync();
+        if (a[0]) { memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); host_wrote(a[0] + a[2], a[3], GEN_UBO); }
+        break;
+    case OP_CLEAR_BUF: cb_sync(); if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); host_wrote(a[0], a[1], GEN_BUF); } break;
     case OP_CLEARCOLOR: {
         unsigned i = (unsigned)a[0] & 7, mask = (unsigned)a[2] & 15;
         if (!R.have_targets || R.render_off || (int)i >= R.ncol || !R.col[i].tex) break;
@@ -2636,8 +2687,10 @@ static void exec(const Cmd *m, int depth) {
         if (count <= 0 || !a[3]) { R.frame_skipped++; nvn_front_count(1, 1); break; }
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
         BufRef ib;
+        if (g_cb_live && cb_overlap(a[3], (uint64_t)count << t)) cb_sync();      /* index_max reads the indices from guest memory: compute results there first */
         buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
         vtx_switches();
+        if (g_wlog_n && wlog_overlap(0, a[3], a[3] + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
         {   int64_t mv = (int64_t)index_max(a[3], count, t) + (int32_t)a[4];      /* + base vertex */
             vtx_need(mv > 0 ? (uint64_t)mv : 0, a[6] ? (uint64_t)a[5] + a[6] - 1 : (uint64_t)a[5], 1); }
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
@@ -2657,7 +2710,7 @@ static void exec(const Cmd *m, int depth) {
         memcpy(&v, blob, sizeof v); memcpy(r, blob + 24, 24);
         cb_sync();
         read_region(t, &v, r, P(a[3]), R.row_stride, R.image_stride);
-        R.gen++;                                   /* guest memory changed: ranges are streamed again */
+        GEN_BUMP(GEN_TEXBUF);                      /* guest memory changed: ranges are streamed again */
         break;
     }
     case OP_COPY_TEX_TEX: {
@@ -2728,7 +2781,8 @@ static void vk_submit(void *arg) {
     if (g_occ_qn) occ_resolve(0);                  /* occlusion counts whose submissions have finished */
     LONG64 t1 = tk();
     nvn_front_batch_begin();
-    R.gen++;                                       /* guest memory may have changed since the last batch */
+    GEN_BUMP(GEN_BATCH);                           /* guest memory may have changed since the last batch */
+    g_batch_no++;
     if (g_scan_on) { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }      /* session 4: what this batch will need goes to the workers before it is replayed */
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     cb_batch_end();
@@ -3119,6 +3173,15 @@ swap: ;
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+        {   static LONG64 lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes;
+            double g[GEN_N], w[GEN_N];
+            for (int i = 0; i < GEN_N; i++) { g[i] = (double)(g_gen_why[i] - lg[i]) / 300.0; w[i] = (double)(g_wlog_why[i] - lw[i]) / 300.0; }
+            printf("nvn_vk_ring: frames %lld..%lld per frame: streamed %.2f MB, ring_put %.0f calls (%.1f%% cached), copied again within a batch %.0f ranges %.2f MB | new generations: batch %.1f, wrap %.2f, texture to buffer %.2f, write log full %.2f, index range written %.2f | host writes logged: copy-back %.1f, occlusion %.1f, UpdateUniformBuffer %.1f, report %.1f, buffer copy/clear %.1f\n",
+                   (long long)frame - 300, (long long)frame, (double)(g_ring_bytes - lbytes) / 1048576.0 / 300.0, (double)(g_rput_calls - lcalls) / 300.0,
+                   g_rput_calls > lcalls ? 100.0 * (double)(g_rput_hits - lhits) / (double)(g_rput_calls - lcalls) : 0.0, (double)(g_rput_again - lagain) / 300.0, (double)(g_rput_again_bytes - lagain_b) / 1048576.0 / 300.0,
+                   g[GEN_BATCH], g[GEN_WRAP], g[GEN_TEXBUF], g[GEN_LOGFULL], g[GEN_INDEXW], w[GEN_CB], w[GEN_OCC], w[GEN_UBO], w[GEN_REPORT], w[GEN_BUF]);
+            memcpy(lg, g_gen_why, sizeof lg); memcpy(lw, g_wlog_why, sizeof lw); lcalls = g_rput_calls; lhits = g_rput_hits; lagain = g_rput_again; lagain_b = g_rput_again_bytes; lbytes = g_ring_bytes;
+        }
         if (frame % 3000 == 0) m4_report();
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }

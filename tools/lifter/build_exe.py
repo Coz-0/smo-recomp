@@ -31,7 +31,7 @@ HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nv
                 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c',
                 'nncxxlib.c', 'nnlibc2.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c',
                 'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c', 'smo_nerve.c',
-                'gamedll.c']
+                'smo_fast.c', 'gamedll.c']
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', RT, '-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',

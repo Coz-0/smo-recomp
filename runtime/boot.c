@@ -247,6 +247,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     g_main_ctx = &c;
     { void module_coverage_start(Ctx *main_ctx); module_coverage_start(&c); }   /* nnro.c: SMO_MODCOV=1 */
     { void os_apply_main_sched(void); os_apply_main_sched(); }                  /* os_threads.c: SMO_OS_CONSOLE_CORES=1 */
+    { void smo_fast_install(void); smo_fast_install(); }                        /* smo_fast.c: host versions of hot game code (before the game runs) */
     { void hitch_set_main(Ctx *c); hitch_set_main(&c); }      /* hitch.c: SMO_HITCH */
     g_main_stack_base = (uint64_t)stack;
     g_main_stack_size = stack_size;

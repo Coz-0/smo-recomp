@@ -308,8 +308,24 @@ static void os_StartThread(Ctx *c) {
     o->thread = CreateThread(NULL, (SIZE_T)256 << 20, thread_main, o, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, NULL);
     if (o->thread) { SetThreadPriority(o->thread, host_priority(o->priority)); apply_sched(o->thread, o->core_mask); ResumeThread(o->thread); }
 }
+/* The process runs in the ABOVE_NORMAL priority class (SMO_PRIORITY_CLASS=normal: the NORMAL class, as before). With the
+ * console core model every guest thread may run on one host processor only, and the game's helpers at nn::os priority
+ * 17..27 (view update, clipping, draw buffer update: the main thread waits for them every frame) are BELOW_NORMAL
+ * threads: in the NORMAL class any normal thread of another program on one of those three processors comes first. One
+ * class up every level of the mapping is two higher (the six levels stay apart: 8 9 10 11 12 15), above the normal
+ * threads of other programs (8); HIGH would put HIGHEST and TIME_CRITICAL together. Measured at Cascade Kingdom's first
+ * checkpoint: with up to 8 busy programs (11 of 32 processors busy) Windows keeps them off those three processors and
+ * the class changes nothing; with every processor busy (30 busy programs) the game in the NORMAL class got 44% of one
+ * processor and had not reached play after 120 s, in ABOVE_NORMAL it played at 38-39 fps. */
+static void process_priority(void) {
+    const char *e = getenv("SMO_PRIORITY_CLASS");
+    if (e && !_stricmp(e, "normal")) { printf("nn::os: process priority class NORMAL (SMO_PRIORITY_CLASS=normal)\n"); return; }
+    BOOL ok = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    printf("nn::os: process priority class ABOVE_NORMAL%s (SMO_PRIORITY_CLASS=normal for the NORMAL class)\n", ok ? "" : ": REFUSED");
+}
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
 void os_apply_main_sched(void) {
+    process_priority();
     if (!console_cores()) return;
     apply_sched(GetCurrentThread(), 1ull << OS_DEFAULT_CORE);
     SetThreadPriority(GetCurrentThread(), host_priority(OS_DEFAULT_PRIORITY));

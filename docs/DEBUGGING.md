@@ -66,6 +66,22 @@ The end of every log has the counts that tell whether a run was healthy:
   busiest threads (default 4) about every millisecond in each window and prints the functions met most often, what
   each thread was blocked in, and under which function of the game. `tools\dev\profnames.py build\run\<name>.log` adds
   the names of the lifted game's functions (`guest f_...`) from the function list.
+- `SMO_FRAMETL=<first frame>,<frames>` records a timeline of those frames (every job the game's threads queue for the
+  render thread and when it ran, the submissions to the GPU and the waits for it, the presents, the game's waits for the
+  refresh and the refreshes, each with its thread and processor) into `SMO_FRAMETL_OUT=<file>` (default `frametl.txt`
+  next to the exe). `tools\dev\frametl.py <file>` makes a table of it per frame: when the batch was submitted, how long
+  the replay and the present took and how much of it was waiting for the GPU, how long the main thread drew after the
+  present, and how far ahead of the next refresh it was done; the slow frames are listed.
+- `nvn_vk_ring:` (every 300 frames) says what the stream ring copied per frame, how often its range caches were dropped
+  (`new generations`) and which writes of the host into guest memory were checked against them instead.
+- `tools\dev\cpuload.py --busy <n> --seconds <s> --log <file>` keeps n processes busy (arithmetic and memory copies) and
+  logs the CPU use of the system, the game and the busiest other programs every 5 seconds: frame rates measured while
+  other programs use the PC, the same way each time.
+- `SMO_PRIORITY_CLASS=normal` runs the process in the NORMAL priority class (default ABOVE_NORMAL: the game's threads
+  are tied to three processors and must come before other programs' threads there; `runtime/os_threads.c`).
+- `SMO_FAST=0` leaves the game's own code where `runtime/smo_fast.c` puts host code in its place (the sort of the
+  sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
+  results ever differ.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),

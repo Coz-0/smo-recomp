@@ -498,6 +498,7 @@ void report_and_exit(int code) {
     os_thread_report(stdout);
     { void smo_heap_report(FILE *out); smo_heap_report(stdout); }   /* smo_nn.c */
     { void smo_audio_report(FILE *out); smo_audio_report(stdout); }   /* smo_audio.c */
+    { void smo_fast_report(FILE *out); smo_fast_report(stdout); }     /* smo_fast.c */
     { void nerve_report(FILE *out); nerve_report(stdout); }   /* smo_nerve.c */
     module_coverage_report(stdout);
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }

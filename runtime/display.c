@@ -23,6 +23,7 @@ static volatile LONG g_ready;
 static volatile LONG64 g_frames;
 void nvn_gl_start(void *hwnd);                        /* nvn_gl.c */
 void nvn_gl_report(FILE *out);
+void nvn_tl(int ev, int arg);                          /* nvn_gl.c: SMO_FRAMETL timeline */
 static uint64_t g_vsync_event;
 static LARGE_INTEGER g_freq;
 
@@ -155,6 +156,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             InterlockedExchange64(&g_vsync_n, n);
             ReleaseSRWLockExclusive(&g_vsync_lock);
             WakeAllConditionVariable(&g_vsync_cv);
+            nvn_tl(8 /* TL_VSYNC */, (int)(n & 0xffff));
             vsync_test_key();
         }
     }
@@ -307,9 +309,11 @@ int display_wait_refresh(void) {
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
     hitch_pacing(1);
+    nvn_tl(6 /* TL_PACE_BEGIN */, (int)(g_latch & 0xffff));
     AcquireSRWLockExclusive(&g_vsync_lock);
     while (g_vsync_n < g_latch) SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0);
     ReleaseSRWLockExclusive(&g_vsync_lock);
+    nvn_tl(7 /* TL_PACE_END */, (int)(g_vsync_n & 0xffff));
     hitch_pacing(0);
     QueryPerformanceCounter(&b);
     nvn_pf_pace(b.QuadPart - a.QuadPart);

@@ -257,6 +257,17 @@ static LONG64 g_joblog_frame, g_joblog_cur;
 static void joblog(void (*fn)(void *), LONG64 t);
 static inline LONG64 pf_now(void);
 static inline void pf_add(int k, LONG64 t0);
+/* SMO_FRAMETL=<first frame>,<frames> (debug aid): a timeline of those frames. Every job a game thread queues for the render
+ * thread (and whether it waits), when the render thread ran it, its submissions to the GPU and its waits for the GPU, the
+ * presents, the game's waits for the refresh and the refreshes themselves are recorded with the performance counter, the
+ * thread and the processor, and written to SMO_FRAMETL_OUT (default frametl.txt in the exe's folder) once the last of
+ * those frames has been presented, one line per event: counter, thread, event, argument, processor.
+ * tools/dev/frametl.py makes a table per frame of it. Costs one test per event when not set. */
+enum { TL_POST = 1, TL_RUN, TL_RUN_RET, TL_JOB_BEGIN, TL_JOB_END, TL_PACE_BEGIN, TL_PACE_END, TL_VSYNC, TL_FRAME_END, TL_PRESENT_CALL, TL_SYNC_CALL, TL_SYNC_RET,
+       TL_GPU_WAIT, TL_GPU_WAIT_END, TL_GPU_SUBMIT };   /* nvn_vk_draw.c: 13/14 the render thread waits for a submission to finish (slot_wait), 15 vkQueueSubmit */
+static volatile LONG g_tl_on;
+void nvn_tl(int ev, int arg);
+static int tl_kind(void (*fn)(void *));
 enum { PF_WAIT_SUBMIT_ = 13, PF_WAIT_PRESENT_ = 14, PF_WAIT_OTHER_ = 15 };
 /* Hitch log (hitch.c, SMO_HITCH=<ms>): what the render thread is doing right now, for the watchdog. Two stores per scope. */
 extern int g_hitch_ms;
@@ -272,6 +283,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     Job j = {fn, arg, t_done, NULL};
     LONG64 pf0 = pf_now();
     if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) joblog(fn, pf0);
+    if (g_tl_on) nvn_tl(TL_RUN, tl_kind(fn));
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
     g_job_tail = &j;
@@ -280,6 +292,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     hitch_wait_render(1);
     WaitForSingleObject(j.done, INFINITE);
     hitch_wait_render(0);
+    if (g_tl_on) nvn_tl(TL_RUN_RET, tl_kind(fn));
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
 }
 
@@ -309,6 +322,7 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
     InterlockedIncrement(&g_async_pending);
+    if (g_tl_on) nvn_tl(TL_POST, tl_kind(fn));
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = j; else g_job_head = j;
     g_job_tail = j;
@@ -347,6 +361,54 @@ static uint32_t g_gs_last_attr[16];
 static inline LONG64 pf_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 static inline void pf_add(int k, LONG64 t0) { InterlockedExchangeAdd64(&g_pf[k], pf_now() - t0); InterlockedIncrement64(&g_pfn[k]); }
 void nvn_pf_pace(LONG64 ticks) { InterlockedExchangeAdd64(&g_pf[PF_PACE], ticks); InterlockedIncrement64(&g_pfn[PF_PACE]); }     /* display.c */
+
+/* SMO_FRAMETL (see the enum above): the record */
+#define TL_MAX (1 << 18)
+typedef struct { LONG64 t; uint32_t tid; uint16_t ev, arg; uint32_t cpu; } TlEv;
+static TlEv *g_tl;
+static volatile LONG g_tl_n;
+static LONG64 g_tl_first = -2, g_tl_frames;
+static int tl_kind(void (*fn)(void *)) {           /* 0 submit, 1 fence, 2 flush, 3 present, 4 SyncWait, 5 Finish, 9 other */
+    return fn == g_rb->submit || fn == g_rb->submit_async ? 0 : fn == g_rb->fence ? 1 : fn == g_rb->flush ? 2 : fn == g_rb->present ? 3 :
+           fn == g_rb->sync_wait ? 4 : fn == g_rb->finish ? 5 : 9;
+}
+void nvn_tl(int ev, int arg) {
+    if (!g_tl_on) return;
+    LONG i = InterlockedIncrement(&g_tl_n) - 1;
+    if (i >= TL_MAX) return;
+    g_tl[i].t = pf_now(); g_tl[i].tid = GetCurrentThreadId(); g_tl[i].ev = (uint16_t)ev; g_tl[i].arg = (uint16_t)arg; g_tl[i].cpu = GetCurrentProcessorNumber();
+}
+static DWORD WINAPI tl_write(void *arg) {           /* the record, written by a thread of its own (on the render thread it held a frame) */
+    LONG64 last = (LONG64)(uintptr_t)arg;
+    Sleep(20);                                     /* a thread between its test of g_tl_on and its store */
+    const char *out = getenv("SMO_FRAMETL_OUT");
+    FILE *fp = fopen(out ? out : "frametl.txt", "w");
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    LONG n = g_tl_n < TL_MAX ? g_tl_n : TL_MAX;
+    if (fp) {
+        fprintf(fp, "# frametl frames %lld..%lld, %ld events, counter %lld Hz, render thread %lu\n", (long long)g_tl_first, (long long)last, (long)n, (long long)fq.QuadPart, (unsigned long)g_render_tid);
+        for (LONG i = 0; i < n; i++) fprintf(fp, "%lld %lu %u %u %u\n", (long long)g_tl[i].t, (unsigned long)g_tl[i].tid, g_tl[i].ev, g_tl[i].arg, g_tl[i].cpu);
+        fclose(fp);
+    }
+    printf("nvn_tl: frames %lld..%lld: %ld events written to %s\n", (long long)g_tl_first, (long long)last, (long)n, out ? out : "frametl.txt");
+    return 0;
+}
+static void tl_frame_end(LONG64 frame) {           /* render thread, after the present of `frame` */
+    if (g_tl_first == -2) {
+        const char *e = getenv("SMO_FRAMETL");
+        g_tl_first = -1;
+        if (e && sscanf(e, "%lld,%lld", &g_tl_first, &g_tl_frames) == 2 && g_tl_first > 0 && g_tl_frames > 0) g_tl = calloc(TL_MAX, sizeof *g_tl);
+        if (!g_tl) g_tl_first = -1;
+    }
+    if (g_tl_first < 0) return;
+    if (g_tl_on) nvn_tl(TL_FRAME_END, (int)(frame & 0xffff));
+    if (frame == g_tl_first - 1) InterlockedExchange(&g_tl_on, 1);
+    if (frame != g_tl_first + g_tl_frames - 1) return;
+    InterlockedExchange(&g_tl_on, 0);
+    HANDLE th = CreateThread(NULL, 0, tl_write, (void *)(uintptr_t)frame, 0, NULL);
+    if (th) CloseHandle(th);
+    g_tl_frames = 0;                               /* recorded once */
+}
 
 static void logf_limited(int *counter, int limit, const char *fmt, ...) {
     if (*counter >= limit) return;
@@ -3794,7 +3856,9 @@ static void render_loop(void) {
             HANDLE done = j->done;
             if (g_rb->idle) g_rb->idle();
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
+            if (g_tl_on) nvn_tl(TL_JOB_BEGIN, tl_kind(j->fn));
             j->fn(j->arg);                       /* a member of g_rb (seam step S2), or a job of the front end / of the back end itself */
+            if (g_tl_on) nvn_tl(TL_JOB_END, tl_kind(j->fn));
             g_hitch_rt = "idle";
             if (done) SetEvent(done); else { free(j); InterlockedDecrement(&g_async_pending); }      /* gl_post: nobody waits */
         }
@@ -4701,6 +4765,7 @@ static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_prese
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     if (j.win && j.win->native && j.win->native == album_movie_native_window()) { gl_run(g_rb->present_movie, &j); return; }
+    if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();
     if (g_present_sync < 0) g_present_sync = !(getenv("SMO_PRESENT_ASYNC") && atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();
@@ -4818,10 +4883,12 @@ static void job_sync_wait(void *arg) {
 static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> NVNsyncWaitResult */
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3};
+    if (g_tl_on) nvn_tl(TL_SYNC_CALL, o == g_window_sync);
     if (o) gl_run(g_rb->sync_wait, &j);
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (display_wait_refresh()) j.result = 1;             /* NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED; otherwise as before */
     }
+    if (g_tl_on) nvn_tl(TL_SYNC_RET, (int)j.result);
     RET(j.result);
 }
 static void job_server_wait(void *arg) { SyncJob *j = arg; if (j->o->s) glWaitSync(j->o->s, 0, 0xFFFFFFFFFFFFFFFFull); j->result = j->o->s != NULL; }
@@ -5471,6 +5538,7 @@ long long nvn_front_frame_end(long long draws, long long skipped, long long clea
     pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;
+    tl_frame_end(frame);
     if (frame <= 3 || frame % 600 == 0 || draws != 0 && g_logn < 40 && (g_logn++, 1))
         printf("nvn_vk: frame %lld: %lld draws (%lld skipped), %lld clears | totals: %lld lists, %lld textures, %lld uploads (%lld MB)\n", (long long)frame, draws, skipped, clears,
                (long long)g_st.lists, (long long)g_st.tex_created, (long long)g_st.tex_uploads, (long long)(g_st.tex_bytes >> 20));

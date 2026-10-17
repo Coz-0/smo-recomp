@@ -29,7 +29,10 @@ GUEST_BASE = 0x7100000000
 SDK_BASE = 0x7500000000
 # game functions the runtime calls by name (the console's own allocator lives in main for this game)
 GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
-             '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
+             '_ZdlPv',               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
+             # runtime/smo_fast.c: the sampler list sort of agl::driver::NVNMgr in host code
+             '_ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E', '_ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj',
+             '_ZN3agl6driver6NVNMgr18compareSamplerKey_EPKNS1_10SamplerKeyES4_']
 
 
 def layout(m):
