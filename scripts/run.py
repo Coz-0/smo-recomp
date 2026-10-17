@@ -13,6 +13,8 @@ linker map. --full prints the whole log instead.
 --seq plays an input sequence file (SMO_SEQ, runtime/nnhid.c; one or more steps per line, '#' starts a comment), e.g.
 tests/cap_kingdom.seq. --userdata gives the game its own save folder (SMO_USERDATA; created if missing): a new, empty
 folder starts a new game, a copy of an earlier run's folder continues from there. Without it saves go to build/userdata.
+--target <version> runs the build of another game version (scripts/setup.py --target): build/<version>/ in place of
+build/ for everything above.
 """
 import argparse
 import os
@@ -22,9 +24,8 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(REPO, 'build', 'bin')
-RUN = os.path.join(REPO, 'build', 'run')
 sys.path.insert(0, os.path.join(REPO, 'tools', 'lifter'))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
 import mapaddr  # noqa: E402
 
 
@@ -37,9 +38,14 @@ def main():
     ap.add_argument('--full', action='store_true')
     ap.add_argument('--seq', help='input sequence file (SMO_SEQ)')
     ap.add_argument('--userdata', help='save folder for this run (SMO_USERDATA)')
+    ap.add_argument('--target', help='game version of the build to run (default 1.0.0, or SMO_TARGET)')
     a = ap.parse_args()
+    if a.target:
+        os.environ['SMO_TARGET'] = a.target
+    import target as T
+    BIN, RUN = T.build('bin'), T.build('run')
     os.makedirs(RUN, exist_ok=True)
-    os.makedirs(os.path.join(REPO, 'build', 'userdata'), exist_ok=True)
+    os.makedirs(T.build('userdata'), exist_ok=True)
     if a.seq:
         steps = [line.split('#', 1)[0].strip() for line in open(a.seq, encoding='utf-8')]
         a.env.append('SMO_SEQ=' + ' '.join(s for s in steps if s))
@@ -58,7 +64,7 @@ def main():
     log = os.path.join(RUN, a.name + '.log')
     with open(log, 'w', encoding='utf-8', errors='replace') as f:
         try:
-            r = subprocess.run([exe, r'..\dump\base\elf\main.elf', str(max(a.seconds, 0))], cwd=BIN, stdout=f, stderr=subprocess.STDOUT,
+            r = subprocess.run([exe, os.path.relpath(T.elf('main'), BIN), str(max(a.seconds, 0))], cwd=BIN, stdout=f, stderr=subprocess.STDOUT,
                                env=env, timeout=a.seconds + 120 if a.seconds > 0 else None)      # 0: no time limit, until the window is closed
             code = r.returncode
         except subprocess.TimeoutExpired:
