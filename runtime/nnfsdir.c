@@ -154,7 +154,7 @@ static const ImportDef fsdir_imports[] = {
 void register_nnfsdir_imports(void) {
     int n = (int)(sizeof fsdir_imports / sizeof fsdir_imports[0]);
     for (int i = 0; i < n; i++)
-        if (!import_data(fsdir_imports[i].name)) printf("nnfsdir: \"%s\" is not an import of the game (typo?)\n", fsdir_imports[i].name);
+        if (!import_data(fsdir_imports[i].name)) printf("nnfsdir: \"%s\" is not an import of this game version (a typo, or a name another version imports)\n", fsdir_imports[i].name);
     register_imports(fsdir_imports, n);
 }
 
