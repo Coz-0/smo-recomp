@@ -56,6 +56,7 @@ static void vsync_test_key(void);
  * paces itself on the same refresh clock (display_menu_wait). */
 static volatile LONG g_menu_hold;
 void display_menu_hold(int on) { InterlockedExchange(&g_menu_hold, on); }
+int display_menu_held(void) { return g_menu_hold != 0; }     /* nvn_vk_wd.c: a game held on purpose (menu, guide) is not frozen */
 static int vsync_signal_ok(void) { return !g_menu_hold; }
 
 /* TEST ONLY, SMO_SPEED=<n> (debug_mode.c, tests\DEBUG_MODE.md): 2, 4 (any number > 0) = the refresh clock runs n times
@@ -78,7 +79,60 @@ static void speed_init(void) {
 int oe_exit_request(void);                            /* nnmisc.c */
 static volatile LONG g_closing;
 int display_closing(void) { return g_closing != 0; }  /* smo_amiibo.c: the menu gives way to the game when the window is being closed */
+
+/* The window's mode (config\graphics.ini, gfx_options.c): windowed, borderless fullscreen, fullscreen (topmost), or the
+ * default, a borderless window of the configured size (dragged anywhere to move it). F11, or a double-click in a borderless
+ * window, switches between covering the monitor and the window; a window left by a mode that started covering the monitor
+ * is the borderless window of the configured size, centred. Called on the window thread. */
+static int g_win_full;                                /* the window covers its monitor now */
+static int g_win_drag;                                /* the window is a borderless window now: its whole area moves it */
+static int g_win_topmost;                             /* graphics.ini fullscreen: covering the monitor means on top */
+static RECT g_win_rect;                               /* the window's rectangle (and style) before it covered the monitor */
+static DWORD g_win_style;
+static void window_fullscreen(HWND h, int on) {
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+    if (on == g_win_full || !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    if (on) {
+        GetWindowRect(h, &g_win_rect);
+        g_win_style = (DWORD)GetWindowLongA(h, GWL_STYLE);
+        SetWindowLongA(h, GWL_STYLE, (LONG)((g_win_style & ~(DWORD)WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE));
+        SetWindowPos(h, g_win_topmost ? HWND_TOPMOST : HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        g_win_drag = 0;
+    } else {
+        if (IsRectEmpty(&g_win_rect)) {
+            const GfxOptions *go = gfx_options();
+            int ww = mi.rcWork.right - mi.rcWork.left, wh = mi.rcWork.bottom - mi.rcWork.top;
+            int cw = go->width < ww ? go->width : ww, ch = go->height < wh ? go->height : wh;
+            SetRect(&g_win_rect, mi.rcWork.left + (ww - cw) / 2, mi.rcWork.top + (wh - ch) / 2, mi.rcWork.left + (ww - cw) / 2 + cw, mi.rcWork.top + (wh - ch) / 2 + ch);
+            g_win_style = WS_POPUP | WS_CLIPCHILDREN;
+        }
+        SetWindowLongA(h, GWL_STYLE, (LONG)(g_win_style | WS_VISIBLE));
+        SetWindowPos(h, HWND_NOTOPMOST, g_win_rect.left, g_win_rect.top, g_win_rect.right - g_win_rect.left, g_win_rect.bottom - g_win_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        g_win_drag = !(g_win_style & WS_CAPTION);
+    }
+    g_win_full = on;
+    printf("display: the window %s (F11)\n", on ? "covers its monitor" : g_win_drag ? "is a borderless window" : "has its frame again");
+    fflush(stdout);
+}
+
+void *display_hwnd(void) { return g_hwnd; }
+void display_toggle_fullscreen(void) { if (g_hwnd) window_fullscreen(g_hwnd, !g_win_full); }    /* on the window thread (smo_guide.c) */
+#define WM_SMO_GUIDE (WM_APP + 0x47)                /* smo_guide.c: the Help page in the game window */
+void guide_on_message(HWND hwnd, WPARAM what, LPARAM arg);
+void guide_on_size(void);
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_SMO_GUIDE) { guide_on_message(h, w, l); return 0; }
+    if (m == WM_SIZE) guide_on_size();
+    if (m == WM_NCHITTEST && g_win_drag) {           /* a borderless window: dragging anywhere moves it */
+        LRESULT r = DefWindowProcA(h, m, w, l);
+        return r == HTCLIENT ? HTCAPTION : r;
+    }
+    if ((m == WM_NCLBUTTONDBLCLK && w == HTCAPTION && g_win_drag) || (m == WM_LBUTTONDBLCLK && g_win_full)) { window_fullscreen(h, !g_win_full); return 0; }
+    if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) { window_fullscreen(h, !g_win_full); return 0; }
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
         InterlockedExchange(&g_closing, 1);
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
@@ -103,28 +157,41 @@ static char g_title[96];
 
 static DWORD WINAPI window_thread(LPVOID arg) {
     (void)arg;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   /* smo_guide.c: the WebView2 objects live on this thread */
     WNDCLASSA wc;
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.lpszClassName = "smo_native_window";
-    wc.style = CS_OWNDC;
+    wc.style = CS_OWNDC | CS_DBLCLKS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
-    /* Track O: window mode and size from config\graphics.ini (gfx_options.c). borderless / fullscreen: a frameless window
-     * over the primary monitor (fullscreen: also topmost). */
+    /* Track O: window mode and size from config\graphics.ini (gfx_options.c). borderless window (the default): frameless,
+     * the configured size (at most the primary monitor's work area), centred on it. borderless fullscreen / fullscreen: a
+     * frameless window over the primary monitor (fullscreen: also topmost). F11 switches (window_fullscreen). */
     const GfxOptions *go = gfx_options();
-    DWORD style = go->window_mode ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+    DWORD style = (go->window_mode ? WS_POPUP : WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN;      /* children: the Help page (smo_guide.c) */
     int cw = go->width, ch = go->height, px = CW_USEDEFAULT, py = CW_USEDEFAULT;
     if (go->window_mode) {
         MONITORINFO mi;
         POINT origin = {0, 0};
         memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
-        if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) { cw = mi.rcMonitor.right - mi.rcMonitor.left; ch = mi.rcMonitor.bottom - mi.rcMonitor.top; px = mi.rcMonitor.left; py = mi.rcMonitor.top; }
+        if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            if (go->window_mode == 3) {
+                int ww = mi.rcWork.right - mi.rcWork.left, wh = mi.rcWork.bottom - mi.rcWork.top;
+                if (cw > ww) cw = ww;
+                if (ch > wh) ch = wh;
+                px = mi.rcWork.left + (ww - cw) / 2; py = mi.rcWork.top + (wh - ch) / 2;
+            } else { cw = mi.rcMonitor.right - mi.rcMonitor.left; ch = mi.rcMonitor.bottom - mi.rcMonitor.top; px = mi.rcMonitor.left; py = mi.rcMonitor.top; }
+        }
     }
+    g_win_full = go->window_mode == 1 || go->window_mode == 2;
+    g_win_drag = go->window_mode == 3;
+    g_win_topmost = go->window_mode == 2;
     RECT r = {0, 0, cw, ch};
     AdjustWindowRect(&r, style, FALSE);
-    printf("display: window %s, client %dx%d (graphics.ini)\n", go->window_mode == 2 ? "fullscreen (borderless, topmost)" : go->window_mode ? "borderless" : "windowed", cw, ch);
+    printf("display: window %s, client %dx%d (graphics.ini; F11 switches between covering the monitor and the window)\n",
+           go->window_mode == 2 ? "fullscreen (borderless, topmost)" : go->window_mode == 1 ? "borderless fullscreen" : go->window_mode == 3 ? "borderless window" : "windowed", cw, ch);
     /* Only the copies a person plays (smo_native.exe, smo_user.exe, or SMO_SHOW=1) get a window on screen;
      * test copies started under any other name keep theirs off-screen and out of the taskbar, so automated
      * runs do not cover the desktop. SMO_TITLE names the window. */

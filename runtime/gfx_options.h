@@ -4,8 +4,9 @@
 typedef struct {
     char path[260];
     int renderer;            /* 0 Vulkan (default), 1 OpenGL                               env SMO_RENDERER=vk|gl wins */
-    int window_mode;         /* 0 windowed, 1 borderless (desktop size), 2 fullscreen (borderless, topmost, covering the monitor) */
-    int width, height;       /* client size of the windowed mode */
+    int window_mode;         /* 0 windowed, 1 borderless fullscreen (desktop size), 2 fullscreen (borderless, topmost, covering the
+                              * monitor), 3 borderless window (the default: no frame, width x height, centred) */
+    int width, height;       /* client size of the windowed modes (windowed, borderless window) */
     int present;             /* 0 clock (mailbox, else immediate, paced by our 60 Hz clock), 1 vsync on (fifo), 2 vsync off (immediate), 3 mailbox;   env SMO_VK_PRESENT wins */
     char gpu[64];            /* "" = discrete first; an index of the printed list, or a part of the device name   env SMO_VK_DEVICE wins */
     float scale;             /* internal resolution scale asked for (Vulkan: nvn_vk_draw.c rs_scale, 0.25 .. 1.0; env SMO_VK_SCALE wins) */

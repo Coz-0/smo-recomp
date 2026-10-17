@@ -21,11 +21,15 @@ static const char *const k_default_ini =
 ";   vulkan: the default since 2026-10-09. opengl: the first renderer (NVIDIA only), kept as a fallback.\r\n"
 "renderer = vulkan\r\n"
 "\r\n"
-"; window = windowed | borderless | fullscreen\r\n"
-";   windowed:   a normal window with the client size below.\r\n"
-";   borderless: no frame, covers the monitor the window is on (the desktop keeps its resolution).\r\n"
-";   fullscreen: as borderless, and always on top. (Exclusive fullscreen with a mode change is not implemented.)\r\n"
-"window = windowed\r\n"
+"; window = borderless_window | borderless_fullscreen | windowed | fullscreen\r\n"
+";   borderless_window:     a window without a frame or title bar, the size below, centred on the screen. Drag it\r\n"
+";                          anywhere to move it; double-click it for borderless_fullscreen and back.\r\n"
+";   borderless_fullscreen: no frame, covers the monitor the window is on (the desktop keeps its resolution).\r\n"
+";   windowed:              a normal window with a title bar, the client size below.\r\n"
+";   fullscreen:            as borderless_fullscreen, and always on top. (Exclusive fullscreen with a mode change is\r\n"
+";                          not implemented.)\r\n"
+";   F11 switches between covering the monitor and the window while the game runs.\r\n"
+"window = borderless_window\r\n"
 "width = 1280\r\n"
 "height = 720\r\n"
 "\r\n"
@@ -109,7 +113,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 3;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -127,7 +131,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         *eq = 0; val = eq + 1;
         trim(key); trim(val);
         if (!_stricmp(key, "renderer")) o->renderer = !_stricmp(val, "opengl") || !_stricmp(val, "gl");
-        else if (!_stricmp(key, "window")) o->window_mode = !_stricmp(val, "borderless") ? 1 : !_stricmp(val, "fullscreen") ? 2 : 0;
+        else if (!_stricmp(key, "window")) o->window_mode = !_stricmp(val, "borderless_fullscreen") || !_stricmp(val, "borderless") ? 1 : !_stricmp(val, "fullscreen") ? 2 : !_stricmp(val, "windowed") ? 0 : 3;
         else if (!_stricmp(key, "width")) { int v = atoi(val); if (v >= 320 && v <= 16384) o->width = v; }
         else if (!_stricmp(key, "height")) { int v = atoi(val); if (v >= 180 && v <= 16384) o->height = v; }
         else if (!_stricmp(key, "vsync")) o->present = !_stricmp(val, "on") ? 1 : !_stricmp(val, "off") ? 2 : !_stricmp(val, "mailbox") ? 3 : 0;
@@ -146,7 +150,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     }
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
-    static const char *const k_win[3] = {"windowed", "borderless", "fullscreen"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
+    static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
     printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
