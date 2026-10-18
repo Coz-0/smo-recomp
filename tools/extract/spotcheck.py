@@ -18,19 +18,21 @@ import csv
 import os
 import random
 import struct
+import sys
 
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402
 OFF = 0x1000
 TERM = {'ret', 'b', 'br', 'brk', 'udf', 'hlt', 'eret', 'braa', 'brab', 'retaa', 'retab'}
 COND_BR = ('b.', 'cbz', 'cbnz', 'tbz', 'tbnz')
 
 
 def load(module):
-    rows = list(csv.DictReader(open(os.path.join(REPO, 'build', 'functions', '%s_functions.tsv' % module),
-                                    encoding='utf-8'), delimiter='\t'))
-    img = open(os.path.join(REPO, 'build', 'dump', 'base', 'elf', '%s.elf' % module), 'rb').read()
+    rows = list(csv.DictReader(open(T.build('functions', '%s_functions.tsv' % module), encoding='utf-8'), delimiter='\t'))
+    img = open(T.elf(module), 'rb').read()
     return rows, img
 
 
@@ -93,7 +95,7 @@ def check(module, n, seed, show):
         if shown < show:
             shown += 1
             print('--- %s %x..%x  src %s  %s' % (module, s, e, rows[i]['src'],
-                                                 (rows[i].get('decomp_name') or rows[i]['symbol'])[:90]))
+                                                 (rows[i]['symbol'] or rows[i]['rtti_name'])[:90]))
             body = insns if len(insns) <= 12 else insns[:5] + [None] + insns[-5:]
             for x in body:
                 print('    ...' if x is None else '    %08x  %-8s %s' % (x.address, x.mnemonic, x.op_str))

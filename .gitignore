@@ -45,7 +45,7 @@ gen*/
 *.map
 *.spv
 
-# function lists carry addresses and names derived from the dump (and the decompilation, when given)
+# function lists carry addresses and names derived from the dump
 functions*.tsv
 functions*.json
 

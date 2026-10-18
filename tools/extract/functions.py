@@ -1,11 +1,7 @@
-"""The list of every function of a module, with start/end addresses, the evidence for each boundary, and
-names (the module's own dynamic symbols, plus OdysseyDecomp's name where it has a function at the same address).
+"""The list of every function of a module, with start/end addresses, the evidence for each boundary, and names
+(the module's own dynamic symbols, and for main's nerve states the name RTTI gives).
 
-    python tools/extract/functions.py [--dump build/dump/base] [--out build/functions]
-                                      [--decomp <OdysseyDecomp clone, optional>]
-
-The defaults follow SMO_TARGET (tools/target.py): for an update target, build/dump/update and build/<version>/functions;
-the decompilation's names are for 1.0.0 and are only used for that target.
+    python tools/extract/functions.py [--dump build/dump/update] [--out build/functions]
 
 Boundary evidence, per function (column `src`):
     E  .eh_frame FDE (exact start and length, written by the compiler)
@@ -17,27 +13,26 @@ The list is the union of E and S, plus B/R/T targets that no E/S function starts
 E or S end when there is one (they must agree, checked), else the next start. Addresses are module-relative
 (main is loaded at 0x7100000000 on the console; add that for absolute addresses).
 
-Names of main's nerve states from RTTI (column `rtti_name`; 1.4.1's main has almost no symbols): every class whose
+Names of main's nerve states from RTTI (column `rtti_name`; the game's main has almost no symbols): every class whose
 typeinfo derives (through single-inheritance bases) from al::Nerve has a vtable whose first function is its
-execute(al::NerveKeeper *) const; that function gets the mangled name the class implies. On 1.0.0 these names equal the
-symbols and the decompilation's names wherever those exist (see the summary line).
+execute(al::NerveKeeper *) const; that function gets the mangled name the class implies. In the base game's main,
+which has symbols, these names equal the symbols wherever both exist.
 
-Writes <out>/<module>_functions.tsv and <out>/summary.json. Output is derived from the dump and the decomp: it stays
-under build/ (ignored by git).
+Writes <out>/<module>_functions.tsv (start, end, size, src, end_from, symbol, rtti_name) and <out>/summary.json. Output
+is derived from the dump: it stays under build/ (ignored by git).
 """
 import argparse
 import bisect
 import collections
 import json
 import os
-import re
 import struct
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T               # noqa: E402
-OFF = 0x1000                     # image offset inside our ELF files (switchfs.nso_to_elf)
+OFF = 0x1000                     # image offset inside our ELF files (nso.nso_to_elf)
 
 
 def sext(v, n):
@@ -171,38 +166,7 @@ class Module:
         return v, p + n
 
 
-def decomp_list(decomp):
-    """{offset: (label, size, status, guess)} from OdysseyDecomp data/file_list.yml (simple line parser)."""
-    p = os.path.join(decomp, 'data', 'file_list.yml')
-    out = {}
-    if not os.path.isfile(p):
-        return out
-    cur = {}
-    in_label = False
-    for line in open(p, encoding='utf-8'):
-        m = re.match(r'\s+- offset: (0x[0-9a-fA-F]+)', line)
-        if m:
-            if 'offset' in cur:
-                out[cur['offset']] = cur
-            cur = {'offset': int(m.group(1), 16)}
-            in_label = False
-            continue
-        m = re.match(r'\s+(size|label|status|guess|lazy):\s*(.*)', line)
-        if m and 'offset' in cur:
-            v = m.group(2).strip().strip("'\"")
-            in_label = m.group(1) == 'label' and v == ''          # a list of labels follows (e.g. C1 + C2 ctors)
-            cur[m.group(1)] = v
-            continue
-        m = re.match(r'\s+- (\S.*)$', line)
-        if in_label and m:
-            item = m.group(1).strip().strip("'\"")
-            cur['label'] = item if not cur['label'] else cur['label'] + '|' + item
-    if 'offset' in cur:
-        out[cur['offset']] = cur
-    return out
-
-
-def analyse(mod, decomp=None):
+def analyse(mod):
     words = mod.words()
     text_end = mod.text_end
     exact = {}                                        # start -> {'E': end, 'S': end}
@@ -289,38 +253,6 @@ def analyse(mod, decomp=None):
              'secondary_examples': ['%x in %x' % (a, containing(a)) for a in secondary[:10]],
              'bl_targets': len(bl), 'reloc_targets': len(rel), 'tail_targets': len(tail),
              'text_bytes_in_exact_functions': covered, 'named_by_dynsym': sum(1 for r in rows if r['names'])}
-
-    if decomp is not None:
-        by_start = {r['start']: r for r in rows}
-        same = size_same = size_diff = 0
-        missing = []
-        size_diffs = []
-        for off, e in decomp.items():
-            r = by_start.get(off)
-            if r is None:
-                missing.append(off)
-                continue
-            same += 1
-            r['decomp'] = e
-            try:
-                dsz = int(e.get('size', '-1'))
-            except ValueError:
-                dsz = -1
-            if r['end'] - r['start'] == dsz:
-                size_same += 1
-            else:
-                size_diff += 1
-                if len(size_diffs) < 20:
-                    size_diffs.append('%x: ours %d decomp %d (%s)' % (off, r['end'] - r['start'], dsz, r['src']))
-        ours_not_decomp = [r['start'] for r in rows if r['start'] not in decomp]
-        stats['decomp'] = {'decomp_functions': len(decomp), 'same_start': same, 'same_start_and_size': size_same,
-                           'same_start_other_size': size_diff, 'size_diff_examples': size_diffs,
-                           'decomp_start_not_in_ours': len(missing),
-                           'missing_examples': ['%x' % m for m in missing[:20]],
-                           'ours_not_in_decomp': len(ours_not_decomp),
-                           'ours_not_in_decomp_by_src': dict(collections.Counter(
-                               by_start[s]['src'] for s in ours_not_decomp).most_common(12)),
-                           'named_by_decomp': sum(1 for r in rows if 'decomp' in r)}
     return rows, stats
 
 
@@ -377,17 +309,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dump', default=T.DUMP)
     ap.add_argument('--out', default=T.build('functions'))
-    ap.add_argument('--decomp', default=os.path.join(os.path.dirname(REPO), 'ref', 'OdysseyDecomp'))
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     summary = {}
     elfdir = os.path.join(a.dump, 'elf')
-    base_main = os.path.normcase(os.path.abspath(a.dump)) == os.path.normcase(os.path.join(REPO, 'build', 'dump', 'base'))
     for fn in sorted(os.listdir(elfdir)):
         name = fn[:-4]
         mod = Module(os.path.join(elfdir, fn))
-        dec = decomp_list(a.decomp) if name == 'main' and base_main else None   # its addresses are 1.0.0's
-        rows, stats = analyse(mod, dec)
+        rows, stats = analyse(mod)
         rtti = rtti_nerves(mod, on_end=True) if name == 'main' else {}
         if rtti:
             on_end = sum(1 for n in rtti.values() if '12executeOnEndE' in n)
@@ -395,29 +324,21 @@ def main():
             starts = {r['start'] for r in rows}
             same_sym = sum(1 for r in rows if r['start'] in rtti and rtti[r['start']] in r['names'])
             other_sym = sum(1 for r in rows if r['start'] in rtti and r['names'] and rtti[r['start']] not in r['names'])
-            dec_rows = [r for r in rows if r['start'] in rtti and '7executeEP' in r.get('decomp', {}).get('label', '')
-                        or r['start'] in rtti and '12executeOnEndEP' in r.get('decomp', {}).get('label', '')]
-            same_dec = sum(1 for r in dec_rows if r['decomp']['label'].lstrip('#') == rtti[r['start']])
             stats['rtti_nerves'] = {'execute_functions': len(rtti_exec), 'own_executeOnEnd': on_end,
                                     'not_a_listed_start': len(set(rtti) - starts),
-                                    'same_as_symbol': same_sym, 'other_symbol': other_sym,
-                                    'decomp_named': len(dec_rows), 'same_as_decomp': same_dec}
+                                    'same_as_symbol': same_sym, 'other_symbol': other_sym}
         summary[name] = stats
         with open(os.path.join(a.out, '%s_functions.tsv' % name), 'w', encoding='utf-8', newline='\n') as f:
-            f.write('start\tend\tsize\tsrc\tend_from\tsymbol\tdecomp_name\tdecomp_status\trtti_name\n')
+            f.write('start\tend\tsize\tsrc\tend_from\tsymbol\trtti_name\n')
             for r in rows:
-                d = r.get('decomp', {})
-                f.write('%x\t%x\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' % (
+                f.write('%x\t%x\t%d\t%s\t%s\t%s\t%s\n' % (
                     r['start'], r['end'], r['end'] - r['start'], r['src'], r['end_from'], '|'.join(r['names']),
-                    d.get('label', ''), d.get('status', ''), rtti.get(r['start'], '')))
+                    rtti.get(r['start'], '')))
         print('%-8s functions %6d  exact E %6d  S %6d  both %6d  E/S disagree %d  heuristic-only %d  secondary entries %d'
               '  .text covered %.2f%%' % (name, stats['functions'], stats['exact_E'], stats['exact_S'],
                                           stats['exact_both'], stats['E_S_end_disagree'], stats['only_heuristic'],
                                           stats['secondary_entries'],
                                           100.0 * stats['text_bytes_in_exact_functions'] / stats['text_size']))
-        if 'decomp' in stats:
-            print('         decomp:', json.dumps({k: v for k, v in stats['decomp'].items()
-                                                  if not k.endswith('examples')}))
         if 'rtti_nerves' in stats:
             print('         nerve states from RTTI:', json.dumps(stats['rtti_nerves']))
     with open(os.path.join(a.out, 'summary.json'), 'w') as f:
