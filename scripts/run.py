@@ -15,18 +15,80 @@ tests/cap_kingdom.seq. --userdata gives the game its own save folder (SMO_USERDA
 folder starts a new game, a copy of an earlier run's folder continues from there. Without it saves go to build/userdata.
 --target <version> runs the build of another game version (scripts/setup.py --target): build/<version>/ in place of
 build/ for everything above.
+
+A test copy first waits for one of SMO_MAX_GAMES places on this PC (default: one per 12 GB of memory, 2 on a 32 GB PC;
+0 = no limit): a game in a stage takes 4-7 GB, and more test games than fit make the PC page, which slows every game
+and can make graphics memory allocations fail. smo_native.exe and smo_user.exe never wait.
 """
 import argparse
+import ctypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+from ctypes import wintypes
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'lifter'))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 import mapaddr  # noqa: E402
+
+PLAYED = ('smo_native.exe', 'smo_user.exe')     # the copies a person plays: a window, sound, no waiting for a place
+
+
+class _MemoryStatus(ctypes.Structure):
+    _fields_ = [('dwLength', wintypes.DWORD), ('dwMemoryLoad', wintypes.DWORD)] + [
+        (n, ctypes.c_ulonglong) for n in ('total_phys', 'avail_phys', 'total_page', 'avail_page', 'total_virtual',
+                                          'avail_virtual', 'avail_extended')]
+
+
+def max_games():
+    """SMO_MAX_GAMES, or one test game per 12 GB of the PC's memory (at least one)."""
+    if os.environ.get('SMO_MAX_GAMES'):
+        return max(int(os.environ['SMO_MAX_GAMES']), 0)
+    m = _MemoryStatus()
+    m.dwLength = ctypes.sizeof(m)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return max(int(m.total_phys / 2**30 / 12), 1)
+
+
+def take_place(exe_name, poll=2.0, name='Local\\smo_test_game_%d'):
+    """Waits until fewer than max_games() test games run on this PC and takes a place: the named mutex
+    Local\\smo_test_game_<k>, held by this thread until release_place (a launcher that dies frees its place: the mutex
+    is abandoned). Returns the mutex handle, or None for the played copies and with no limit."""
+    n = max_games()
+    if exe_name.lower() in PLAYED or n == 0:
+        return None
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    waited = None
+    while True:
+        for k in range(n):
+            h = k32.CreateMutexW(None, False, name % k)
+            if not h:
+                continue
+            if k32.WaitForSingleObject(h, 0) in (0, 0x80):          # WAIT_OBJECT_0, WAIT_ABANDONED (its launcher died)
+                if waited:
+                    print('run.py: place %d of %d free after %.0f s' % (k, n, time.time() - waited))
+                return h
+            k32.CloseHandle(h)
+        if waited is None:
+            waited = time.time()
+            print('run.py: %d test games are running (SMO_MAX_GAMES=%d): waiting for one to end' % (n, n))
+            sys.stdout.flush()
+        time.sleep(poll)
+
+
+def release_place(h):
+    if h:
+        ctypes.windll.kernel32.ReleaseMutex(wintypes.HANDLE(h))
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(h))
 
 
 def main():
@@ -39,6 +101,8 @@ def main():
     ap.add_argument('--seq', help='input sequence file (SMO_SEQ)')
     ap.add_argument('--userdata', help='save folder for this run (SMO_USERDATA)')
     ap.add_argument('--target', help='game version of the build to run (default 1.0.0, or SMO_TARGET)')
+    ap.add_argument('--timeout', type=int, help='seconds after which a game still running is killed (default --seconds + 120; '
+                                                'a run of several stages, SMO_STAGE_LIST, has the time limit per stage)')
     a = ap.parse_args()
     if a.target:
         os.environ['SMO_TARGET'] = a.target
@@ -54,21 +118,26 @@ def main():
         a.env.append('SMO_USERDATA=' + os.path.abspath(a.userdata))
     src = os.path.join(BIN, 'smo_native.exe')
     exe = os.path.join(BIN, a.exe)
-    if a.exe != 'smo_native.exe':
-        shutil.copy2(src, exe)
-        shutil.copy2(src[:-4] + '.map', exe[:-4] + '.map')
-    env = dict(os.environ)
-    for kv in a.env:
-        k, v = kv.split('=', 1)
-        env[k] = v
-    log = os.path.join(RUN, a.name + '.log')
-    with open(log, 'w', encoding='utf-8', errors='replace') as f:
-        try:
-            r = subprocess.run([exe, os.path.relpath(T.elf('main'), BIN), str(max(a.seconds, 0))], cwd=BIN, stdout=f, stderr=subprocess.STDOUT,
-                               env=env, timeout=a.seconds + 120 if a.seconds > 0 else None)      # 0: no time limit, until the window is closed
-            code = r.returncode
-        except subprocess.TimeoutExpired:
-            code = 'timeout (killed)'
+    place = take_place(a.exe)
+    try:
+        if a.exe != 'smo_native.exe':
+            shutil.copy2(src, exe)
+            shutil.copy2(src[:-4] + '.map', exe[:-4] + '.map')
+        env = dict(os.environ)
+        for kv in a.env:
+            k, v = kv.split('=', 1)
+            env[k] = v
+        log = os.path.join(RUN, a.name + '.log')
+        with open(log, 'w', encoding='utf-8', errors='replace') as f:
+            try:
+                r = subprocess.run([exe, os.path.relpath(T.elf('main'), BIN), str(max(a.seconds, 0))], cwd=BIN, stdout=f,
+                                   stderr=subprocess.STDOUT, env=env,      # 0: no time limit, until the window is closed
+                                   timeout=a.timeout or (a.seconds + 120 if a.seconds > 0 else None))
+                code = r.returncode
+            except subprocess.TimeoutExpired:
+                code = 'timeout (killed)'
+    finally:
+        release_place(place)
     text = open(log, encoding='utf-8', errors='replace').read()
     if a.full:
         print(text)
