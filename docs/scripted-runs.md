@@ -5,7 +5,7 @@ state. It is how gameplay is tested here: the same sequence, played after a chan
 checkpoints. `tests/run_cap_kingdom.py` is the example: from an empty save to Mario's first capture in Top-Hat Tower.
 
 ```bat
-.venv\Scripts\python scripts\run.py <run name> --seconds 600 --seq tests\cap_kingdom.seq --userdata build\run\<run name>_save
+.venv\Scripts\python scripts\run.py <run name> --seconds 600 --seq tests\cap_kingdom.seq --userdata build\run\<run name>_save --env SMO_SEQ_EXIT=1
 ```
 
 ## Sequences
@@ -77,7 +77,7 @@ when a cutscene takes the player for 10 polls, and when a new stage starts (a ne
 
 ## The Cap Kingdom run
 
-`tests\run_cap_kingdom.py <new run name>` plays `tests\cap_kingdom.seq` from an empty save and checks 13 checkpoints:
+`tests\run_cap_kingdom.py <new run name>` plays `tests\cap_kingdom.seq` from an empty save and checks 14 checkpoints:
 
 1. the mode select of a new game
 2. the prologue skipped through its own menu (Plus twice, then Skip)
@@ -93,10 +93,12 @@ when a cutscene takes the player for 10 polls, and when a new stage starts (a ne
 11. the tower door opened by the cap
 12. inside Top-Hat Tower (a new stage)
 13. a frog captured
+14. the capture's message ("You captured a frog!") closed with A
 
 It also requires 0 host exceptions, 0 Vulkan call failures, 0 operations not implemented, 0 unknown command handles,
-and no dropped audio samples or underruns. It takes about 12 minutes with a warm shader cache. The checkpoints land on
-the same frames within a few frames from run to run.
+and no dropped audio samples or underruns. The run ends with its sequence (`SMO_SEQ_EXIT=1`), a second after play
+goes on as the frog: about 5 minutes with a warm shader cache. The checkpoints land on the same frames within a few
+frames from run to run.
 
 Limits: the route depends on the game behaving the same way each time (it does, as far as measured); the sequence
 does not avoid enemies (a small Goomba hits Mario once on the way to the tower door).

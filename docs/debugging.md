@@ -261,7 +261,13 @@ The end of every log has the counts that tell whether a run was healthy:
   registered, before the game starts; one line per group, then it exits with the number of failed checks as exit code.
   `SMO_AMIIBO_SHOT=<file.png>` also saves the menu picture it composes.
 - `SMO_MANUAL=<folder>` takes the game's manual from that folder instead of `build\manual`; `SMO_WEB_NOOPEN=1` prepares
-  the Help pages without showing them (neither in the game window nor in the browser).
+  the Help pages without showing them (neither in the game window nor in the browser). Nothing is written next to the
+  manual: the game window adds the console browser's `window.nx` to the page, a web browser gets a copy in
+  `%TEMP%\smo-recomp-help`.
+- `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
+  focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
+  the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.
+  `graphics.ini` `unfocused = run` (the default) keeps the game running then; `pause` stops it as the console does.
 - `SMO_STRICT=1` lists, at start, every import bound to a handler that does nothing and every function import without a
   handler, and stops (exit code 5); `SMO_STRICT=report` lists them and goes on. The `strict check:` line of every log
   counts them.

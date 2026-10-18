@@ -104,10 +104,13 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
 - The window: by default a borderless window of the size in `graphics.ini`, centred (drag it anywhere to move it). F11,
   or a double-click on it, switches between that and borderless fullscreen; `window = borderless_fullscreen` starts that
-  way, and `windowed` (with a title bar) and `fullscreen` (on top) are there too.
-- Help (the pause menu's Action Guide) opens inside the game window and the game waits while it is open, as on the
-  console: stick or d-pad and A to choose and open, L / R to turn pages, B to go back and to close (keyboard: arrows,
-  Enter, Q / E, Escape).
+  way, and `windowed` (with a title bar) and `fullscreen` (on top) are there too. The game keeps running while its
+  window is not the active one or is minimised (pads and keyboard count only while it is active); `unfocused = pause`
+  in `graphics.ini` stops it then instead, as the console stops a game behind its HOME menu.
+- Help (the pause menu's Action Guide) opens inside the game window, scaled to it, and the game waits while it is open,
+  as on the console: stick or d-pad and A to choose and open, L / R to turn pages, B to go back and to close (keyboard:
+  arrows, Enter, Q / E, Escape). Its Choose Mode item leads to the game's Options, and back to the page when you
+  leave them, as on the console.
 - amiibo: press F1, or both stick buttons of a pad, while you play. The game waits and a menu like its pause menu lists
   the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F1 again) to close. When the game is
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
@@ -122,8 +125,9 @@ The scripted Cap Kingdom run checks the game from a new save up to Mario's first
 .venv\Scripts\python tests\run_cap_kingdom.py <new run name>
 ```
 
-It takes about 12 minutes with a warm shader cache (give a first run a larger `--seconds`, e.g. 1500) and exits with
-code 0 when every checkpoint was reached and every health counter is zero.
+It takes about 5 minutes with a warm shader cache and ends by itself once the capture's message is closed (give a
+first run a larger `--seconds`, e.g. 1500); it exits with code 0 when every checkpoint was reached and every health
+counter is zero.
 
 ## Troubleshooting
 
