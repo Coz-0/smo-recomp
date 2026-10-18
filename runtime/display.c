@@ -59,21 +59,18 @@ void display_menu_hold(int on) { InterlockedExchange(&g_menu_hold, on); }
 int display_menu_held(void) { return g_menu_hold != 0; }     /* nvn_vk_wd.c: a game held on purpose (menu, guide) is not frozen */
 static int vsync_signal_ok(void) { return !g_menu_hold; }
 
-/* TEST ONLY, SMO_SPEED=<n> (debug_mode.c, tests\DEBUG_MODE.md): 2, 4 (any number > 0) = the refresh clock runs n times
- * faster; 0 = uncapped. Not set or 1 = nothing changes. In this mode there is no free-running vsync thread: the refresh is
- * given when the frame the game queued is due, ONE refresh per queued frame (interval 1), the event is signalled and the
- * wait goes on until the game's VSync Count Thread has counted it (window object + 0x138), so the game steps one frame per
- * presented frame whatever the host speed; the wall-clock gap between refreshes is 1/60/n s (none when uncapped). */
-static double g_speed = 1.0;
-static int g_lockstep;
-static volatile uint64_t g_wnd_count_addr;           /* guest address of the window object's refresh count, once known */
+/* TEST ONLY, SMO_SPEED=<n>: the refresh clock (vsync_thread) runs n times faster, 60 x n refreshes a second (any number
+ * > 0; 0 = 960 a second, as fast as the PC can run the game). The game waits for a refresh before each frame and steps
+ * once per frame, so it runs up to n times faster where the PC keeps up; input sequences count frames, so they play the
+ * same. Not set or 1 = nothing changes. (A lockstep clock, a refresh only once the game has queued a frame, never starts
+ * this game: it waits for a refresh before its first frame.) */
+static double g_rate = 60.0;                          /* refreshes a second */
 static void speed_init(void) {
     const char *e = getenv("SMO_SPEED");
     if (!e || !e[0]) return;
-    g_speed = atof(e);
-    if (g_speed < 0) g_speed = 0;
-    g_lockstep = g_speed != 1.0;
-    if (g_lockstep) printf("display: SMO_SPEED=%s: %s, one refresh per presented frame\n", e, g_speed > 0 ? "paced at n x 60 Hz" : "uncapped");
+    double speed = atof(e);
+    g_rate = speed > 0 ? 60.0 * speed : 960.0;
+    if (g_rate != 60.0) printf("display: SMO_SPEED=%s (TEST ONLY): the refresh clock runs at %.0f Hz\n", e, g_rate);
 }
 
 int oe_exit_request(void);                            /* nnmisc.c */
@@ -225,7 +222,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         for (;;) {
-            LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
+            LONGLONG target = t0.QuadPart + (LONGLONG)((double)(n + 1) * (double)g_freq.QuadPart / g_rate);      /* no accumulated rounding */
             QueryPerformanceCounter(&now);
             LONGLONG left = target - now.QuadPart;
             if (left > 0) {
@@ -234,7 +231,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
                 for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
             }
-            LONG64 passed = (now.QuadPart - t0.QuadPart) * 60 / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
+            LONG64 passed = (LONG64)((double)(now.QuadPart - t0.QuadPart) * g_rate / (double)g_freq.QuadPart);   /* >= n + 1; more when this thread was kept off the CPU */
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
@@ -288,7 +285,7 @@ void display_init(void) {
     while (!g_ready) Sleep(1);
     nvn_gl_start(g_hwnd);
     speed_init();
-    if (!g_lockstep) CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
+    CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
     { void nvn_vk_selftest_hook(void); nvn_vk_selftest_hook(); }      /* nvn_vk.c: SMO_RENDERER=vk SMO_VK_SELFTEST=<frames>, then exit (plan\phases\V1_vulkan.md, M1) */
 }
 
@@ -303,7 +300,6 @@ static LONG64 g_cs_steps, g_cs_hist[4];      /* game steps (1 + refreshes skippe
  * VSync Count Thread has counted, + 0x140 = the count at its previous present. Right after this call the game computes
  * steps = max(count - last, 1) (0x710386fc30) and then stores last = count. */
 void display_clock_sample(uint64_t index_ptr) {
-    if (g_lockstep && index_ptr) g_wnd_count_addr = index_ptr - 0x30 + 0x138;
     if (!g_clockstat || !index_ptr) return;
     uint64_t count = rd64(index_ptr - 0x30 + 0x138), last = rd64(index_ptr - 0x30 + 0x140);
     LONG64 d = (LONG64)(count - last);
@@ -342,8 +338,6 @@ static void frame_queued(void) {
     }
     if ((now.QuadPart - second_start.QuadPart) >= g_freq.QuadPart) {
         char title[160];
-        if (g_lockstep) printf("speed: frame %lld, %lld frames presented in the last %.2f s (%.1f per second)%c", (long long)n, (long long)second_frames,
-                               (double)(now.QuadPart - second_start.QuadPart) / (double)g_freq.QuadPart, (double)second_frames * (double)g_freq.QuadPart / (double)(now.QuadPart - second_start.QuadPart), 10);
         if (gfx_options()->overlay && second_frames) {       /* track O: frame_time_overlay = on */
             double ms = (double)(now.QuadPart - second_start.QuadPart) * 1000.0 / (double)g_freq.QuadPart / (double)second_frames;
             printf("frame-time: %.2f ms per frame over the last second (%lld frames)\n", ms, (long long)second_frames);
@@ -359,40 +353,6 @@ static void frame_queued(void) {
 int display_wait_refresh(void) {
     if (old_pacing() || !InterlockedExchange(&g_latch_pending, 0)) return 0;
     if (g_vsync_n >= g_latch) return 0;
-    if (g_lockstep) {                                              /* SMO_SPEED: see the comment at g_speed */
-        static LONG64 due;                                         /* wall-clock time of the next refresh (QPC ticks) */
-        LARGE_INTEGER a, now;
-        QueryPerformanceCounter(&a);
-        while (g_vsync_n < g_latch) {
-            if (g_speed > 0) {
-                LONGLONG step = (LONGLONG)((double)g_freq.QuadPart / (60.0 * g_speed));
-                if (!due) due = a.QuadPart;
-                due += step;
-                QueryPerformanceCounter(&now);
-                if (now.QuadPart - due > 4 * step) due = now.QuadPart;      /* far behind (a load): do not run to catch up */
-                while (now.QuadPart < due) {
-                    LONGLONG left = due - now.QuadPart;
-                    if (left * 1000 > 2 * g_freq.QuadPart) Sleep(1); else YieldProcessor();
-                    QueryPerformanceCounter(&now);
-                }
-            }
-            uint64_t ca = g_wnd_count_addr, c0 = ca ? rd64(ca) : 0;
-            AcquireSRWLockExclusive(&g_vsync_lock);
-            g_vsync_n++;
-            ReleaseSRWLockExclusive(&g_vsync_lock);
-            if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
-            if (ca) {                                              /* wait until the game's VSync Count Thread has counted it */
-                LARGE_INTEGER t0, t1;
-                QueryPerformanceCounter(&t0);
-                while (rd64(ca) == c0) {
-                    QueryPerformanceCounter(&t1);
-                    if ((t1.QuadPart - t0.QuadPart) * 1000 > 100 * g_freq.QuadPart) { printf("display: speed mode: the game did not count a refresh within 100 ms%c", 10); break; }
-                    Sleep(0);
-                }
-            }
-        }
-        return 1;
-    }
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
     hitch_pacing(1);
@@ -407,9 +367,9 @@ int display_wait_refresh(void) {
     return 1;
 }
 /* smo_amiibo.c: the menu's own pace while it holds the game: until the next refresh of the clock (16 ms where there is no
- * refresh clock: SMO_SPEED, SMO_OLD_PACING) */
+ * refresh clock: SMO_OLD_PACING) */
 void display_menu_wait(void) {
-    if (old_pacing() || g_lockstep) { Sleep(16); return; }
+    if (old_pacing()) { Sleep(16); return; }
     LONG64 n = g_vsync_n;
     AcquireSRWLockExclusive(&g_vsync_lock);
     while (g_vsync_n == n) if (!SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0)) break;
@@ -461,6 +421,8 @@ void display_pace(void) {
         second_start = now;
     }
 }
+
+long long display_frames(void) { return g_frames; }  /* smo_nerve.c (SMO_STAGE_LIST): frames presented so far */
 
 void display_report(FILE *out) {
     fprintf(out, "\ndisplay: %lld frames presented\n", (long long)g_frames);

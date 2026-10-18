@@ -328,6 +328,10 @@ int main(int argc, char **argv) {
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("SMO_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
     DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    {   unsigned long long stage_list_started(void);     /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the limit counts from the start of the stage being played */
+        for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > GetTickCount64(); )
+            wr = WaitForSingleObject(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
+    }
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
         for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
     }

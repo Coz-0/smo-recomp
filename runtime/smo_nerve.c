@@ -21,15 +21,21 @@
  *                               @near / @chase steer to an actor found by its nerve (nerve_actor_pos), @at waits for the
  *                               player at a point (nerve_player)
  *   SMO_FUNCTIONS=<path>        the function list (default ..\functions\main_functions.tsv, relative to build\bin)
+ *   SMO_START_STAGE=<stage>[:<scenario>]  TEST ONLY: the first stage scene starts that stage (see start_stage_init); the
+ *                               one place here that writes game memory
+ *   SMO_STAGE_LIST=<stage>[:<scenario>[:<start>]],...  TEST ONLY: one stage after another in one run, each changed to by
+ *                               the game's own stage change when the input sequence is done (see stage_play_hit)
  *
  * A nerve's name is its mangled nested name without the anonymous namespace, joined with "::"
  * (_ZNK12_GLOBAL__N_135OpeningStageStartDemoNrvWaitStandUp7executeEPN2al11NerveKeeperE -> OpeningStageStartDemoNrvWaitStandUp).
- * Reads game memory only; never changes it. */
+ * Reads game memory only, except for SMO_START_STAGE's one change of a scene's init info and SMO_STAGE_LIST's calls of
+ * the game's own stage change. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <psapi.h>
 #include "hostrt.h"
 
 long long nvn_front_frame_next(void);                     /* nvn_gl.c: the number the frame being made will get */
@@ -223,9 +229,12 @@ static void nerve_load(void) {
            g_nrv_count, named, from_rtti, derived, block, hosted);
 }
 
+static void start_stage_init(void);
+static void stage_list_init(void);
 static void nerve_init(void) {                           /* first indirect call (any thread); the others wait for it */
     static volatile LONG once;
     if (InterlockedCompareExchange(&once, 1, 0)) { while (*(volatile int *)&g_nerve_mode < 0) YieldProcessor(); return; }
+    start_stage_init();
     const char *log = getenv("SMO_NERVELOG"), *pos = getenv("SMO_ACTORPOS"), *seq = getenv("SMO_SEQ");
     int want = (log && *log) || (pos && atoi(pos) > 0) || (seq && (strstr(seq, "@nerve:") || strstr(seq, "@until-nerve:") || strstr(seq, "@goto:") ||
                                                                     strstr(seq, "@near:") || strstr(seq, "@at:") || strstr(seq, "@chase:")));
@@ -233,6 +242,7 @@ static void nerve_init(void) {                           /* first indirect call 
     g_pos_every = pos ? atoi(pos) : 0;
     if (pos && strchr(pos, ':')) snprintf(g_pos_prefix, sizeof g_pos_prefix, "%s", strchr(pos, ':') + 1);
     if (want) nerve_load();
+    stage_list_init();
     MemoryBarrier();
     g_nerve_mode = want && g_nrv_count > 0;
 }
@@ -367,6 +377,282 @@ int nerve_watch_set(const char *a, const char *b) {
     g_nerve_watch[1] = found[1];
     g_nerve_watch[0] = found[0];
     return found[0] != 0;
+}
+
+/* TEST ONLY, SMO_START_STAGE=<stage>[:<scenario>]: the first stage scene the game starts is that stage (in that
+ * scenario) instead of the one it chose. A save always resumes in a kingdom's home stage; a test starts any other stage
+ * this way, as the game does when Mario goes through the stage's entrance, but at the stage's default start point.
+ * StageScene::init(const al::SceneInitInfo &) runs through the scene's vtable (GAME_VSYM_StageScene_init, gen_tables.py):
+ * call_indirect (hostrt.c) compares each indirect call with it; the first call gets the init info's stage name (+0x18)
+ * replaced and its scenario (+0x20): the one given, else the stage's own scenario when the game has one for it (what
+ * its door gives, use_scenario: 1 for a kingdom's challenge rooms), else the kingdom's as the game chose it. Later calls
+ * (the game's own, e.g. the restart after a miss) are only logged. The game then starts that stage itself
+ * (GameDataHolder::startStage from StageScene::init). */
+volatile uint64_t g_stage_init;                           /* hostrt.c call_indirect: the function watched for, 0 = none */
+static char g_start_stage[128];
+static int g_start_scenario = -1;
+static int g_stage_inits;                                 /* StageScene::init calls seen */
+
+/* TEST ONLY, SMO_STAGE_LIST=<stage>[:<scenario>[:<start>]],...: several stages one after another in one run, so that a
+ * test of many stages boots the game once (tests/stress_stages.py --chain). The first entry is the stage the run starts
+ * in (the save's, or SMO_START_STAGE's). Whenever the input sequence is done (nnhid.c), the game changes to the next
+ * entry through its own stage change, the one a door makes: at the scene's next StageSceneNrvPlay (nnhid.c presses B
+ * every 45 polls while the change waits for it: a map, the pause menu or a message left open) a ChangeStageInfo
+ * (GameDataHolder, start, stage, not a return, scenario, no sub-scenario) is made by the game's own constructor and given
+ * to GameDataFunction::tryChangeNextStage (GAME_FN_*, gen_tables.py); StageScene::exePlay then ends the scene and the
+ * game's sequence loads the stage, in a world of its own when it is a kingdom's home stage. <scenario> (default -1: the
+ * game's choice, as for a door) and <start>, the id of a start point (e.g. a checkpoint flag's PlayerRestartPos; default
+ * the stage's default start), are optional. The GameDataHolder is the one the stage scenes are made with (SceneInitInfo
+ * +8, checked by its RTTI). When the next StageScene::init runs, the input sequence starts again: SMO_SEQ_<n> for the
+ * n-th entry (1-based), else SMO_STAGE_SEQ, else SMO_SEQ. Lines: "stage list: frame F: stage n of N begins: the game
+ * starts <stage>, scenario <s>" at each StageScene::init of the list, "stage list: stage n of N done at frame F ...: run
+ * totals: ..." when its input sequence is done (the counters the end-of-run summary prints, so far, for tests to take
+ * apart per stage); after the last entry the run ends as with SMO_SEQ_EXIT=1. boot.c: the run's time limit counts from
+ * the start of the entry being played (the moment its stage change was asked for). */
+#define LIST_MAX 64
+static struct { char stage[96], start[160]; int scenario; } g_list[LIST_MAX];
+static int g_list_n;                                      /* entries; 0 = no stage list */
+static volatile LONG g_list_cur;                          /* the entry being played, 0-based */
+enum { LIST_PLAY, LIST_ASKED, LIST_CHANGING, LIST_BEGUN };
+static volatile LONG g_list_state;                        /* LIST_ASKED: waits for StageSceneNrvPlay; LIST_CHANGING: for the next StageScene::init */
+static uint64_t g_holder;                                 /* the game's GameDataHolder */
+static uint64_t g_play_exec;                              /* StageSceneNrvPlay's execute */
+volatile uint64_t g_stage_play;                           /* hostrt.c call_indirect: g_play_exec while a change waits for it, else 0 */
+static volatile ULONGLONG g_list_tick;                    /* see stage_list_started */
+
+static void start_stage_init(void) {                      /* nerve_init: before the first indirect call goes on */
+    const char *e = getenv("SMO_START_STAGE"), *l = getenv("SMO_STAGE_LIST");
+    if (e && e[0]) {
+        snprintf(g_start_stage, sizeof g_start_stage, "%s", e);
+        char *colon = strchr(g_start_stage, ':');
+        if (colon) { *colon = 0; g_start_scenario = atoi(colon + 1); }
+        if (!GAME_VSYM_StageScene_init) printf("start stage: SMO_START_STAGE is set, but this build does not know StageScene::init (gen_tables.py): ignored\n");
+        else {
+            printf("start stage: the first stage scene will start %s (SMO_START_STAGE=%s, TEST ONLY)\n", g_start_stage, e);
+            g_stage_init = GAME_VSYM_StageScene_init;
+        }
+    }
+    if (!l || !l[0]) return;
+    if (!GAME_VSYM_StageScene_init || !GAME_FN_ChangeStageInfo_ctor || !GAME_FN_tryChangeNextStage) {
+        printf("stage list: SMO_STAGE_LIST is set, but this build does not know StageScene::init, ChangeStageInfo's constructor and "
+               "GameDataFunction::tryChangeNextStage (gen_tables.py): ignored\n");
+        return;
+    }
+    for (const char *s = l; *s && g_list_n < LIST_MAX; ) {
+        size_t len = strcspn(s, ",");
+        char tok[300];
+        snprintf(tok, sizeof tok, "%.*s", (int)(len < sizeof tok ? len : sizeof tok - 1), s);
+        s += len + (s[len] == ',');
+        if (!tok[0]) continue;
+        char *f2 = strchr(tok, ':'), *f3 = f2 ? strchr(f2 + 1, ':') : NULL;
+        if (f2) *f2++ = 0;
+        if (f3) *f3++ = 0;
+        snprintf(g_list[g_list_n].stage, sizeof g_list[0].stage, "%s", tok);
+        g_list[g_list_n].scenario = f2 && *f2 ? atoi(f2) : -1;
+        snprintf(g_list[g_list_n].start, sizeof g_list[0].start, "%s", f3 ? f3 : "");
+        g_list_n++;
+    }
+    printf("stage list: %d stages in one run (SMO_STAGE_LIST, TEST ONLY):", g_list_n);
+    for (int i = 0; i < g_list_n; i++) printf(" %s%s", g_list[i].stage, i + 1 < g_list_n ? "," : "\n");
+    g_stage_init = GAME_VSYM_StageScene_init;             /* every StageScene::init, while the list lasts */
+}
+static void stage_list_init(void) {                       /* nerve_init, after the nerve list may have been loaded */
+    if (!g_list_n) return;
+    if (!g_nrv_count) nerve_load();                       /* for the address of StageSceneNrvPlay's execute; tracking stays as decided */
+    for (int i = 0; i < g_nrv_count && !g_play_exec; i++) if (!strcmp(g_nrv[i].name, "StageSceneNrvPlay")) g_play_exec = g_nrv[i].addr;
+    if (!g_play_exec) { printf("stage list: the nerve StageSceneNrvPlay is not in the function list: no stage after the first\n"); g_list_n = 1; }
+}
+
+/* The counters of the end-of-run summary so far, in one line (stage_list_seq_done); each of them only grows. */
+long long display_frames(void);                                                   /* display.c */
+void nvn_vk_counts(long long *failures, long long *missing);                      /* nvn_vk.c */
+int import_counts(int *stubs);                                                    /* hostrt.c */
+void smo_audio_counts(long long *frames, long long *dropped, long long *underruns);   /* smo_audio.c */
+void nvn_vk_hold_counts(long long *holds, long long *hold_ms, long long *dummies); /* nvn_vk_m4.c */
+static void stage_totals(char *out, size_t n) {
+    long long fail = 0, miss = 0, af = 0, drop = 0, under = 0, holds = 0, hold_ms = 0, dummies = 0;
+    int stubs = 0, imports = import_counts(&stubs);
+    nvn_vk_counts(&fail, &miss);
+    smo_audio_counts(&af, &drop, &under);
+    nvn_vk_hold_counts(&holds, &hold_ms, &dummies);
+    PROCESS_MEMORY_COUNTERS_EX pm;
+    memset(&pm, 0, sizeof pm);
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
+    FILETIME made, ex, k, u, now;                         /* the run's time: since the process was made */
+    GetProcessTimes(GetCurrentProcess(), &made, &ex, &k, &u);
+    GetSystemTimeAsFileTime(&now);
+    double run_s = (double)((((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - (((ULONGLONG)made.dwHighDateTime << 32) | made.dwLowDateTime)) / 1e7;
+    snprintf(out, n, "%lld frames presented, %lld Vulkan call failures, %lld calls of operations that are not implemented, imports reached %d "
+             "(still stubs %d), audio device sink %lld frames, %lld samples dropped, %lld underruns, loading-screen holds %lld (%lld ms), "
+             "samplers given a dummy %lld, process memory %llu MB, run time %.1f s", display_frames(), fail, miss, imports, stubs, af, drop, under,
+             holds, hold_ms, dummies, (unsigned long long)(pm.PrivateUsage >> 20), run_s);
+}
+
+/* nnhid.c: when the input sequence of the entry being played is done, does a next entry follow? Else the sequence's own
+ * end applies (SMO_SEQ_EXIT). */
+int stage_list_has_next(void) { return g_list_n && g_list_cur + 1 < g_list_n && g_holder && g_list_state == LIST_PLAY; }
+
+/* nnhid.c: the input sequence of the entry being played is done: its line with the run's totals, and the change to the
+ * next entry is asked for */
+void stage_list_seq_done(long long poll) {
+    if (!g_list_n) return;
+    char totals[600];
+    stage_totals(totals, sizeof totals);
+    int k = g_list_cur;
+    long long frame = nvn_front_frame_next();
+    printf("stage list: stage %d of %d done at frame %lld (poll %lld): run totals: %s\n", k + 1, g_list_n, frame, poll, totals);
+    if (k + 1 < g_list_n && !g_holder) printf("stage list: no stage scene was seen, so no GameDataHolder to change stage with: no stage after this\n");
+    if (!stage_list_has_next()) { fflush(stdout); return; }
+    unsigned nvn_gl_held_ms(void);                        /* nvn_gl.c: held presents are not run time (boot.c) */
+    g_list_tick = GetTickCount64() - nvn_gl_held_ms();
+    InterlockedExchange(&g_list_state, LIST_ASKED);
+    g_stage_play = g_play_exec;
+    printf("stage list: stage %d of %d, %s, scenario %d%s%s: the game is asked to change stage at its next StageSceneNrvPlay (frame %lld)\n", k + 2, g_list_n,
+           g_list[k + 1].stage, g_list[k + 1].scenario, g_list[k + 1].start[0] ? ", start " : "", g_list[k + 1].start, frame);
+    fflush(stdout);
+}
+
+/* nnhid.c: a stage change is asked for and waits for the scene's StageSceneNrvPlay */
+int stage_list_waiting(void) { return g_list_n && g_list_state == LIST_ASKED; }
+
+/* boot.c: when the entry being played began (GetTickCount64, less the time presents were held before; 0 = the first
+ * entry, or no list): the run's time limit counts from there */
+unsigned long long stage_list_started(void) { return g_list_n ? g_list_tick : 0; }
+
+/* The scenario the game's own stage change gives a stage when none is asked for, as a door without a ScenarioNo does:
+ * ChangeStageInfo's constructor then takes GameDataHolder::findUseScenarioNo (1 for a kingdom's challenge rooms, say);
+ * -1 when the stage has none (it plays in the kingdom's scenario). Made with the calling thread's registers, put back. */
+static int use_scenario(Ctx *c, uint64_t holder, const char *stage) {
+    static __declspec(align(16)) unsigned char csi[0x1000];      /* a ChangeStageInfo: 0x278 bytes in 1.0.0 and 1.4.1 */
+    if (!GAME_FN_ChangeStageInfo_ctor || !holder) return -1;
+    Ctx saved = *c;
+    memset(csi, 0, sizeof csi);
+    c->x[0] = (uint64_t)(uintptr_t)csi;
+    c->x[1] = holder;
+    c->x[2] = 0;
+    c->x[3] = (uint64_t)(uintptr_t)stage;
+    c->x[4] = 0;
+    c->x[5] = 0xffffffffu;                                /* no scenario asked for */
+    c->x[6] = 0;
+    call_guest(c, GAME_FN_ChangeStageInfo_ctor);
+    *c = saved;
+    return *(int32_t *)(csi + 0x1cc);                     /* its scenario: +0x1cc in both versions */
+}
+
+/* The GameDataHolder a stage scene is made with (SceneInitInfo +8), when RTTI says it is one; else 0. */
+static uint64_t holder_of(uint64_t info) {
+    char cls[64] = "?";
+    uint64_t h = rd64(info + 8);
+    return class_of(h, cls, sizeof cls) && !strcmp(cls, "GameDataHolder") ? h : 0;
+}
+
+/* hostrt.c call_indirect, on the thread that runs the stage scene: StageSceneNrvPlay's execute while a change is asked
+ * for. The game's own calls are made with this thread's registers, which are put back before its call goes on. */
+void stage_play_hit(Ctx *c) {
+    g_stage_play = 0;
+    if (g_list_state != LIST_ASKED) return;
+    int k = g_list_cur + 1;
+    static __declspec(align(16)) unsigned char info[0x1000];     /* ChangeStageInfo: 0x278 bytes in 1.0.0 and 1.4.1 */
+    Ctx saved = *c;
+    memset(info, 0, sizeof info);
+    c->x[0] = (uint64_t)(uintptr_t)info;
+    c->x[1] = g_holder;
+    c->x[2] = g_list[k].start[0] ? (uint64_t)(uintptr_t)g_list[k].start : 0;
+    c->x[3] = (uint64_t)(uintptr_t)g_list[k].stage;
+    c->x[4] = 0;                                          /* not a return to the stage before */
+    c->x[5] = (uint32_t)g_list[k].scenario;
+    c->x[6] = 0;                                          /* no sub-scenario */
+    call_guest(c, GAME_FN_ChangeStageInfo_ctor);
+    int scen = *(int32_t *)(info + 0x1cc);                /* its scenario (+0x1cc): the one asked for, else the stage's own, else -1 */
+    c->x[0] = g_holder;
+    c->x[1] = (uint64_t)(uintptr_t)info;
+    call_guest(c, GAME_FN_tryChangeNextStage);
+    int ok = (int)(c->x[0] & 1);
+    *c = saved;
+    InterlockedExchange(&g_list_state, ok ? LIST_CHANGING : LIST_PLAY);
+    char from[96];
+    if (scen >= 0) snprintf(from, sizeof from, "scenario %d (%s)", scen, g_list[k].scenario >= 0 ? "asked for" : "the stage's own, as through its door");
+    else snprintf(from, sizeof from, "the kingdom's scenario");
+    printf("stage list: frame %lld: GameDataFunction::tryChangeNextStage to %s, %s%s%s: %s\n", nvn_front_frame_next(), g_list[k].stage, from,
+           g_list[k].start[0] ? ", start " : "", g_list[k].start, ok ? "changing" : "REFUSED (no change; the run waits for its time limit)");
+    fflush(stdout);
+}
+
+/* StageScene::init of a stage of the list: the first, the one a change asked for, or one the game starts itself (a
+ * restart after a miss). Called from stage_init_hit with the stage and scenario the scene is made for. */
+static void stage_list_init_seen(uint64_t info, const char *stage, int scen) {
+    long long frame = nvn_front_frame_next();
+    if (!g_holder && !(g_holder = holder_of(info))) {
+        printf("stage list: the scene's init info does not hold the GameDataHolder (RTTI): no stage after the first\n");
+        g_list_n = 1;
+    }
+    if (g_stage_inits == 1) {
+        printf("stage list: frame %lld: stage 1 of %d begins: the game starts %s, scenario %d%s%s\n", frame, g_list_n, stage, scen,
+               strcmp(stage, g_list[0].stage) ? "; NOT the list's first stage, " : "", strcmp(stage, g_list[0].stage) ? g_list[0].stage : "");
+        return;
+    }
+    if (g_list_state != LIST_CHANGING) {
+        printf("stage list: frame %lld: the game starts %s, scenario %d itself (no change of the list: a restart after a miss?)\n", frame, stage, scen);
+        return;
+    }
+    int k = InterlockedIncrement(&g_list_cur);
+    printf("stage list: frame %lld: stage %d of %d begins: the game starts %s, scenario %d%s%s\n", frame, k + 1, g_list_n, stage, scen,
+           strcmp(stage, g_list[k].stage) ? "; NOT the stage asked for, " : "", strcmp(stage, g_list[k].stage) ? g_list[k].stage : "");
+    InterlockedExchange(&g_list_state, LIST_BEGUN);
+}
+
+/* nnhid.c, each poll: an entry of the list began since the last call: the game-state tracker starts afresh (the old
+ * scene's objects are gone; tracking resumes if the input sequence had stopped it) and the entry's input sequence is
+ * returned; else NULL. */
+static long long g_released;
+const char *stage_list_begun(void) {
+    if (g_list_state != LIST_BEGUN) return NULL;
+    InterlockedExchange(&g_list_state, LIST_PLAY);
+    for (int i = 0; i < g_nrv_count; i++) g_nrv[i].last_frame = -10;
+    while (InterlockedCompareExchange(&g_nerve_lock, 1, 0)) YieldProcessor();
+    memset(g_keep, 0, sizeof g_keep);
+    g_keep_used = 0;
+    g_player_actor = 0;
+    g_player_nrv = -1;
+    g_nerve_lock = 0;
+    if (g_nerve_mode == 0 && g_released >= 0 && g_nrv_count > 0) {
+        g_nerve_mode = 1;
+        printf("nerve: tracking resumes at frame %lld (a new stage of SMO_STAGE_LIST)\n", nvn_front_frame_next());
+    }
+    char key[32];
+    snprintf(key, sizeof key, "SMO_SEQ_%d", (int)g_list_cur + 1);
+    const char *s = getenv(key), *from = key;
+    if (!s) { s = getenv("SMO_STAGE_SEQ"); from = "SMO_STAGE_SEQ"; }
+    if (!s) { s = getenv("SMO_SEQ"); from = "SMO_SEQ"; }
+    printf("stage list: the input sequence starts again (%s)\n", s ? from : "none");
+    return s ? s : "";
+}
+
+void stage_init_hit(Ctx *c) {
+    int first = g_stage_inits++ == 0;
+    uint64_t info = c->x[1];
+    __try {
+        uint64_t was = rd64(info + 0x18);
+        int scen = (int)rd32(info + 0x20);
+        char name[96] = "?";
+        for (int i = 0; was && i < (int)sizeof name - 1; i++) { name[i] = (char)rd8(was + i); name[i + 1] = 0; if (!name[i]) break; }
+        if (!first && !g_list_n)                          /* SMO_START_STAGE alone: later stage scenes are only logged */
+            printf("start stage: frame %lld: the game starts %s, scenario %d itself (a later stage scene: a restart after a miss?)\n", nvn_front_frame_next(), name, scen);
+        if (first && g_start_stage[0]) {                  /* the scenario: the one asked for, else the stage's own (as through its door), else the game's */
+            int own = g_start_scenario >= 0 ? -1 : use_scenario(c, holder_of(info), g_start_stage);
+            int to = g_start_scenario >= 0 ? g_start_scenario : own >= 0 ? own : scen;
+            wr64(info + 0x18, (uint64_t)(uintptr_t)g_start_stage);
+            if (to != scen) wr32(info + 0x20, (uint32_t)to);
+            printf("start stage: frame %lld: the game starts %s, scenario %d; SMO_START_STAGE makes it %s, scenario %d (%s)\n", nvn_front_frame_next(),
+                   name, scen, g_start_stage, to, g_start_scenario >= 0 ? "asked for" : own >= 0 ? "the stage's own, as through its door" : "the kingdom's");
+            snprintf(name, sizeof name, "%s", g_start_stage);
+            scen = to;
+        }
+        if (g_list_n) stage_list_init_seen(info, name, scen);
+    } __except (1) {
+        printf("start stage: the scene's init info at %llx could not be read: the game's own stage starts\n", (unsigned long long)info);
+    }
+    fflush(stdout);
 }
 
 /* SMO_SEQ "@nerve:<name>": did that nerve run in this frame or the one before? Unknown names are reported once. */

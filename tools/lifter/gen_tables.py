@@ -5,7 +5,9 @@
 Writes (everything derived from the dump; build/ is ignored by git):
   image.h            image layout of main and sdk (segment ends, relocation tables, .dynsym, .init_array, entry
                      points), and GAME_SYM_<name> addresses of the game functions the runtime calls by name (in an
-                     update's main without symbols: matched with the base executable's, see find_sampler_sort).
+                     update's main without symbols: matched with the base executable's, see find_sampler_sort),
+                     GAME_VSYM_<name> of the virtual functions it watches for (from RTTI vtables, see find_vsym), and
+                     GAME_FN_<name> of the game functions its test aids call (matched likewise, see find_func).
                      Replaces the 13.0.4 constants ssbu-recomp hard-coded in hostrt.c / boot.c / sdklift.h / libcxx.c.
   imports_all.txt    names main imports (undefined dynamic symbols), symbol-table order (as ssbu's gen_imports.py)
   sdkdata.c          values of the data symbols main imports from sdk (nn::util tables, nn::hid NpadId constants),
@@ -42,6 +44,15 @@ GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStar
 # smo_fast.c then leaves the game's own code alone. Order: the sort, registerSampler_, the key comparison.
 GAME_SYMS_OPTIONAL = ['_ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E', '_ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj',
                       '_ZN3agl6driver6NVNMgr18compareSamplerKey_EPKNS1_10SamplerKeyES4_']
+# Virtual functions the runtime watches for (GAME_VSYM_<name>): (class as RTTI names it, mangled function, name). In a
+# main without symbols they come from the class's vtable, in the slot that holds them in the base executable's
+# (find_vsym), or 0. StageScene::init: a stage scene starts (test aid SMO_START_STAGE, runtime/smo_nerve.c).
+GAME_VSYMS = [('10StageScene', '_ZN10StageScene4initERKN2al13SceneInitInfoE', 'StageScene_init')]
+# Game functions the runtime calls (GAME_FN_<name>): (mangled function, name). A main without symbols gets each from the
+# base executable's (find_func), or 0. ChangeStageInfo's constructor and GameDataFunction::tryChangeNextStage: a stage
+# change of the game's own, as a door makes it (test aid SMO_STAGE_LIST, runtime/smo_nerve.c).
+GAME_FUNCS = [('_ZN15ChangeStageInfoC1EPK14GameDataHolderPKcS4_biNS_15SubScenarioTypeE', 'ChangeStageInfo_ctor'),
+              ('_ZN16GameDataFunction18tryChangeNextStageE20GameDataHolderWriterPK15ChangeStageInfo', 'tryChangeNextStage')]
 
 
 def code_words(m, start, size):
@@ -152,6 +163,128 @@ def find_sampler_sort(main_m):
     return {sort_n: found[2], reg_n: found[0], cmp_n: same[0]}, None
 
 
+def vtable_slots(m, cls):
+    """The virtual functions of the primary vtable of the class whose RTTI name is cls (e.g. 10StageScene), in slot
+    order (None for a slot that is not a function of the module), or None when there is not exactly one. A typeinfo is a
+    pointer to a __cxxabiv1 class_type_info vtable (a symbol relocation) followed by its name (a RELATIVE relocation); a
+    vtable is offset-to-top (not relocated; 0 for the primary one), the typeinfo, then the functions."""
+    syms = m.symbols()
+    rel, symrel = {}, {}
+    for off, info, add in m.relocs():
+        kind = info & 0xffffffff
+        if kind == 0x403:                                 # R_AARCH64_RELATIVE
+            rel[off] = add
+        elif kind in (0x101, 0x401):                      # R_AARCH64_ABS64, GLOB_DAT
+            symrel[off] = syms[info >> 32][0]
+    tinfo = [off for off, n in symrel.items() if n.startswith('_ZTVN10__cxxabiv1') and n.endswith('class_type_infoE')
+             and off + 8 in rel and m.cstr(rel[off + 8]) == cls]
+    if len(tinfo) != 1:
+        return None
+    vts = [o - 8 for o, p in rel.items() if p == tinfo[0] and o - 8 not in rel and o - 8 not in symrel
+           and struct.unpack_from('<q', m.d, F.OFF + o - 8)[0] == 0]
+    if len(vts) != 1:
+        return None
+    out, a = [], vts[0] + 16
+    while a in rel or a in symrel:
+        out.append(rel.get(a))
+        a += 8
+    return out
+
+
+def find_vsym(main_m, defined, cls, name):
+    """(address, how) of virtual function `name` of class cls: main's own symbol (checked against its vtable), else the
+    function in the slot of main's vtable for the class that holds it in the base executable's; (0, why not)."""
+    base = F.Module(BASE_MAIN) if os.path.exists(BASE_MAIN) else None
+    ref = (base, {n: v for n, t, b, sh, v, s in base.symbols() if sh}) if base else (main_m, defined)
+    slots_ref = vtable_slots(ref[0], cls)
+    if name not in ref[1] or not slots_ref or slots_ref.count(ref[1][name]) != 1:
+        return 0, 'the base executable\'s vtable of %s does not hold it once' % cls
+    slots = vtable_slots(main_m, cls)
+    k = slots_ref.index(ref[1][name])
+    if not slots or k >= len(slots) or not slots[k]:
+        return 0, 'no vtable of %s in this main.elf' % cls
+    if name in defined and defined[name] != slots[k]:
+        return 0, 'the vtable slot does not hold the symbol'
+    return slots[k], 'own symbol' if name in defined else 'vtable slot %d, as in the base executable' % k
+
+
+def bl_targets(m, start, size):
+    """The targets of a function's BL instructions, in order."""
+    return [start + 4 * i + F.sext(w & 0x3ffffff, 26) * 4 for i, w in enumerate(code_words(m, start, size))
+            if w & 0xfc000000 == 0x94000000]
+
+
+class FuncMatcher:
+    """Functions of a main without symbols found from the base executable's (build/dump/base), which names them."""
+
+    def __init__(self, main_m):
+        self.main, self.base = main_m, F.Module(BASE_MAIN)
+        self.base_sym = {n: (v, s) for n, t, b, sh, v, s in self.base.symbols() if sh and t == 2 and s}
+        base_funcs = sorted({vs for vs in self.base_sym.values()})
+        rows = csv.DictReader(open(T.build('functions', 'main_functions.tsv'), encoding='utf-8'), delimiter='\t')
+        funcs = sorted((int(r['start'], 16), int(r['size'])) for r in rows)
+        self.base_size, self.size = dict(base_funcs), dict(funcs)
+        self.base_by_size, self.by_size = {}, {}
+        for v, s in base_funcs:
+            self.base_by_size.setdefault(s, []).append(v)
+        for v, s in funcs:
+            self.by_size.setdefault(s, []).append(v)
+        self.calls, self.base_calls, self.equal_of = None, None, {}
+
+    def equal(self, v):
+        """The one function of this main whose masked instructions equal those of base function v, which no other base
+        function has; else None."""
+        if v not in self.equal_of:
+            s, r = self.base_size.get(v), None
+            if s:
+                pat = masked(code_words(self.base, v, s))
+                if [o for o in self.base_by_size[s] if masked(code_words(self.base, o, s)) == pat] == [v]:
+                    same = [o for o in self.by_size.get(s, []) if masked(code_words(self.main, o, s)) == pat]
+                    r = same[0] if len(same) == 1 else None
+            self.equal_of[v] = r
+        return self.equal_of[v]
+
+    def by_calls(self, v, s):
+        """The one function of this main of about the size of base function v (within a quarter) whose calls (BL)
+        go to the same functions as v's wherever the callee is matched by equal(), at least two of them and at least
+        half; the same rule over the base executable's functions must give v alone. (address, matched calls) or None."""
+        want = bl_targets(self.base, v, s)
+        mapped = [self.equal(t) for t in want]
+        known = [i for i, x in enumerate(mapped) if x is not None]
+        if len(known) < 2 or 2 * len(known) < len(want):
+            return None
+        if self.calls is None:
+            self.calls = {o: bl_targets(self.main, o, sz) for o, sz in self.size.items()}
+            self.base_calls = {o: bl_targets(self.base, o, sz) for o, sz in self.base_size.items()}
+
+        def fits(calls, targets):
+            return len(calls) == len(want) and all(calls[i] == targets[i] for i in known)
+        if [o for o, c in self.base_calls.items() if fits(c, want)] != [v]:
+            return None
+        hits = [o for o, c in self.calls.items() if fits(c, mapped) and abs(self.size[o] - s) <= s // 4]
+        return (hits[0], len(known)) if len(hits) == 1 else None
+
+
+def find_func(main_m, defined, name, matcher):
+    """(address, how) of game function `name`: main's own symbol, else (a main without symbols) the one function whose
+    masked instructions equal the base executable's function of that name, else the one whose calls match its calls
+    (FuncMatcher.by_calls); (0, why not)."""
+    if name in defined:
+        return defined[name], 'own symbol'
+    if not matcher:
+        return 0, 'the base executable is not in build/dump/base'
+    if name not in matcher.base_sym:
+        return 0, 'the base executable does not name it'
+    v, s = matcher.base_sym[name]
+    a = matcher.equal(v)
+    if a is not None:
+        return a, 'matched with the base executable\'s instructions'
+    hit = matcher.by_calls(v, s)
+    if hit:
+        return hit[0], 'matched with the base executable\'s by %d of the %d functions it calls' % (hit[1], len(bl_targets(matcher.base, v, s)))
+    return 0, 'no single function of this main.elf matches the base executable\'s'
+
+
 def layout(m):
     dv, dsz = m.sec['.data'][0], m.sec['.data'][1] + m.sec['.dynamic'][1] + m.sec['.data.1'][1]
     file_image = m.sec['.data.1'][0] + m.sec['.data.1'][1]
@@ -216,6 +349,17 @@ def main():
                      % (n, matched[n]))
         else:
             h.append('#define GAME_SYM_%s 0ULL      /* not in this main.elf */' % n)
+    vsyms = []
+    for cls, n, short in GAME_VSYMS:
+        a, how = find_vsym(main_m, defined, cls, n)
+        vsyms.append('%s %s' % (short, '0x%x (%s)' % (a, how) if a else 'not found: ' + how))
+        h.append('#define GAME_VSYM_%s %s      /* %s */' % (short, '(GUEST_BASE + 0x%xULL)' % a if a else '0ULL', how))
+    fns = []
+    matcher = FuncMatcher(main_m) if os.path.exists(BASE_MAIN) and any(n not in defined for n, _ in GAME_FUNCS) else None
+    for n, short in GAME_FUNCS:
+        a, how = find_func(main_m, defined, n, matcher)
+        fns.append('%s %s' % (short, '0x%x (%s)' % (a, how) if a else 'not found: ' + how))
+        h.append('#define GAME_FN_%s %s      /* %s */' % (short, '(GUEST_BASE + 0x%xULL)' % a if a else '0ULL', how))
     h += ['', '#define SDK_IMAGE_SIZE_GEN 0x%xULL' % sdk_image_size,
           '#define SDK_TEXT_SIZE_GEN 0x%xULL' % sdk_m.text_end, '', '#endif', '']
     write('image.h', '\n'.join(h))
@@ -261,6 +405,8 @@ def main():
             '%s 0x%x' % (n, matched[n]) for n in GAME_SYMS_OPTIONAL if n in matched))
     elif missing:
         print('not in this main.elf (their fast path stays off: %s): %s' % (why, ', '.join(missing)))
+    print('virtual functions: %s' % '; '.join(vsyms))
+    print('game functions: %s' % '; '.join(fns))
     print('wrote', OUT)
 
 

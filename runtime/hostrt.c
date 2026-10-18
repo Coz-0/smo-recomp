@@ -194,14 +194,18 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
 }
 
 extern int g_nerve_mode;                              /* smo_nerve.c */
-extern volatile uint64_t g_nerve_watch[2];
+extern volatile uint64_t g_nerve_watch[2], g_stage_init, g_stage_play;
 void nerve_call(Ctx *c, uint64_t addr);
 void nerve_watch_hit(void);
+void stage_init_hit(Ctx *c);
+void stage_play_hit(Ctx *c);
 
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
     if (g_nerve_mode) nerve_call(c, addr);             /* smo_nerve.c: SMO_NERVELOG, SMO_ACTORPOS, SMO_SEQ @nerve: */
     if (g_nerve_watch[0] && (addr == g_nerve_watch[0] || addr == g_nerve_watch[1])) nerve_watch_hit();   /* smo_nerve.c: the amiibo menu's watch */
+    if (g_stage_init && addr == g_stage_init) stage_init_hit(c);      /* smo_nerve.c: SMO_START_STAGE, SMO_STAGE_LIST (TEST ONLY): a stage scene starts */
+    if (g_stage_play && addr == g_stage_play) stage_play_hit(c);      /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the stage change to the next stage */
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
         void (*fn)(Ctx *) = lookup_guest(addr);
         if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
@@ -472,6 +476,13 @@ static void host_import_real(Ctx *c, int sym) {
     if (g_guest_frozen) guest_freeze_wait();
 }
 
+int import_counts(int *stubs) {                       /* smo_nerve.c (SMO_STAGE_LIST): imports reached so far, and how many of them are stubs */
+    int n = g_import_order_count, s = 0;
+    for (int i = 0; i < n; i++) s += !g_handlers[g_import_order[i]];
+    *stubs = s;
+    return n;
+}
+
 void print_import_summary(FILE *out) {
     int stubs = 0, impl = 0;
     for (int i = 0; i < g_import_order_count; i++) { if (g_handlers[g_import_order[i]]) impl++; else stubs++; }
@@ -532,7 +543,9 @@ void report_and_exit(int code) {
 }
 
 void guest_trap(const char *what, uint64_t addr) {
-    printf("\nGUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
+    const char *guest_thread_name_of(DWORD tid);      /* os_threads.c */
+    const char *tn = guest_thread_name_of(GetCurrentThreadId());
+    printf("\nGUEST TRAP: %s (0x%llx), on thread %s\n", what, (unsigned long long)addr, tn ? tn : "main (or a host thread)");
     trace_printf("GUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
     RaiseException(0xE0000001, 0, 0, NULL);
     report_and_exit(2);

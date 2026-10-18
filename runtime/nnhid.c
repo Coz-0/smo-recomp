@@ -122,7 +122,9 @@ static int script_key(int vk) {
  *   <n>               wait n polls
  *   <n>:<keys>[/<h>]  wait n polls, then hold the keys for h polls (default 8); keys as in SMO_SCRIPT
  * Example: "@movie 90:Z 120:Z @draws:150-200 300:u/40 10:Z". Each step is announced with the poll number and the
- * draw count of the last frame. SMO: tests\cap_kingdom.seq is the scripted Cap Kingdom run (tests\run_cap_kingdom.py). */
+ * draw count of the last frame. SMO: tests\cap_kingdom.seq is the scripted Cap Kingdom run (tests\run_cap_kingdom.py).
+ * SMO_STAGE_LIST (smo_nerve.c, TEST ONLY): when the sequence is done the game changes to the list's next stage, and the
+ * sequence starts again there (SMO_SEQ_<n> for the n-th stage of the list, else SMO_STAGE_SEQ, else SMO_SEQ). */
 #define SEQ_MAX 256
 #define MARK_MAX 128
 enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL, SEQ_GOTO, SEQ_CHASE, SEQ_UNTIL_NERVE, SEQ_NEAR, SEQ_AT };
@@ -157,65 +159,74 @@ static void seq_begin(int i) {
     if (i > 0 && k == g_seq_count) { void nerve_release(void); nerve_release(); }      /* smo_nerve.c: no step left needs the game-state tracker */
 }
 
+static int g_seq_ended;                                   /* the end of this sequence was handled (seq_tick) */
+static int g_wait_b;                                      /* B held: SMO_STAGE_LIST's change waits for play (seq_tick) */
+static void seq_parse(const char *s) {
+    g_seq_count = 0;
+    g_seq_ended = 0;
+    g_wait_b = 0;
+    while (s && *s && g_seq_count < SEQ_MAX) {
+        char tok[128];
+        int used = 0;
+        if (sscanf(s, " %127[^ \t\r\n]%n", tok, &used) < 1) break;
+        s += used;
+        memset(&g_seq[g_seq_count], 0, sizeof g_seq[0]);
+        g_seq[g_seq_count].hold = 8;
+        if (!strncmp(tok, "@until:", 7)) {
+            g_seq[g_seq_count].kind = SEQ_UNTIL;
+            g_seq[g_seq_count].need = 20;
+            g_seq[g_seq_count].wait = 200;
+            const char *k = strchr(tok + 7, ':');
+            if (sscanf(tok + 7, "%d-%d/%d", &g_seq[g_seq_count].lo, &g_seq[g_seq_count].hi, &g_seq[g_seq_count].need) < 2 || !k ||
+                sscanf(k + 1, "%11[^/]/%d", g_seq[g_seq_count].keys, &g_seq[g_seq_count].wait) < 1) { printf("input sequence: bad step %s\n", tok); break; }
+        } else if (!strncmp(tok, "@draws:", 7)) {
+            g_seq[g_seq_count].kind = SEQ_DRAWS;
+            g_seq[g_seq_count].need = 20;
+            if (sscanf(tok + 7, "%d-%d/%d", &g_seq[g_seq_count].lo, &g_seq[g_seq_count].hi, &g_seq[g_seq_count].need) < 2) { printf("input sequence: bad step %s\n", tok); break; }
+        } else if (!strncmp(tok, "@goto:", 6)) {
+            g_seq[g_seq_count].kind = SEQ_GOTO;
+            g_seq[g_seq_count].gr = 100;
+            g_seq[g_seq_count].wait = 3600;
+            const char *sl = strchr(tok + 6, '/');
+            if (sscanf(tok + 6, "%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 2 ||
+                (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
+        } else if (!strncmp(tok, "@until-nerve:", 13)) {
+            g_seq[g_seq_count].kind = SEQ_UNTIL_NERVE;
+            const char *k = strchr(tok + 13, ':');
+            if (sscanf(tok + 13, "%95[^:]", g_seq[g_seq_count].mark) < 1 || !k ||
+                sscanf(k + 1, "%11[^/]/%d", g_seq[g_seq_count].keys, &g_seq[g_seq_count].wait) < 2 || g_seq[g_seq_count].wait < 9) {
+                printf("input sequence: bad step %s\n", tok); break;
+            }
+        } else if (!strncmp(tok, "@at:", 4)) {
+            g_seq[g_seq_count].kind = SEQ_AT;
+            g_seq[g_seq_count].gr = 300;
+            if (sscanf(tok + 4, "%f,%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gy, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 3) {
+                printf("input sequence: bad step %s\n", tok); break;
+            }
+        } else if (!strncmp(tok, "@chase:", 7) || !strncmp(tok, "@near:", 6)) {
+            int is_near = tok[1] == 'n';
+            const char *b = tok + (is_near ? 6 : 7);
+            g_seq[g_seq_count].kind = is_near ? SEQ_NEAR : SEQ_CHASE;
+            g_seq[g_seq_count].gr = is_near ? 250.0f : 300.0f;
+            g_seq[g_seq_count].wait = 1200;
+            const char *cm = strchr(b, ','), *sl = strchr(b, '/');
+            if (sscanf(b, "%95[^,/]", g_seq[g_seq_count].mark) < 1 || (!sl && !is_near) || (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1) ||
+                (cm && (!sl || cm < sl) && sscanf(cm + 1, "%f", &g_seq[g_seq_count].gr) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
+        } else if (tok[0] == '@') {
+            g_seq[g_seq_count].kind = SEQ_MARK;
+            strncpy(g_seq[g_seq_count].mark, tok + 1, sizeof g_seq[0].mark - 1);
+        } else if (sscanf(tok, "%d:%11[^/]/%d", &g_seq[g_seq_count].wait, g_seq[g_seq_count].keys, &g_seq[g_seq_count].hold) < 1) { printf("input sequence: bad step %s\n", tok); break; }
+        g_seq_count++;
+    }
+    if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
+    seq_begin(0);
+}
+
 static void seq_tick(void) {                              /* once per poll of player 1 */
-    if (g_seq_count < 0) {
-        const char *s = getenv("SMO_SEQ");
-        g_seq_count = 0;
-        while (s && *s && g_seq_count < SEQ_MAX) {
-            char tok[128];
-            int used = 0;
-            if (sscanf(s, " %127[^ \t\r\n]%n", tok, &used) < 1) break;
-            s += used;
-            memset(&g_seq[g_seq_count], 0, sizeof g_seq[0]);
-            g_seq[g_seq_count].hold = 8;
-            if (!strncmp(tok, "@until:", 7)) {
-                g_seq[g_seq_count].kind = SEQ_UNTIL;
-                g_seq[g_seq_count].need = 20;
-                g_seq[g_seq_count].wait = 200;
-                const char *k = strchr(tok + 7, ':');
-                if (sscanf(tok + 7, "%d-%d/%d", &g_seq[g_seq_count].lo, &g_seq[g_seq_count].hi, &g_seq[g_seq_count].need) < 2 || !k ||
-                    sscanf(k + 1, "%11[^/]/%d", g_seq[g_seq_count].keys, &g_seq[g_seq_count].wait) < 1) { printf("input sequence: bad step %s\n", tok); break; }
-            } else if (!strncmp(tok, "@draws:", 7)) {
-                g_seq[g_seq_count].kind = SEQ_DRAWS;
-                g_seq[g_seq_count].need = 20;
-                if (sscanf(tok + 7, "%d-%d/%d", &g_seq[g_seq_count].lo, &g_seq[g_seq_count].hi, &g_seq[g_seq_count].need) < 2) { printf("input sequence: bad step %s\n", tok); break; }
-            } else if (!strncmp(tok, "@goto:", 6)) {
-                g_seq[g_seq_count].kind = SEQ_GOTO;
-                g_seq[g_seq_count].gr = 100;
-                g_seq[g_seq_count].wait = 3600;
-                const char *sl = strchr(tok + 6, '/');
-                if (sscanf(tok + 6, "%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 2 ||
-                    (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
-            } else if (!strncmp(tok, "@until-nerve:", 13)) {
-                g_seq[g_seq_count].kind = SEQ_UNTIL_NERVE;
-                const char *k = strchr(tok + 13, ':');
-                if (sscanf(tok + 13, "%95[^:]", g_seq[g_seq_count].mark) < 1 || !k ||
-                    sscanf(k + 1, "%11[^/]/%d", g_seq[g_seq_count].keys, &g_seq[g_seq_count].wait) < 2 || g_seq[g_seq_count].wait < 9) {
-                    printf("input sequence: bad step %s\n", tok); break;
-                }
-            } else if (!strncmp(tok, "@at:", 4)) {
-                g_seq[g_seq_count].kind = SEQ_AT;
-                g_seq[g_seq_count].gr = 300;
-                if (sscanf(tok + 4, "%f,%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gy, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 3) {
-                    printf("input sequence: bad step %s\n", tok); break;
-                }
-            } else if (!strncmp(tok, "@chase:", 7) || !strncmp(tok, "@near:", 6)) {
-                int is_near = tok[1] == 'n';
-                const char *b = tok + (is_near ? 6 : 7);
-                g_seq[g_seq_count].kind = is_near ? SEQ_NEAR : SEQ_CHASE;
-                g_seq[g_seq_count].gr = is_near ? 250.0f : 300.0f;
-                g_seq[g_seq_count].wait = 1200;
-                const char *cm = strchr(b, ','), *sl = strchr(b, '/');
-                if (sscanf(b, "%95[^,/]", g_seq[g_seq_count].mark) < 1 || (!sl && !is_near) || (sl && sscanf(sl + 1, "%d", &g_seq[g_seq_count].wait) < 1) ||
-                    (cm && (!sl || cm < sl) && sscanf(cm + 1, "%f", &g_seq[g_seq_count].gr) < 1)) { printf("input sequence: bad step %s\n", tok); break; }
-            } else if (tok[0] == '@') {
-                g_seq[g_seq_count].kind = SEQ_MARK;
-                strncpy(g_seq[g_seq_count].mark, tok + 1, sizeof g_seq[0].mark - 1);
-            } else if (sscanf(tok, "%d:%11[^/]/%d", &g_seq[g_seq_count].wait, g_seq[g_seq_count].keys, &g_seq[g_seq_count].hold) < 1) { printf("input sequence: bad step %s\n", tok); break; }
-            g_seq_count++;
-        }
-        if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
-        seq_begin(0);
+    if (g_seq_count < 0) seq_parse(getenv("SMO_SEQ"));
+    {   const char *stage_list_begun(void);               /* smo_nerve.c, SMO_STAGE_LIST: the next stage began, with its own sequence */
+        const char *next = stage_list_begun();
+        if (next) seq_parse(next);
     }
     g_seq_polls++;
     {   /* SMO_SEQ_LOG=<n>: the draw count every n polls, to find the ranges for @draws */
@@ -226,7 +237,27 @@ static void seq_tick(void) {                              /* once per poll of pl
     g_steer_on = 0;
     if (g_jump_left > 0 && --g_jump_left == 0) g_jump_cool = 10;
     else if (g_jump_cool > 0) g_jump_cool--;
-    if (g_seq_index >= g_seq_count) return;
+    if (g_seq_index >= g_seq_count) {
+        if (!g_seq_ended && g_seq_count > 0) {           /* TEST ONLY, SMO_SEQ_EXIT=1: the run ends with its sequence (tests/stress_stages.py) */
+            g_seq_ended = 1;
+            int stage_list_has_next(void);                /* smo_nerve.c, SMO_STAGE_LIST: the run goes on with the next stage */
+            void stage_list_seq_done(long long poll);
+            int next = stage_list_has_next(), end = !next && getenv("SMO_SEQ_EXIT") && atoi(getenv("SMO_SEQ_EXIT"));
+            if (next || end) printf("input sequence: done at poll %lld (%s): %s\n", (long long)g_seq_polls, next ? "SMO_STAGE_LIST" : "SMO_SEQ_EXIT",
+                                    next ? "the next stage follows" : "the run ends here");
+            stage_list_seq_done(g_seq_polls);
+            if (end) { fflush(stdout); report_and_exit(0); }
+        }
+        {   /* SMO_STAGE_LIST: the stage change waits for the scene's play state; a map, the pause menu or a message the
+             * sequence left open would hold it: B (8 polls) every 45 polls, the first after 30 */
+            int stage_list_waiting(void);                 /* smo_nerve.c */
+            static int waited;
+            waited = stage_list_waiting() ? waited + 1 : 0;
+            g_wait_b = waited % 45 >= 30 && waited % 45 < 38;
+            if (waited == 30) printf("input sequence: poll %lld: the stage change waits for the scene to play: B every 45 polls\n", (long long)g_seq_polls);
+        }
+        return;
+    }
     if (g_seq[g_seq_index].kind == SEQ_GOTO) {
         int nerve_steer(float tx, float tz, float r, float *sx, float *sy, float *dist);      /* smo_nerve.c */
         int nerve_player(float pos[3]);
@@ -375,6 +406,7 @@ static void seq_tick(void) {                              /* once per poll of pl
 
 static int seq_key(int vk) {
     if (g_jump_left > 0 && vk == 'Z') return 1;           /* SEQ_GOTO stuck rule: jump */
+    if (g_wait_b && vk == 'X') return 1;                  /* SMO_STAGE_LIST: B while the stage change waits for play */
     if (g_seq_count <= 0 || g_seq_index >= g_seq_count || !g_seq_holding) return 0;
     for (const char *k = g_seq[g_seq_index].keys; *k; k++) if (script_vk(*k) == vk) return 1;
     return 0;
