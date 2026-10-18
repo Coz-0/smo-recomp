@@ -372,8 +372,8 @@ static int audit_strict_on(void);
  * 240 s run, from every thread). They are kept only when SMO_IMPORT_COUNTS=1 or SMO_AUDIT_COUNTS is set;
  * otherwise an import is counted (and traced) for its first three calls, as before, and then called directly. */
 static int g_import_count_all = 1;
-/* suspension of the application by the applet manager (nnmisc.c oe_watch; suyu am/applet.cpp UpdateSuspensionStateLocked ->
- * process->Suspend). While g_guest_frozen is set every guest thread stops at its next call of, or return from, an SDK function and
+/* suspension of the application by the applet manager (nnmisc.c oe_watch, with graphics.ini unfocused = pause; suyu am/applet.cpp
+ * UpdateSuspensionStateLocked -> process->Suspend). While g_guest_frozen is set every guest thread stops at its next call of, or return from, an SDK function and
  * waits here (the console's kernel stops the threads wherever they are; a thread inside a kernel call finishes it there too). */
 volatile LONG g_guest_frozen;
 void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }

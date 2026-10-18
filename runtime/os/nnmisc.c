@@ -17,6 +17,7 @@
 #include <wincrypt.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "gfx_options.h"
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -118,13 +119,13 @@ static LARGE_INTEGER g_start;
  * (NoSuspend) and 2 (SuspendHomeSleepNotify) only, so the message is posted only in those modes.
  * The operation mode never changes on a PC (always the TV mode), so MessageOperationModeChanged (30) and
  * MessagePerformanceModeChanged (31) never occur; the enable flags are kept as the game sets them.
- * (the state now follows the applet manager's table, see oe_track_focus: not in focus = 2 only while the window is
+ * (the state follows the applet manager's table, see oe_track_focus: not in focus = 2 only while the window is
  * visible; minimised = 3 for a NoSuspend application and no change at all in the suspending modes.)
- * Differences from the console, stated: (1) in the suspending modes (0, 2, 3) the console also FREEZES the application
- * while it is in the background (mode 3: also while obscured); the runtime does not freeze the game's threads: a minimised
- * game keeps running. (2) A window
- * that has never been in the foreground (the automated tests keep theirs off screen) is treated as in focus.
- * (3) Closing the window is the exit request: see oe_exit_request below.
+ * Differences from the console, stated: (1) in the suspending modes (0, 2, 3) the console also stops the application
+ * while it is in the background (mode 3, which this game sets: also while obscured); here the game keeps running unless
+ * graphics.ini says unfocused = pause (see oe_watch below). (2) A window that has never been in the foreground (the
+ * automated tests keep theirs off screen) is treated as in focus. (3) Closing the window is the exit request: see
+ * oe_exit_request below.
  * SMO_FOCUS_NOTIFY=0 turns the focus tracking off. */
 #define OE_MSG_FOCUS_STATE_CHANGED 15u
 static uint8_t g_oe_event[0x40];
@@ -146,10 +147,14 @@ static void oe_push(uint32_t message) {
 /* Suspension. The applet manager suspends the application's process while it is not runnable (suyu am/applet.cpp
  * UpdateSuspensionStateLocked, am/lifecycle_manager.cpp IsRunnable): in the background unless the handling mode is NoSuspend,
  * obscured only in AlwaysSuspend; never while an exit request is pending. A message "Resume" (16) is queued at that moment when
- * the application enabled it (RequestResumeNotification). Here a watcher thread applies the rule to the window every 20 ms and
- * sets hostrt.c's g_guest_frozen: every guest thread then stops at its next SDK call or return (hostrt.c host_import).
- * SMO_FREEZE_TEST=<start s>,<seconds> minimises and restores the window by itself (test; the log line counts the polls of the
- * game's main loop during the freeze). */
+ * the application enabled it (RequestResumeNotification).
+ * Here the game keeps running while its window is not active or is minimised (graphics.ini unfocused = run, the default; pads
+ * and keyboard count only while it is active: nnhid.c devices_live). With unfocused = pause a watcher thread applies the
+ * console's rule to the window every 20 ms and sets hostrt.c's g_guest_frozen: every guest thread then stops at its next SDK
+ * call or return (hostrt.c host_import).
+ * SMO_FOCUS_TEST=<start s>,<seconds> (test): from <start> the window counts as not active (another program has the focus) for
+ * <seconds>, then it is minimised for <seconds> and restored; the log says how often the game's main loop polled its messages
+ * in each period (once per frame while the game runs). */
 extern volatile LONG g_guest_frozen;
 static volatile LONG g_oe_poll_count;
 static int g_oe_exit_requested;                           /* defined with the exit request code below */
@@ -159,31 +164,43 @@ static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
     if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
     return TRUE;
 }
-static DWORD WINAPI oe_watch(LPVOID unused) {
-    const char *test = getenv("SMO_FREEZE_TEST");
+static DWORD WINAPI oe_watch(LPVOID pause) {
+    static const char *const k_test_state[] = {"", "not active (another program has the focus)", "minimised"};
+    const char *test = getenv("SMO_FOCUS_TEST");
     double t_start = 0, t_len = 0;
-    int test_phase = 0;
-    ULONGLONG t0 = GetTickCount64(), frozen_at = 0;
-    LONG polls_at = 0;
+    int test_phase = 0;                                   /* 1 not active, 2 minimised, 3 over */
+    ULONGLONG t0 = GetTickCount64(), frozen_at = 0, phase_at = 0;
+    LONG polls_at = 0, phase_polls = 0;
     if (test) sscanf(test, "%lf,%lf", &t_start, &t_len);
     for (;;) {
         Sleep(20);
         double t = (double)(GetTickCount64() - t0) / 1000.0;
-        if (test && test_phase == 0 && t >= t_start) {
+        if (test && test_phase < 3 && t >= t_start + test_phase * t_len) {
             HWND w = NULL;
-            EnumWindows(oe_find_window, (LPARAM)&w);
-            if (w) { g_oe_window = w; g_oe_was_foreground = 1; ShowWindow(w, SW_SHOWMINNOACTIVE); test_phase = 1; printf("nn::oe: freeze test: window minimised (handling mode %d)\n", g_oe_focus_mode); fflush(stdout); }
-        } else if (test_phase == 1 && t >= t_start + t_len) {
-            ShowWindow(g_oe_window, SW_SHOWNOACTIVATE);
-            test_phase = 2;
+            if (test_phase > 0)
+                printf("nn::oe: focus test: %s for %llu ms: the game's main loop polled %ld times\n", k_test_state[test_phase],
+                       (unsigned long long)(GetTickCount64() - phase_at), (long)(g_oe_poll_count - phase_polls));
+            if (test_phase == 1) EnumWindows(oe_find_window, (LPARAM)&w);
+            if (test_phase == 0) g_oe_was_foreground = 1;  /* never the foreground window, so from now on another program has the focus */
+            else if (test_phase == 1 && w) { g_oe_window = w; ShowWindow(w, SW_SHOWMINNOACTIVE); }
+            else {                                        /* restored (or no window on screen to minimise: SMO_SHOW=1 for a test copy) */
+                if (test_phase == 2) ShowWindow(g_oe_window, SW_SHOWNOACTIVATE);
+                else printf("nn::oe: focus test: no window on screen to minimise (a test copy needs SMO_SHOW=1)\n");
+                g_oe_was_foreground = 0;                  /* a window that was never the foreground window counts as in focus again */
+                test_phase = 2;
+            }
+            test_phase++;
+            phase_at = GetTickCount64(); phase_polls = g_oe_poll_count;
+            if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run", g_oe_focus_mode);
+            fflush(stdout);
         }
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
-        int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+        int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real foreground */
+        int ours = !testing && fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
         if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
-        if (!g_oe_was_foreground) continue;
         int minimised = g_oe_window && IsIconic(g_oe_window);
-        int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
+        int runnable = !pause || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
             frozen_at = GetTickCount64(); polls_at = g_oe_poll_count;
@@ -196,7 +213,6 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
             fflush(stdout);
             trace_printf("     nn::oe: application resumed after %llu ms\n", (unsigned long long)(GetTickCount64() - frozen_at));
         }
-        if (test_phase == 2 && !g_guest_frozen) { g_oe_was_foreground = 0; test_phase = 3; }      /* the test window was never the foreground window: back to "in focus" */
     }
     return 0;
 }
@@ -206,7 +222,10 @@ static void oe_track_focus(void) {
     static volatile LONG watcher;
     ULONGLONG now = GetTickCount64();
     if (enabled < 0) { const char *e = getenv("SMO_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
-    if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) CloseHandle(CreateThread(NULL, 0, oe_watch, NULL, 0, NULL));
+    if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) {     /* the watcher: only to pause the game, or for the test */
+        int pause = gfx_options()->pause_unfocused;
+        if (pause || getenv("SMO_FOCUS_TEST")) CloseHandle(CreateThread(NULL, 0, oe_watch, (LPVOID)(intptr_t)pause, 0, NULL));
+    }
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
     g_oe_focus_recheck = 0;

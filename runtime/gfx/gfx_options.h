@@ -15,6 +15,7 @@ typedef struct {
     int overlay;             /* 1: frame time in the title bar and a "frame-time:" log line every second */
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a scene the draw is left out until they are ready; nvn_vk_pipelines.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
+    int pause_unfocused;     /* unfocused: 0 run (the game goes on while the window is not active), 1 pause (nnmisc.c oe_watch stops it) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
 #endif

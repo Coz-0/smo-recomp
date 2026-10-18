@@ -15,6 +15,7 @@
 #include <tlhelp32.h>
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 int display_menu_held(void);                       /* display.c */
+extern volatile LONG g_guest_frozen;               /* hostrt.c */
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile LONG g_wd_quit;
 static HANDLE g_wd_thread;
@@ -212,6 +213,7 @@ static DWORD WINAPI wd_main(void *arg) {
         if (s < next || dumps >= 6) continue;
         if (IsIconic((HWND)nvn_front_hwnd()) && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
         if (display_menu_held()) { next = s + limit; continue; }       /* the game is held on purpose (the Help page, smo_guide.c) */
+        if (g_guest_frozen) { next = s + limit; continue; }            /* stopped on purpose (graphics.ini unfocused = pause, nnmisc.c oe_watch) */
         dumps++;
         wd_dump(s, g_wd_try - try0);
         reported = s; next = s * 4;
