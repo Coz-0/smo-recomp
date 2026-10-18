@@ -38,10 +38,10 @@ game read it (the log's `amiibo menu:`, `nfp:` and `nn::hid:` lines say what hap
 ## The game's state
 
 Every state machine of the game is an `al::NerveKeeper`: its current state (a "nerve") runs once a frame through a call
-the runtime sees (`runtime/smo_nerve.c`). A state's name is the game's own class name for it, for example
+the runtime sees (`runtime/game/smo_nerve.c`). A state's name is the game's own class name for it, for example
 `StageSceneNrvPlay` or `OpeningStageStartDemoNrvCameraTutorial`. Names come from the function list
-(`build\functions\main_functions.tsv`): the decompilation's names (built with `--decomp`, 1.0.0) and the class names
-the game's RTTI gives (always; the only source for 1.4.1). The tracker names the others from the code: a state whose
+(`build\functions\main_functions.tsv`): the class names the game's RTTI gives. The tracker names the others from the
+code: a state whose
 code calls `<Class>::exe<State>()` is `<Class>Nrv<State>`, one that runs a sub-state is named after its neighbours,
 `<Class>Nrv_<address>`. Many classes are called `HostTypeNrv<State>` by the game itself (one per actor class); such a
 state gets the class of the object that first runs it: `FrogNrvWait`.
@@ -99,5 +99,4 @@ and no dropped audio samples or underruns. It takes about 12 minutes with a warm
 the same frames within a few frames from run to run.
 
 Limits: the route depends on the game behaving the same way each time (it does, as far as measured); the sequence
-does not avoid enemies (a small Goomba hits Mario once on the way to the tower door); and some of the state names it
-waits for come from the function list built with `--decomp`.
+does not avoid enemies (a small Goomba hits Mario once on the way to the tower door).

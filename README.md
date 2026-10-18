@@ -1,149 +1,117 @@
 # smo-recomp
 
-A **static recompilation** of *Super Mario Odyssey* (version 1.0.0, and its 1.4.1 update) from the Nintendo Switch to a
-native Windows x64 program, with its own runtime and a Vulkan renderer.
+A native Windows x64 version of *Super Mario Odyssey* (1.4.1), made by **static recompilation** of the Nintendo
+Switch game, with its own runtime and a Vulkan renderer.
 
-It is **not an emulator**: there is no CPU interpreter and no JIT. The game's AArch64 machine code is translated to C
-ahead of time and compiled for the PC; the console's system libraries, graphics API, audio, video, input and file
-system are re-implemented by this project's runtime.
+It is **not an emulator**: there is no CPU interpreter and no JIT, and no console firmware runs. The game's AArch64
+machine code is translated to C ahead of time and compiled for the PC; the system libraries, graphics API, audio,
+video, input and file system the game uses are re-implemented by this project's runtime.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own legally obtained copy of the game (1.0.0; for 1.4.1 also its update) and keys and firmware dumped
-> from your own console.
-> Everything derived from them is generated on your PC, from your dump, under `build/`, and never leaves it.
+> You need your own copy of the game, dumped from your own console. The build reads the dump's decrypted files: no
+> keys and no firmware are needed. Everything derived from the game is generated on your PC, under `build/`, and never
+> leaves it.
 
-## Status (October 2026)
+## Status
 
-Early, not finished: played by hand up to Cascade Kingdom's first checkpoint, the start checked with scripted input.
-What is written here was measured on the development PC (Windows 11, RTX 4090); where something was not checked, it
-says so. The table is version 1.0.0; the 1.4.1 update builds and runs too, and what was checked on it is listed
-[below](#the-141-update).
+Early, not finished. Everything below was measured on the development PC (Windows 11, NVIDIA RTX 4090); where
+something was not checked, it says so.
 
 | Area | State |
 |---|---|
-| Boot → title screen → file select | works |
-| New game → prologue → Cap Kingdom → Bonneton → into Top-Hat Tower, up to Mario's first capture (a frog) | plays with scripted input: `tests/run_cap_kingdom.py` checks 13 checkpoints against the game's own state, from an empty save, without a crash (5 of 5 runs passed; 42,409 frames in the last) |
-| Cap Kingdom → Cascade Kingdom, up to its first checkpoint | played by hand with an Xbox One controller; no scripted check yet |
-| Other kingdoms | not played. Loaded from a copy of a save made to start there (`tools/dev/save_warp.py`): Metro Kingdom (daytime) and Ruined Kingdom (arrival, with its lightning) load and run at 60 fps once loaded, with 0 Vulkan call failures and 0 operations not implemented |
-| Renderer | Vulkan. **Every shader stage in the game's shader archives translates and compiles** (Maxwell machine code → GLSL → SPIR-V), checked offline by `tests/check_all_shaders.py`: 27,228 of 27,228 distinct stages (7,292 vertex, 19,865 fragment, 3 geometry, 68 compute). The structured control flow of the translator was checked against its reference form on the GPU: 1,519 of 1,519 stages equal over 6.2 million invocations. 0 Vulkan call failures and 0 dropped command lists in the scripted run. No single-frame flashes: 0 frames with a flash in captures of every frame while the camera pans in Cascade Kingdom (2 to 9 in 361 before the fix: draws that read vertices past the range the game declared) |
-| Geometry stages | the Ruined Kingdom's lightning: 657 draws in a run. Measured on the GPU: each draw's 31 line segments become 392-507 line primitives; read back from the scene buffer, a bolt adds 3 to 85 (peaks up to 752) to the brightness of about 3,000 pixels, over 1.7 behind it, before the game draws its clouds over it |
-| Compute images, indirect draws and dispatches | implemented (image loads, stores and atomics, `nvnCommandBufferBindImage`; `DrawElementsIndirect`, `DispatchComputeIndirect`); no scene tried so far uses them, so they are not checked in play |
-| Operations the renderer lacks | reported once in the log, counted and skipped: the game keeps running (`SMO_VK_MISSING=exit` stops at the first instead). One met so far, by the stage stress test (1.4.1, below): quads, in a Sand Kingdom room; they are now drawn as two triangles each. None left in that test |
-| Graphics memory | fixed: when the game makes a texture again (its render targets, every few frames in some places), the image of the one it gave up is now freed once nothing names it any more. Measured with the 1.4.1 update: 1.5 GB at the end of the 12-minute scripted Cap Kingdom run (8.8 GB before), 2.0 GB in the Cookatiel rematch (12.9 GB before after 25 s); the Cap Kingdom run still passes with the same pictures, and the 60 fps bench holds on both versions. A test game also takes about 1.1 GB less memory of the PC than before |
-| Audio | the game's own audio renderer runs (lifted from its system library); the final mix plays through the Windows audio device (6 → 2 channel downmix, 48 kHz): 0 dropped samples, 0 underruns in the scripted run |
-| Video | H.264 through Windows Media Foundation; the tutorial videos play with their picture (checked in the scripted run's captures) |
-| Help (the pause menu's Action Guide) | opens inside the game window, from the manual in your dump (Microsoft Edge WebView2, part of Windows 11), and the game waits while it is open, as on the console. Pad: stick or d-pad and A to choose and open, L / R to turn, B to go back and to close; keyboard: arrows, Enter, Q / E, Escape. Checked on both versions with scripted input: opened from the pause menu, an entry chosen and opened, a page turned, back, closed, the game going on where it was. Without WebView2 it opens in your web browser |
-| Window | a borderless window by default (`graphics.ini`: size, mode), dragged anywhere to move it; F11 or a double-click switches to borderless fullscreen and back. Checked by reading the window's style and size and sending F11 and double-clicks: 1280x720 centred, then the whole 2560x1440 monitor and back, the picture rebuilt at the new size each time |
-| Capture button | F12 or a pad's share button saves the frame as a BMP in the save folder's `album` (the saving checked through `SMO_CAPTURE_AT`, which presses the same button; the turn for the game's portrait setting is not checked against a console) |
-| System calls | every system call the game made in the tested scenes is implemented (321 of 321 in the scripted Cap Kingdom run, 294 of 294 in the Ruined Kingdom); `SMO_IMPORT_SELFTEST=1` checks the implementations added from a list of the game's imports rather than from play (0 failures) |
-| Controllers | keyboard, XInput, and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, gyro): passes its automated tests with virtual devices (51 of 51); played by hand with an Xbox One controller; other physical pads not tried |
+| Start | boot, title screen, file select, Resume: play begins (a scripted start reaches the game's play state at frame 3,564 with the warm shader cache) |
+| Cap Kingdom | `tests/run_cap_kingdom.py` plays from an empty save to Mario's first capture in Top-Hat Tower and checks 13 checkpoints against the game's own state: 13 of 13 (42,558 frames), 0 host exceptions, 0 Vulkan call failures, 0 operations not implemented |
+| Every stage and scenario | `tests/stress_stages.py` started every stage the game plays as a stage scene (176) and every scenario of every kingdom (100), each from a save made to start there, played for a few seconds at 4x speed: 276 runs, 2.1 million frames, 0 Vulkan call failures, 0 operations not implemented, 0 freezes, 0 audio drops. Cutscenes, the Labo VR stages and the world map have scenes of their own and were not started this way; Luigi's Balloon World and the Koopa races are started by their characters and cannot be started from a save |
+| Played by hand | from Cap Kingdom to Cascade Kingdom's first checkpoint, with an Xbox One controller¹; that save continues on 1.4.1 |
+| Shaders | every stage in the game's shader files translates and compiles (Maxwell machine code → GLSL → SPIR-V), checked offline by `tests/check_all_shaders.py`: 27,888 of 27,888 distinct stages (7,381 vertex, 20,436 fragment, 3 geometry, 68 compute). The translator's structured control flow equals its reference form on the GPU: 1,519 of 1,519 stages over 6.2 million invocations¹ |
+| Picture | the texture layout equals the one Nintendo's tools stored for all 20,203 textures of the RomFS (`tests/bntx_layout_check.py`). 0 frames with a single-frame flash in captures of every frame while the camera pans in Cascade Kingdom¹. The Ruined Kingdom's lightning (a geometry stage) draws: each bolt brightens about 3,000 pixels before the game draws its clouds over it¹ |
+| Graphics memory | 1.5 GB at the end of the 12-minute Cap Kingdom run, 2.0 GB in the Cookatiel rematch: textures the game gives up are freed once nothing names them |
+| Audio | the game's own audio renderer runs (lifted from its system library) and plays through the Windows audio device (6 → 2 channel downmix, 48 kHz): 0 dropped samples, 0 underruns in the Cap Kingdom run |
+| Video | H.264 through Windows Media Foundation: the tutorial videos play with their picture |
+| Help | the pause menu's Action Guide opens inside the game window, from the manual in your dump (Microsoft Edge WebView2), and the game waits while it is open, as on the console; checked with scripted input (open, choose, turn a page, back, close). Without WebView2 it opens in your web browser |
+| amiibo | F1, or both stick buttons on a pad, opens a menu drawn like the game's pause menu from its own layout textures, fonts and texts: 102 amiibo, in the game's language. The one chosen is held to a virtual NFC reader; checked in Cascade Kingdom: the game reads Peach and runs her help. Mario, Bowser and Luigi checked as well¹ |
+| System calls | every system call the game made in the tested scenes is implemented (331 of 331 in the Cap Kingdom run); `SMO_IMPORT_SELFTEST=1` checks the ones written from the game's import list rather than met in play: 0 failures |
+| Controllers | keyboard, XInput, and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, motion): 51 of 51 automated checks with virtual devices; played with an Xbox One controller; other physical pads not tried |
+| Window and capture | a borderless window by default; F11 or a double-click switches to borderless fullscreen and back. F12 or a pad's share button saves the frame to the save folder's `album` |
 | Save data | journalled like the console's (two-phase commit); the game's autosave and Resume work |
-| Speed | 60 fps, paced to a 60 Hz clock. At Cascade Kingdom's first checkpoint 59.8-60.0 fps in every 300-frame window for two minutes (1% lows 52.7-57.4 fps), also while a web browser keeps most of a CPU core busy and two or four more processes each keep one busy (`tools/dev/cpuload.py`); before, the browser alone brought it to 56.4-59.8 fps per window. Scripted Cap Kingdom run, with a screenshot every 300 frames: 59.5 fps on average once play begins, 59.4-59.7 in Bonneton, 59.0-59.6 in Top-Hat Tower; lowest 48.6 while the tower stage loads (before: 26-42 fps until Cappy joins, then about 13). Measured on the development PC only |
-| Online | not available (the network services answer as an offline console) |
-| amiibo | F1, or both stick buttons on a pad (`controllers.ini` `[hotkeys]`), opens a menu drawn like the game's pause menu, from the game's own layout textures, fonts and texts: the 91 amiibo the game has names for, in its language. The game waits while it is open; A puts the chosen amiibo on a virtual NFC reader, and if the game is waiting for one (its amiibo mode, the amiibo NPC's prompt) → is held for you until it has read it. Checked in Cascade Kingdom with scripted input: Mario (the game runs its invincibility help), Peach (a Life-Up Heart), Bowser (its coin help), Luigi (coins); chosen in the game's own pause menu, the amiibo waits on the reader until → is held. The amiibo NPC's prompt was not tried |
+| Speed | 60 fps, paced to a 60 Hz clock: at Cascade Kingdom's first checkpoint 59.8-60.0 fps in each of 20 windows of 300 frames (1% lows 49.4-56.0); the Cap Kingdom run averages 59.4 fps once play begins, lowest 49.5 while the tower stage loads. Development PC only |
+| Online | not available: the network services answer as a console without a network |
+| Not tried yet | what the 1.4.1 update adds: Balloon World, the new Snapshot Mode filters, the Labo VR mode |
 
-### The 1.4.1 update
-
-With your update package, the same sources build the game as the update leaves it (`--target 1.4.1`, beside 1.0.0).
-Checked on 1.4.1 so far:
-
-| Area | State |
-|---|---|
-| Game files | the update's RomFS is a patch of the base's; the extraction applies it (336 files added, 246 changed), and `tools/extract/romfs.py --update --verify` checks every block against the update's own hash tree: 346,568 blocks and the levels above them, 0 wrong |
-| Boot, new game, a 1.0.0 save | a new game starts at the mode select; a 1.0.0 save made at Cascade Kingdom's first checkpoint loads after the game's update notifications, and play resumes there |
-| Scripted Cap Kingdom run | `tests/run_cap_kingdom.py` passes: 13 of 13 checkpoints from an empty save to the frog capture, 0 host exceptions, 0 Vulkan call failures, 0 operations not implemented (5 of 5 runs passed; 42,276 frames in the last) |
-| Speed | Cascade Kingdom's first checkpoint: 60.0 fps in all 24 windows of 300 frames (1% lows 52.7-57.0), with the fast path for the game's sampler list that 1.0.0 uses too (without it 59.88 fps on average, 1% lows down to 43.6). Scripted Cap Kingdom run, with a screenshot every 300 frames: 59.4 fps on average once play begins, lowest 48.3 while the tower stage loads |
-| Shaders | every stage in the game's shader files translates and compiles, the update's new ones included: 27,888 of 27,888 distinct stages (7,381 vertex, 20,436 fragment, 3 geometry, 68 compute). Among them the primitive drawer's textured quad (`SystemData/primitive_drawer_nvn_shader.bin`), whose texture handle the game keeps in a uniform buffer: the renderer now reads it there at each draw (before, those draws were left out: 1,404 in 25 minutes of play). The stage stress test met it in the Mushroom Kingdom's boss rematches (an untextured draw) |
-| Every stage and scenario | `tests/stress_stages.py` started every stage the game plays as a stage scene (176; cutscenes, the Labo VR stages and the world map are played by scenes of their own and were not started this way) and every scenario of every kingdom (100, most at a checkpoint flag), each from a copy of a Sand Kingdom save made to start there, played for a few seconds at 4x speed with two games side by side: 276 runs, 2.1 million frames, 0 Vulkan call failures, 0 operations not implemented, 0 freezes, 0 audio drops. Found and fixed: quads (above); a crash entering two places with many small animated objects (a Cascade Kingdom room, Bonneton in Cap Kingdom's second scenario: more than 256 buffers written by compute in one frame); a rare crash going from the title menu into a stage (2 in 91 runs before, 0 in 276 after: a thread priority). Not faults of the game or the port: the Cookatiel rematch stopped when it restarted after Mario lost, because the test started the rematch directly at 4x speed and the restart then needs data the game loads beforehand in the painting room that leads to it; the test now enters every rematch from its painting room, as the game does, and the restart went through in 10 of 10 runs (directly: stopped in 5 of 7); the Mushroom Kingdom's Crazy Cap shop, started in the kingdom's first scenario, in which the game has no door to it, is lit by the game's own placeholder data for that scenario and looks washed out; in the second scenario it is drawn like the other shops. Luigi's Balloon World and the Koopa races cannot be started from a save (their characters start them) |
-| Sound | the game's audio renderer runs on the update's newer system library, whose commands are laid out differently; both layouts are read: 141,972 audio frames in the scripted run, 0 dropped samples, 0 underruns |
-| System calls | the ones 1.4.1 adds are implemented: 333 of 333 reached in the scripted run; `SMO_IMPORT_SELFTEST=1` 0 failures |
-| Not tried yet | what the update adds (Balloon World, the new Snapshot Mode filters and the rest its notification screens list, the Labo VR mode), the amiibo menu |
+¹ measured on the base game (1.0.0), before this project moved to 1.4.1; not measured again since.
 
 ## How it works
 
-- **Extraction** (`tools/extract`): reads your NSP in place (NCA/PFS0/RomFS readers, keys from your own `prod.keys`) and writes the ELF images, the RomFS and the system fonts to `build/`.
-- **Function boundaries** come from the executable's `.eh_frame` unwind data and its own symbol table, never from guesses: 74,822 functions in `main`.
-- **Lifter** (`tools/lifter/recomp.py`): translates each AArch64 function into one C function operating on a register context. The output is compiled with clang into a game DLL; nothing is interpreted at run time.
-- **Differential testing** (`tools/lifter/difftest.py`): sampled instruction shapes run both as lifted C and in the Unicorn CPU emulator, over random, special floating-point, branch and trap inputs; any difference is a failure (1.0.0: 23,069 of 23,069 equal; 1.4.1: 23,194 of 23,194). A mutation test checks that the harness catches planted bugs.
-- **System-library lifting** (`tools/lifter/sdklift.py`): parts of the game's own SDK, such as the audio renderer and its DSP, are lifted the same way, so the host only provides the bottom layer (timers, events, memory, the audio device).
-- **Game versions** (`tools/target.py`): 1.0.0, or with the update package 1.4.1, each built in a folder of its own (`build\` and `build\1.4.1\`). The update's RomFS is a patch of the base's (a relocation table and the counter generations of its encryption) that the extraction applies. Its executable keeps almost no symbols: the game's state names come from its RTTI, and the functions the runtime replaces with host code are found by matching them with 1.0.0's. Where its newer system library lays data out differently (the audio commands), the runtime reads it per version.
-- **Host runtime** (`runtime/`), adapted from [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp):
-  - Horizon OS services: `nn::os` threads and events, `nn::fs` with save-data journalling, hid, settings, an offline network stack.
-  - An NVN → Vulkan graphics back end. Command lists are recorded on the game's threads and replayed on a render thread; a recorded list lives until the game finalizes it or records over its memory, as on the console.
-  - A Maxwell shader → GLSL → SPIR-V translator (`mx_translate.c`) with structured control flow.
-  - Texture de-swizzling, checked against all 19,325 textures in the RomFS.
-  - Movie playback on Windows Media Foundation.
-  - Menus of its own (the amiibo menu) drawn in software from the game's layout textures (BNTX), fonts (BFFNT) and
-    message files (MSBT), read from your RomFS at run time.
-- **Scripted runs** (`runtime/smo_nerve.c`, `runtime/nnhid.c`, `tests/`): the runtime can report which state each of the game's state machines is in. Input sequences wait for those states and steer Mario to map coordinates through the game's camera, so a run does not depend on frame rate or loading times. See [`docs/SCRIPTED_RUNS.md`](docs/SCRIPTED_RUNS.md).
-- **Strict audit:** every unimplemented system call is logged with its name and call count; `SMO_STRICT=report` lists every call to a placeholder handler.
+1. **Import.** `scripts/setup.py` reads your decrypted dump in place and converts the program's modules to ELF.
+2. **Function list.** Every function of the executable, with boundaries from its own unwind tables and symbols (54,214
+   in `main`).
+3. **Lifting.** `tools/lifter/recomp.py` turns each AArch64 function into a C function; clang compiles them into a game
+   DLL. A differential test runs sampled instructions both lifted and in the Unicorn emulator: 23,194 of 23,194 equal.
+4. **Runtime.** `runtime/` stands in for the console: threads with the console's three-core scheduling, files and
+   journalled saves, NVN graphics on Vulkan with a Maxwell shader translator, the audio renderer, controllers, movies,
+   Help and the offline system services.
 
-## Plans
-
-- Speed on slower CPUs and GPUs; shorter stalls while a stage loads (the first seconds in a kingdom never visited before
-  run at 40-55 fps while its textures and shaders are made).
-- Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
-- Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`).
-- Play with other physical controllers (PlayStation, Switch Pro), other GPUs (AMD, Intel).
-- 1.4.1: checks of what the update adds (Balloon World, the Snapshot Mode filters, the Labo VR mode) and of the amiibo
-  menu.
+[`docs/architecture.md`](docs/architecture.md) explains each part.
 
 ## Requirements
 
-- Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* 1.0.0 dump (the base NSP; for 1.4.1 also its update NSP), and `prod.keys` and firmware dumped from your own Switch.
-- [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041, the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the [WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2) (for Help in the game window; the WebView2 Runtime is part of Windows 11), Python 3.13.
+- Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
+  `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
+- Your own *Super Mario Odyssey* dump: the 1.4.1 program, the base game's executable, the RomFS with the update applied
+  and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
+- [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
+  the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
+  [WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2), Python 3.13.
 
-## Building and running
-
-[`BUILDING.md`](BUILDING.md) has the details. In short, from a fresh clone:
+## Quick start
 
 ```bat
 py -3.13 -m venv .venv
-.venv\Scripts\python -m pip install pycryptodome lz4 zstandard capstone unicorn numpy Pillow pyyaml
-.venv\Scripts\python scripts\setup.py --dump <folder with your NSP>
-.venv\Scripts\python scripts\run.py first --seconds 300
+.venv\Scripts\python -m pip install lz4 capstone unicorn numpy Pillow
+.venv\Scripts\python scripts\setup.py --dump "<folder of your dump>"
+.venv\Scripts\python scripts\run.py play --exe smo_native.exe --seconds 0
 ```
 
-For 1.4.1, put the update NSP in the same folder and add `--target 1.4.1` to the last two commands. That build lives in
-`build\1.4.1\`, beside the 1.0.0 one, with saves of its own in `build\1.4.1\userdata`; copy `build\userdata\save` there
-to continue a 1.0.0 save.
-
-Debugging aids (frame and per-pass captures, shader dumps, guest call stacks on crashes, heap write watches, state
-logs) are described in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
+[`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
 
 ## Repository layout
 
 ```
-runtime/         host runtime: OS services, NVN -> Vulkan, shader translator, audio, input, movies, state tracker
-scripts/         setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
-tools/target.py  which game version a build is for (1.0.0, or the 1.4.1 update) and where its files go
-tools/extract/   NSP/NCA/RomFS readers (the update's RomFS patch too), function list, RomFS and font extraction
-tools/lifter/    AArch64 -> C lifter, system-library lifter, differential test, build steps
-tools/dev/       disassembler, caller finder, SARC and stage-placement listers, Maxwell instruction namer
-tools/port/      idempotent adaptation of the ssbu-recomp runtime sources
-tests/           scripted Cap Kingdom run, every shader stage of the game offline, shader translator equivalence harness,
-                 texture layout check, fast-path checks
-docs/            debugging aids, scripted runs
+runtime/          the host runtime, by subsystem: core, libc, os, fs, gfx, audio, input, services, game
+scripts/          setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
+tools/target.py   where the build's files go
+tools/extract/    the import of your dump (NSO to ELF, version checks) and the function lists
+tools/lifter/     the AArch64 to C lifter, the SDK lifter, the differential test and the build steps
+tools/dev/        lookups for debugging: disassembly, callers, archives, stage placement, save warps, profiles
+tests/            scripted Cap Kingdom run, stage stress test, every shader stage offline, translator equivalence,
+                  texture layout, fast paths
+docs/             building, architecture, debugging, scripted runs
 ```
 
-## Related work
+## Plans
 
-- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp): the static recompilation of *Super Smash Bros. Ultimate* this project is built on; its design, lifter and runtime were adapted here (GPL-3.0).
-- [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp): the decompilation project of *Super Mario Odyssey*, read as a reference only; none of its code is included.
-- yuzu/suyu and Ryujinx: documentation and sources consulted for console behaviour (cited where used).
-
-## How this was made
-
-Most of the code was written by AI coding agents (Claude) working under the maintainer's direction, starting from
-ssbu-recomp's design. Two rules kept it honest: every claim comes from a test or a measurement (this README says what
-was measured and what was not), and nothing derived from the game goes into the repository. Expect rough edges.
+- Speed on slower CPUs and GPUs, and shorter stalls the first time a kingdom is visited (its textures and shaders are
+  made then).
+- Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
+- Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed
+  `IPA`).
+- Other physical controllers (PlayStation, Switch Pro) and other GPUs (AMD, Intel).
+- What the 1.4.1 update adds: Balloon World, the Snapshot Mode filters, the Labo VR mode.
 
 ## Contributing
 
 Testers with other GPUs and controllers, and people who know the game's internals, are welcome. Read
-[CONTRIBUTING.md](CONTRIBUTING.md) first: three rules (nothing derived from the game in the repository, clean sources
-only, every claim measured) apply to every contribution.
+[CONTRIBUTING.md](CONTRIBUTING.md) first: nothing derived from the game goes into the repository, sources must be
+clean, and every claim is measured.
+
+## Related work
+
+- [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp): the static recompilation of *Super Smash Bros. Ultimate* whose
+  design, lifter and runtime this project started from (GPL-3.0).
+- [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp): the decompilation project of *Super Mario Odyssey*,
+  read as a reference only; none of its code is included.
+- yuzu/suyu and Ryujinx: documentation and sources consulted for console behaviour, cited where used.
 
 ## Legal
 
@@ -157,5 +125,7 @@ it yourself.
 ## Credits
 
 - [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) by Denkishi: the design and runtime this project builds on.
-- [Unicorn](https://www.unicorn-engine.org/) and [Capstone](https://www.capstone-engine.org/): reference CPU emulation and disassembly.
-- [SDL3](https://github.com/libsdl-org/SDL), [glslang/shaderc](https://github.com/KhronosGroup/glslang), the Vulkan SDK.
+- [Unicorn](https://www.unicorn-engine.org/) and [Capstone](https://www.capstone-engine.org/): reference CPU emulation
+  and disassembly.
+- [SDL3](https://github.com/libsdl-org/SDL), [glslang/shaderc](https://github.com/KhronosGroup/glslang), the Vulkan
+  SDK.
