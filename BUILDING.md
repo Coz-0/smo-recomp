@@ -98,6 +98,9 @@ With the update package in the dump folder, `--target` builds the game as the up
   printed when it ends.
 - Only `smo_native.exe` and `smo_user.exe` open a visible window and play sound (`--exe smo_native.exe` to play);
   other names, used for tests, keep the window hidden (`SMO_SHOW=1` shows it) and silent.
+- A test run first waits while `SMO_MAX_GAMES` test games started this way run on the PC (default: one per 12 GB of
+  memory, 2 on a 32 GB PC; `0` = no limit). A game in a stage takes 4-7 GB; more games than fit make the PC page,
+  which slows every one of them and can make graphics memory allocations fail.
 - `--userdata <folder>` gives the run its own save folder: a new, empty folder starts a new game, a copy of an earlier
   run's folder continues from there. Without it saves go to `build\userdata\save`.
 - `--seq <file>` plays an input sequence (see [`docs/SCRIPTED_RUNS.md`](docs/SCRIPTED_RUNS.md)); `--env NAME=VALUE`

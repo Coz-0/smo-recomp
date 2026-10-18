@@ -65,6 +65,12 @@ The end of every log has the counts that tell whether a run was healthy:
   so, because the game may still submit them.
 - `SMO_TEXLOG=1` logs texture creation, finalization and registration; the per-draw log of `SMO_VK_PASSSHOT` says why
   a texture handle is unknown (slot outside the pool, never registered, or a texture that was finalized).
+- Graphics memory: the `nvn_vk: totals` line (every 600 frames) ends with the device memory the renderer has allocated
+  and the images of textures nothing names any more that were freed (agl gave up every texture pool slot of the
+  texture and the object that made it holds another one; `runtime/nvn_gl.c`, above `pool_ent_release`). Such an image
+  goes after `SMO_VK_TEXFREE=<frames>` unused frames (default 8; `0` keeps every image, as before). `made again` counts
+  textures used after their image went (what the GPU had drawn into one is lost then; it should stay 0, and
+  `nvn_vk_tex:` lines name them). With `SMO_TEXLOG=1` every release of a slot and every freed image is logged too.
 - Flicker that shows in single frames: save every frame of a stretch (`SMO_SHOT_EVERY=1 SMO_SHOT_FROM=<a> SMO_SHOT_TO=<b>
   SMO_SHOT_DIR=<folder>`), then `tools\dev\flicker.py <folder>` lists the frames where a region of the picture is brighter
   or darker than in both neighbours, and saves them side by side. To see what such a frame drew differently, run the same
@@ -108,6 +114,28 @@ The end of every log has the counts that tell whether a run was healthy:
   the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=1` lets the present not wait for the render thread (one frame in flight);
   `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
 
+## Memory
+
+- Every 300 frames the log has `nvn_vk_mem: frame F:` the process's working set (its private part and peak), private
+  bytes, the commit of pagefile-backed sections (the game's memory heap), the Vulkan memory the renderer allocated (the
+  host-visible part is system memory the driver keeps resident) and the shader modules made, released and made again.
+- `tools\dev\memmap.py <pid or exe name> [--log build\<version>\run\<name>.log] [--zero 64] [--json <file>]` reads a
+  running game from outside (nothing is written into it): every allocation with its reserved, committed and resident
+  size, named where it can be (images and mapped files, thread stacks with their start function from the exe's map, NT
+  heap segments and large blocks, the guest memory heap and NVN virtual pools from the log, Vulkan memory blocks with
+  `SMO_VK_MEMLOG=1`). `--zero` adds, for the large allocations, how much of what is resident holds only zeros and where
+  in the allocation it lies.
+- Where a game's memory goes (1.4.1, Sand Kingdom home stage, frame 6000 of a scripted run): the game's own memory heap
+  (2.2 GB resident of the 3.05 GB the game asks for; 92% of it non-zero data), the graphics driver's heaps (stage
+  libraries and pipelines, the pipeline cache object: 640 MB), the stream ring (256 MB of resident system memory), the C
+  runtime heap (250 MB), executables and DLLs (100 MB). Graphics memory adds commit, not resident memory: about as much
+  as the Vulkan memory, for the driver's eviction backing.
+- `SMO_VK_MODREL=0` keeps every shader module (by default a stage's module is released once its pipeline library or
+  compute pipeline is made, and made again from the stage cache's SPIR-V file if needed: 1.1 GB less).
+- `SMO_VK_PCACHE=0` makes pipelines without a pipeline cache object (nothing read or saved): 640 MB less, as fast for an
+  exe the driver has run before, but the NVIDIA driver keeps its own shader cache per executable, so an exe under a new
+  name compiles everything again.
+
 ## Crashes and stalls
 
 - A crash prints `HOST EXCEPTION` with the last guest function, its registers and the host call stack, named from the
@@ -132,6 +160,10 @@ The end of every log has the counts that tell whether a run was healthy:
 ## Audio and input
 
 - `SMO_AUDIO=0` turns the audio output off; `SMO_AUDIO_WAV=<file>` also writes the final mix to a WAV file.
+- Test copies (any exe name but `smo_native.exe` and `smo_user.exe`) are silent: their volume in the Windows mixer is
+  0. The sound is still made and fed to the device as with sound, so the timing, the dropped-sample and underrun counts
+  and an `SMO_AUDIO_WAV` capture are the same. `SMO_VOLUME=<0..100>` sets the volume of any copy (the log says
+  `host volume N%`).
 - `SMO_HIDLOG=1` logs the pad values the game reads, when they change.
 - `SMO_PAD_SELFTEST=1` runs the controller self-test with SDL3 virtual devices and exits.
 - amiibo: the log says when the menu opens and closes (`amiibo menu:`), what the NFC reader does (`nfp:` an amiibo held to
@@ -140,14 +172,84 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Starting elsewhere in the game
 
-- `tools\dev\save_warp.py <save folder> --out <new folder> --stage <StageName> [--world <n>]` copies a save folder so
-  that its game file continues in another stage (at the stage's default entrance; the world number comes from
-  `SystemData\WorldList.szs` for a kingdom's home stage, e.g. `BossRaidWorldHomeStage` = 11). Run it with
-  `scripts\run.py <name> --userdata <new folder>`: a late kingdom can be tried without playing to it. The source folder is
-  only read; never give your own save folder as `--out`.
+- `tools\dev\save_warp.py <save folder> --out <new folder> --stage <StageName> [--world <n>] [--scenario <n>]
+  [--checkpoint <object id> --visited]` copies a save folder so that its game file continues in another stage (at the
+  stage's default entrance, for a kingdom the Odyssey; the world number comes from `SystemData\WorldList.szs` for a
+  kingdom's home stage, e.g. `BossRaidWorldHomeStage` = 11). `--scenario` sets the kingdom's scenario (which objects
+  its stages place); `--checkpoint` starts at one of the stage's checkpoint flags (`tools\dev\byml.py
+  StageData\<Stage>Map.szs --grep CheckpointFlag` lists them; the flag is marked as reached in the copy, a flag in a
+  zone is named `<id>(<zone>[<the zone's id in the stage>])`), `--reached <object id>` marks more flags as reached
+  without starting at them, and `--visited` lets it apply in a kingdom the save has
+  not been to (a first visit starts at the Odyssey). Run it with `scripts\run.py <name> --userdata <new folder>`: a late
+  kingdom can be tried without playing to it. The source folder is only read; never give your own save folder as
+  `--out`.
+- A save always resumes in a kingdom's home stage. `SMO_START_STAGE=<stage>[:<scenario>]` (TEST ONLY) makes the first
+  stage scene the game starts that stage instead, at its default start point, as when Mario goes through its entrance:
+  any sub-area, room or 2D section (the log says `start stage: frame F: the game starts <home>, scenario N;
+  SMO_START_STAGE makes it <stage>, scenario M (<whose>)`). Give it a save warped to the stage's kingdom. The runtime
+  watches for `StageScene::init` (found in the game's own vtable, `GAME_VSYM_StageScene_init` in `build\gen\image.h`)
+  and changes the stage name it is called with, once; later stage scenes are only logged (`the game starts <stage>,
+  scenario <n> itself`, e.g. the restart after a miss). The scenario: the one given (`asked for`), else the stage's own
+  when the game has one for it (`the stage's own, as through its door`: what the game's own `ChangeStageInfo` gives a
+  stage when no scenario is asked for, as the doors to sub-areas do; 1 for a kingdom's challenge rooms), else the
+  kingdom's as the game chose it (`the kingdom's`). Before 2026-10-18 it was always the kingdom's: e.g. the Cascade
+  Kingdom's challenge rooms ran in its scenario 7, which the game never gives them. A stage that follows the
+  kingdom's scenario can still be started in one whose home map has no door to it (the Mushroom Kingdom shop in
+  scenario 1 shows the game's unbaked placeholder lighting): choosing such a scenario is not done yet. Starting a
+  cutscene stage this way, out of its order, can meet game code that expects the story to be where that cutscene
+  belongs.
+- `SMO_STAGE_LIST=<stage>[:<scenario>[:<start>]],...` (TEST ONLY) plays several stages one after another in one run, so
+  that a test of many stages boots the game once. The first is the stage the run starts in (the save's, or
+  `SMO_START_STAGE`'s). Each time the input sequence (`SMO_SEQ`) is done, the game changes to the next stage of the list
+  through its own stage change, the one a door makes: at the scene's next `StageSceneNrvPlay` (while it waits, B is
+  pressed every 45 polls: a map, the pause menu or a message the sequence left open would hold it) the runtime has the
+  game make a `ChangeStageInfo` (its own constructor) for the stage, the scenario (default: the game's choice, as for a door)
+  and the start point (the id of a placed start, e.g. a checkpoint flag's `PlayerRestartPos` link; default: the stage's
+  default start), and hands it to `GameDataFunction::tryChangeNextStage`; the scene then ends and the game loads the
+  stage, a kingdom's home stage with its kingdom. A main without symbols gets the two functions from the base
+  executable's (`GAME_FN_*` in `build\<version>\gen\image.h`, see `find_func` in `tools\lifter\gen_tables.py`). When the
+  stage's `StageScene::init` runs, the input sequence starts again: `SMO_SEQ_<n>` for the n-th stage of the list
+  (counted from 1), else `SMO_STAGE_SEQ`, else `SMO_SEQ`. The log marks each stage: `stage list: frame F: stage n of N
+  begins: the game starts <stage>, scenario <s>`, then `stage list: stage n of N done at frame F (poll P): run totals:
+  ...`, the counters of the end-of-run summary so far (frames presented, Vulkan call failures, operations not
+  implemented, imports and stubs, audio dropped and underruns, loading-screen holds, process memory, run time), so a test
+  can take them apart per stage. After the last stage the run ends as with `SMO_SEQ_EXIT=1`. The run's time limit (the
+  exe's second argument) counts from the start of the stage being played. Stay within one kingdom: the game changes
+  kingdom for a home stage only, so another kingdom's sub-area would load with the old kingdom's scenario.
+- `tests\stress_stages.py --save <save folder> [--target 1.4.1] [--scenarios] [--jobs 2] [--speed 4] [--cache <folder>]`
+  starts every stage of the game from a warped copy of the save (a kingdom's home stage directly, any other stage with
+  `SMO_START_STAGE`; with `--scenarios` also every scenario of every kingdom, at its checkpoint flags), plays a few
+  seconds of each at a raised speed and lists what the logs show: host exceptions, the game's aborts, operations not
+  implemented, shader stages not translated, Vulkan failures, unimplemented system calls, freezes, dummy textures,
+  stages that never reach play (`build\<version>\stress\<name>\summary.md`, with four small pictures a run). It also
+  uses two test switches: `SMO_SPEED=<n>` (TEST ONLY) runs the refresh clock n times faster, 60 x n refreshes a second
+  (0 = 960): the game steps once per refresh, so it runs up to n times faster where the PC keeps up, and input sequences,
+  counted in frames, play the same; `SMO_SEQ_EXIT=1` ends the run when its input sequence is done. A game takes about
+  6 GB of memory: two jobs fit a 32 GB PC with other programs open, and `scripts\run.py` makes a job wait while
+  `SMO_MAX_GAMES` test games run on the PC (`BUILDING.md`). About three quarters of a run's frames come before play
+  (the boot to the title menu alone is about half), so short runs spend most of their time starting. `--chain N` plays
+  up to N stages of one kingdom and one kind (stages in the save's scenario; scenarios started at a checkpoint flag;
+  scenarios at their default start) in one run with `SMO_STAGE_LIST`, splits the log per stage
+  (`build\<version>\run\<name>_<stage>.log`, as a run of its own is named) and records each stage as its own run would,
+  its counters from the run's totals after each stage; after a crash or a time limit a new run plays the stages left.
+  `--exe-prefix` names the jobs' exe copies. A stage that only a painting leads to (the Mushroom Kingdom's six boss
+  rematches, the Darker Side's last room; found in the maps: its `MissRestartArea` names the room, whose
+  `PictureStageChange` leads to it) is entered as in play: its run starts in the painting's room and changes to the
+  stage with the painting's `ChangeStageName` and `ChangeStageId`. Started directly (`--direct`, for comparisons), the
+  restart after a miss goes to that room before the kingdom's resource loader has its archives, and they overflow the
+  restart's 512 KB scene resource heap (`nn::diag abort` on FileLoadThread); in play the room is entered first and its
+  archives are already in the kingdom's heap. Restarts the game makes itself are logged (`the game starts <stage>,
+  scenario <n> itself`) and listed per stage (`restarts` in `results.jsonl`).
 
 ## Other switches
 
+- Threads: the game's three console cores run on three processors of the PC, one per physical core, from a slot of six
+  processors the game takes for itself: counted from the top of the process's affinity, the first slot no other
+  running game holds (a named mutex per slot, `Local\smo_console_cores_<k>`; a 32-processor PC has five). A game alone
+  takes slot 0; games started while it runs take the next ones, so games side by side never share these processors
+  (`console cores in processor slot K of N` in the log). `SMO_OS_HOST_CPUS=<hexadecimal mask>` chooses the processors
+  instead (the stress test's `--cpus split`). TEST ONLY, for comparisons: `SMO_OS_PRIO17=0` puts the game's priority 17 back on one level with
+  18 to 27 (by default the model draw buffer update, 17, runs before the archive decompression, 18, as on the console).
 - `SMO_IMPORT_SELFTEST=1` checks the system calls implemented from the list of the game's imports rather than met in
   play (C library, threads and message queues, files, C++ library pieces, `nn::util`, diagnostics and time, the web
   applet, the NFC reader with an amiibo held to it, the amiibo menu's list and picture): run when every handler is

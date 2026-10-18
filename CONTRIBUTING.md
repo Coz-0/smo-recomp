@@ -84,7 +84,12 @@ Say in the pull request which of these you ran:
   (`runtime/nvn_gl.c`):** `tests\check_fast_paths.py` (`PASS`: both equal to the plain code on random input).
 - **Anything that can change game behaviour, rendering or timing:** `tests\run_cap_kingdom.py <new run name>` must
   print `RESULT: PASS`.
+- **Renderer, threading or anything a stage, a kingdom or a scenario the scripted run does not reach could meet:**
+  `tests\stress_stages.py --save <a copy of a save> --scenarios` starts every stage and every scenario of every kingdom
+  (hours, two games side by side; `docs/DEBUGGING.md`), and its `summary.md` should list nothing new.
 - **Input changes:** `scripts\run.py padtest --env SMO_PAD_SELFTEST=1` (every check passes).
+- **Changes to how `scripts\run.py` limits the test games running at once:** `tests\check_game_places.py` (0 failed;
+  starts no game).
 - **Changes to the amiibo menu or the NFC reader:** the `SMO_IMPORT_SELFTEST=1` run above (its `nfp` and `amiibo menu`
   lines), and a scripted run that opens the menu and scans an amiibo (`docs/SCRIPTED_RUNS.md`): the log must show the
   game reading it (`nfp: the game read the amiibo's model information`).
