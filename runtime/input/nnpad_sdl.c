@@ -40,7 +40,7 @@ typedef struct {
 typedef struct {
     int used, ignored;
     SDL_JoystickID id; SDL_Gamepad *gp; SDL_Joystick *js;
-    int slot, wireless, dropped, nbtn, naxes, nhats, gtype, has_accel, has_gyro, virt;
+    int slot, wireless, nbtn, naxes, nhats, gtype, has_accel, has_gyro, virt;
     char guid[40], name[80];
     Uint16 rl, rh; ULONGLONG rsent;
 } Dev;
@@ -628,8 +628,7 @@ int nnpad_present(int player) {
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
-    if (d && d->dropped) { NnPadState s; dev_state(d, &s); if (s.buttons) d->dropped = 0; }
-    r = d && !d->dropped;
+    r = d != NULL;
     unlock();
     return r;
 }
@@ -639,24 +638,9 @@ int nnpad_get(int player, NnPadState *out) {
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
-    if (d && !d->dropped) { dev_state(d, out); r = 1; }
+    if (d) { dev_state(d, out); r = 1; }
     unlock();
     return r;
-}
-void nnpad_disconnect(int player) {
-    Dev *d;
-    lock();
-    if ((d = dev_of(player)) != NULL) { d->dropped = 1; if (d->gp) SDL_RumbleGamepad(d->gp, 0, 0, 0); d->rl = d->rh = 0; }
-    unlock();
-}
-void nnpad_swap(int a, int b) {
-    lock();
-    Dev *x = dev_of(a), *y = dev_of(b);
-    if (x) x->slot = b;
-    if (y) y->slot = a;
-    if (x) apply_player_index(x);
-    if (y) apply_player_index(y);
-    unlock();
 }
 void nnpad_rumble(int player, float low, float high) {
     Dev *d;

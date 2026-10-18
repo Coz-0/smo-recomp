@@ -1,28 +1,20 @@
 /* Included by nnnet.c: nn::nifm leftovers, nn::socket / nnsocket* (bsd + resolver) on
- * Winsock, nn::ssl / nnssl*, nn::nsd::ResolveEx, nn::ldn, nn::ec::ShopServiceAccessor.
+ * Winsock, nn::ssl / nnssl*, nn::nsd::ResolveEx.
  *
  * Sources: [sdk] = Super Smash Bros. Ultimate 13.0.4's SDK module, where ssbu-recomp read these functions (addresses quoted),
  * [suyu] = the suyu emulator's src/core (file named).
- * Console state modelled: no network connection (the nifm network request is never accepted), wireless
- * communication not available (a PC has no local-wireless radio), one local user.
+ * Console state modelled: no network connection (the nifm network request is never accepted), one local user.
  *
  * ------------------------------------------------------------------ nn::nifm
  * [sdk 0x3218f0] detail::GetGeneralServicePointer and [sdk 0x321990] GetNetworkConnectionPointer return 0xca6e
  *     (module 110, description 101) while the library is not initialised (byte .bss 0xcc9910 != 1).
  * [sdk 0x322900] GetCurrentPrimaryIpAddress(in_addr *): null pointer -> abort; IGeneralService command at vtable
  *     +0x70 (GetCurrentIpAddress); 4 bytes copied out on success.
- * [sdk 0x322ae0] GetCurrentIpConfigInfo(ip, mask, gateway, dns1, dns2): any null -> abort; command at +0x88;
- *     the five addresses are bytes 1..12 of the IpAddressSetting and 1..8 of the DnsSetting.
  * [sdk 0x323620] GetCurrentProxySetting(ProxySetting *): GetCurrentNetworkProfile ([sdk 0x322e60], command +0x38),
  *     converted by [sdk 0x324950] (plain copies), then 0xaa bytes at +0xe2 of the converted profile are copied out.
  *     The module's answers are the reference's ([suyu] hle/service/nifm/nifm.cpp) for a host that is not connected:
- *     GetCurrentIpAddress = success, 0.0.0.0; GetCurrentIpConfigInfo = success, all zero; GetCurrentNetworkProfile
- *     = success, a zero profile (so the proxy setting is 0xaa zero bytes: proxy disabled).
- * [sdk 0x322d90] HandleNetworkRequestErrorResult(): false when not initialised; otherwise [sdk 0x324550]
- *     NetworkConnection::HandleNetworkRequestErrorResult -> [sdk 0x31cbc0] RequestClient::PrepareLibraryApplet asks
- *     the request object for the applet to show (IRequest command at +0xc0, GetAppletInfo). [suyu] answers success
- *     with applet id 0 and an empty parameter block; with an empty block the SDK returns 0x1906e (110-200) and the
- *     function gives false. A console shows the system's network-error applet here; that applet is not modelled.
+ *     GetCurrentIpAddress = success, 0.0.0.0; GetCurrentNetworkProfile = success, a zero profile (so the proxy
+ *     setting is 0xaa zero bytes: proxy disabled).
  *
  * ------------------------------------------------------------------ nn::socket (bsd:u) and the resolver (sfdnsres)
  * [sdk] every nn::socket::X is a jump to nn::socket::detail::X and every nnsocketX a jump to nn::socket::X
@@ -31,19 +23,16 @@
  *     initialised, pool null or not page aligned, sizes not page aligned, allocator pool < 0x1000, pool <= allocator
  *     pool, concurrency not 1..14; pool < 0xa0000 -> Result 0x21b (module 27, description 1); else registers with
  *     bsd:u (works without a connection), enables the resolver, 0.
- * [sdk 0x36f980] Finalize: abort when not initialised; the session is closed (the module closes the sockets), 0.
  * [sdk 0x36fa60 / 0x36fac0] errno IS the C library's errno (__errno_location); SetLastErrno does nothing and
  *     GetLastErrno gives 22 while the library is not initialised.
  * [sdk 0x374b80 ...] every bsd call aborts when the library is not initialised; the module returns (value, errno)
  *     and the SDK stores errno when the value is negative. SDK-side argument checks, before the module is asked:
  *       Recv / Send / RecvFrom / SendTo  size 0 -> 0; buffer null -> -1 EINVAL(22); size >= 4 GiB -> -1 EFAULT(14)
  *       RecvFrom with no address / null or zero length -> Recv; SendTo with no address / zero length -> Send
- *       Bind / Connect   address null -> -1 EINVAL  (the SockAddr overload of Bind also for length 0)
+ *       Bind / Connect   address null -> -1 EINVAL
  *       Accept           address null with *length != 0 -> -1 EINVAL
  *       GetSockName / GetPeerName / GetSockOpt   pointer null or *length 0 -> -1 EINVAL;  SetSockOpt value null -> EINVAL
  *       Poll             fds null with count != 0 -> -1 EINVAL; count >= 2^29 -> -1 EFAULT
- *     The typed overloads (Family, Type, Protocol, MsgFlag, Level, Option, SockAddr) pass the same numbers
- *     ([sdk 0x374a40] masks the family to 8 bits).
  * The module: a real socket layer on Winsock, following [suyu] hle/service/sockets/bsd.cpp + internal_network/
  *     network.cpp (128 descriptors from 0, AF_INET only, O_NONBLOCK 0x800 with F_GETFL 3 / F_SETFL 4, MSG_PEEK 2,
  *     MSG_DONTWAIT 0x80, SOL_SOCKET 0xffff with the BSD option numbers, BSD sockaddr_in {len, family, port, addr},
@@ -62,24 +51,21 @@
  * Resolver: [sdk 0x37fb40] GetAddrInfo: not initialised -> 11 (EAI_SYSTEM); node and service null -> 8; result
  *     pointer null -> 11 + errno 22; then the service; on any failure the result pointer is null.
  *     [sdk 0x37ef80] GetHostByName(name, options, count): not initialised -> null + errno 22; name null -> null,
- *     h_errno 1, errno 22. [sdk 0x37e9e0] GAIStrError: "Error string is not available" ([sdk] 0x9e3ef4) when not
- *     initialised, else the text comes from the module. [sdk 0x37e760 / 0x37eb30] ResolverGetOption / SetOption:
+ *     h_errno 1, errno 22. [sdk 0x37e760 / 0x37eb30] ResolverGetOption / SetOption:
  *     the keys 0x11171..0x11176 (type 0x67, size 8) live in the SDK's own table .data 0xc0cd28 (read / written in
  *     the mapped SDK image); 0x11170 / 0x11177 -> EINVAL; key 10001 gives a random cancel handle; anything else is
  *     the module's: Get -> -1 ([suyu] sfdnsres.cpp has no such command), Set -> 0 ([suyu] ResolverSetOptionRequest).
- *     [sdk 0x36cc00 / 0x36c790] result layouts: addrinfo {flags, family, socktype, protocol, addrlen, canonname
- *     @0x18, addr @0x20, next @0x28}; nn::socket::AddrInfo {.., family u8 @4, .., addr @0x18, canonname @0x20, next};
+ *     [sdk 0x36cc00] result layout: addrinfo {flags, family, socktype, protocol, addrlen, canonname @0x18, addr @0x20,
+ *     next @0x28};
  *     [sdk 0x36d890] hostent {name, aliases, addrtype @0x10, length @0x14, addr_list @0x18}.
  *     The module ([suyu] sfdnsres.cpp, "verified on console" tables there): a name that needs DNS cannot be resolved
  *     without a network: EAI_AGAIN (2), h_errno TRY_AGAIN (2), errno 0. A numeric IPv4 address needs no DNS and is
- *     converted (Winsock getaddrinfo with AI_NUMERICHOST, AF_INET). The error texts are the reference's
- *     (sockets_translate.cpp); they are not in sdk.elf. NOT VERIFIED: a console's answer for "localhost".
+ *     converted (Winsock getaddrinfo with AI_NUMERICHOST, AF_INET). NOT VERIFIED: a console's answer for "localhost".
  *     Results are allocated on the host heap, not in the pool given to Initialize.
  *
  * ------------------------------------------------------------------ nn::ssl
  * [sdk 0x386720] Initialize: use count (.bss 0xcd10a8) is incremented on EVERY call; a call that finds it non-zero
- *     returns 0x1927b (module 123, description 201). [sdk 0x3867e0] Finalize: count 0 -> 0xca7b (123-101); count
- *     still > 0 after the decrement -> 0; reaching 0 closes the session -> 0.
+ *     returns 0x1927b (module 123, description 201). Without a session the calls below return 0xca7b (123-101).
  * [sdk 0x3832f0] Context::Create(version): no session -> 0xca7b; the object is 8 bytes: the address of an 8-byte
  *     chunk that holds the service object, with its four 16-bit pieces in reverse order. [sdk 0x3836d0] GetContextId
  *     = those 8 bytes; null out -> 0xe27b (123-113). [sdk 0x3833f0] Destroy: 0xca7b / 0xdc7b (invalid context,
@@ -104,31 +90,7 @@
  * [sdk 0x3287a0 -> 0x3290f0] ResolveEx(Fqdn *out, const Fqdn &in): the nsd service command at +0x58; only the
  *     command's own Result is returned. [suyu] hle/service/sockets/nsd.cpp: the name is returned unchanged (0x100
  *     bytes), success. NOT VERIFIED: the real module substitutes the environment identifier in names that contain '%'.
- *
- * ------------------------------------------------------------------ nn::ldn
- * [sdk 0x2bc7c0] Initialize: creates the user service and calls its Initialize (vtable +0x100); only on success the
- *     service is stored in .bss 0xcae718 / 0xcae720. [sdk 0x2bcda0] GetState: 0 while no service is stored. Every
- *     other function loads the service pointer and calls through it without a check ([sdk 0x2bcfb0] etc.).
- * Platform fact modelled: this machine has NO local-wireless radio; that is a console whose wireless communication
- *     is switched off. [suyu] hle/service/ldn/user_local_communication_service.cpp Initialize: no usable interface
- *     -> ResultAirplaneModeEnabled (module 203, description 23) = 0x2ecb. So Initialize fails with 0x2ecb, GetState
- *     stays 0 (None), and the game ([game] 0x7103704504) puts the Result in an ErrorResultVariant and does not go on;
- *     it calls Finalize / SetWirelessControllerRestriction only when GetState() != 0 ([game] 0x7103703800,
- *     0x71016a60c4). Any other nn::ldn call after a failed Initialize dereferences a null service pointer on a
- *     console: those handlers stop with that message. (The alternative, "wireless on, nobody around", would need the
- *     real module's NetworkInfo contents for CreateNetwork, which the reference invents: not established.)
- *
- * ------------------------------------------------------------------ nn::ec::ShopServiceAccessor
- * [sdk 0x18e690] InitializeForShopServiceAccessors(buffer, size): builds the proxy and opens the nim:eca session
- *     ([suyu] hle/service/nim/nim.cpp: succeeds) -> 0. [sdk 0x193030] Finalize...: finalizes the accessors still
- *     registered -> 0. [sdk 0x18d740] ShopServiceAccessor(): {this, this} @0, service @0x10 = null, recursive mutex
- *     @0x18, list head {&, &} @0x38. [sdk 0x18d870] Initialize(service): CreateAccessorInterface ([suyu]: succeeds),
- *     service -> @0x10, linked into the proxy's list -> 0. [sdk 0x18d7d0] Finalize, [sdk 0x18d780] destructor.
- * [sdk 0x18da10] Request(): FIRST checks nn::nifm::IsAnyInternetRequestAccepted(GetClientId()); false -> 0x70a4
- *     (module 164, description 56) and nothing else happens. No request is ever accepted here.
- * [sdk 0x18e080 -> 0x18df20] AsyncResponse::GetSize: nothing attached (pointer @0x18 null) -> 0x190a4 (164-200),
- *     *out untouched. [sdk 0x18de10] ~AsyncResponse: Detach ([sdk 0x18de50]: unlink from the accessor @0x10), and
- *     the event @0x20 destroyed when the flag @0x48 is set. */
+ */
 
 #define RETI(v) (c->x[0] = (uint64_t)(int64_t)(v))
 #define M8(a) (*(uint8_t *)(uintptr_t)(a))
@@ -159,20 +121,9 @@ static void nifm_GetCurrentPrimaryIpAddress(Ctx *c) {
     M32(A0) = 0;
     RET(0);
 }
-static void nifm_GetCurrentIpConfigInfo(Ctx *c) {
-    for (int i = 0; i < 5; i++)
-        if (!c->x[i]) guest_trap("nn::nifm::GetCurrentIpConfigInfo: null pointer ([sdk 0x322bec] abort)", c->x[30] - 4);
-    if (!g_nifm_init) { RET(NIFM_NOT_INITIALIZED); return; }
-    for (int i = 0; i < 5; i++) M32(c->x[i]) = 0;
-    RET(0);
-}
 static void nifm_GetCurrentProxySetting(Ctx *c) {
     if (!g_nifm_init) { RET(NIFM_NOT_INITIALIZED); return; }
     memset((void *)(uintptr_t)A0, 0, 0xaa);
-    RET(0);
-}
-static void nifm_HandleNetworkRequestErrorResult(Ctx *c) {
-    if (g_nifm_init) trace_printf("     nn::nifm::HandleNetworkRequestErrorResult: no error applet to show (not modelled) -> false\n");
     RET(0);
 }
 
@@ -307,12 +258,6 @@ static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t
     g_so_init = 1;
     RET(0);
 }
-static void socket_Finalize(Ctx *c) {
-    so_need_init(c, "nn::socket::Finalize");
-    for (int i = 0; i < SO_MAX_FD; i++) so_remove(i);
-    g_so_init = 0;
-    RET(0);
-}
 static void socket_GetLastErrno2(Ctx *c) { if (!g_so_init) RETI(22); else RETI(*so_errno_ptr(c)); }
 static void socket_SetLastErrno2(Ctx *c) { int e = (int)A0; so_set_errno(c, e); }
 
@@ -352,7 +297,6 @@ static void so_bind(Ctx *c, int len_check) {              /* (fd, const sockaddr
     if (e) so_fail(c, e); else RETI(0);
 }
 static void socket_Bind(Ctx *c) { so_bind(c, 0); }
-static void socket_BindSockAddr(Ctx *c) { so_bind(c, 1); }
 static void socket_Connect(Ctx *c) {                      /* (fd, const sockaddr *, len) */
     so_need_init(c, "nn::socket::Connect");
     if (!A1) { so_fail(c, 22); return; }
@@ -610,11 +554,6 @@ static const char *const g_gai_text[] = {
     "No address associated with hostname", "hostname nor servname provided, or not known", "servname not supported for ai_socktype",
     "ai_socktype not supported", "System error returned in errno", "Invalid value for hints", "Resolved protocol is unknown",
     "Argument buffer overflow"};
-static void socket_GAIStrError2(Ctx *c) {
-    uint32_t e = (uint32_t)A0;
-    if (!so_resolver_enabled()) { RET(P("Error string is not available")); return; }
-    RET(P(e < sizeof g_gai_text / sizeof g_gai_text[0] ? g_gai_text[e] : "Unknown error"));
-}
 static int so_gai_from_host(int w) {
     switch (w) {
     case 0: return 0;
@@ -673,7 +612,6 @@ static void so_getaddrinfo(Ctx *c, int nn_layout) {
     RETI(0);
 }
 static void socket_GetAddrInfo2(Ctx *c) { so_getaddrinfo(c, 0); }
-static void socket_GetAddrInfoNn(Ctx *c) { so_getaddrinfo(c, 1); }
 static void so_freeaddrinfo(Ctx *c, int nn_layout) {
     uint64_t ai = A0;
     while (ai) {
@@ -685,7 +623,6 @@ static void so_freeaddrinfo(Ctx *c, int nn_layout) {
     (void)nn_layout;
 }
 static void socket_FreeAddrInfo2(Ctx *c) { so_freeaddrinfo(c, 0); }
-static void socket_FreeAddrInfoNn(Ctx *c) { so_freeaddrinfo(c, 1); }
 static void socket_GetHostByNameWithOptions(Ctx *c) {     /* (const char *name, const ResolverOption *, size_t count) -> hostent * */
     static __declspec(thread) struct { uint64_t name, aliases; int32_t type, length; uint64_t list; uint64_t alias0; uint64_t addrs[2]; uint32_t addr; char text[64]; } t_he;
     const char *name = (const char *)(uintptr_t)A0;
@@ -750,13 +687,6 @@ static void nnssl_Initialize(Ctx *c) {
     g_ssl_count++;
     if (!first || g_ssl_session) { RET(0x1927bu); return; }
     g_ssl_session = 1;
-    RET(0);
-}
-static void nnssl_Finalize(Ctx *c) {
-    if (g_ssl_count == 0) { RET(SSL_NOT_INIT); return; }
-    if (--g_ssl_count != 0) { RET(0); return; }
-    if (!g_ssl_session) { RET(SSL_NOT_INIT); return; }
-    g_ssl_session = 0;
     RET(0);
 }
 static void ssl_Context_Create(Ctx *c) {                  /* (this, SslVersion) */
@@ -926,139 +856,33 @@ static void nsd_ResolveEx(Ctx *c) {                       /* (Fqdn *out, const F
     RET(0);
 }
 
-/* ================================================================== nn::ldn */
-#define LDN_WIRELESS_OFF 0x2ecbu
-static void ldn_Initialize(Ctx *c) { RET(LDN_WIRELESS_OFF); }
-static void ldn_GetState(Ctx *c) { RET(0); }
-static void ldn_no_service(Ctx *c) {
-    printf("\nnn::ldn function called although nn::ldn::Initialize failed (no local-wireless radio: Result 0x2ecb).\n"
-           "The SDK dereferences its null service pointer here; a console crashes at this point.\n");
-    guest_trap("nn::ldn call without a service (Initialize failed)", c->x[30] - 4);
-}
-
-/* ================================================================== nn::ec::ShopServiceAccessor */
-static uint64_t g_ec_list[2];                             /* the proxy's list of accessors ([sdk] proxy + 0x70) */
-static int g_ec_ready;
-static uint8_t g_ec_service_token[16];
-static void ec_os(Ctx *c, const char *name, uint64_t x0) { uint64_t k1 = c->x[1], k2 = c->x[2]; sock_call(c, name, x0); c->x[1] = k1; c->x[2] = k2; }
-static void ec_unlink(uint64_t node, uint64_t head) {     /* [sdk 0x192b74] / [sdk 0x18ded0] */
-    uint64_t next = M64(node + 8);
-    if (next == node || head == node) return;
-    uint64_t prev = M64(node), nn = M64(next);
-    (void)nn;
-    M64(prev + 8) = next;
-    M64(next) = M64(node);
-    M64(node + 8) = node;
-    M64(node) = node;
-}
-static void ec_InitializeForAccessors(Ctx *c) {
-    if (!g_ec_list[0]) { g_ec_list[0] = P(g_ec_list); g_ec_list[1] = P(g_ec_list); }
-    g_ec_ready = 1;
-    RET(0);
-}
-static void ec_Accessor_ctor(Ctx *c) {
-    uint64_t self = A0;
-    M64(self) = self; M64(self + 8) = self; M64(self + 0x10) = 0;
-    c->x[1] = 1; c->x[2] = 0;
-    sock_call(c, "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi", self + 0x18);
-    M64(self + 0x38) = self + 0x38; M64(self + 0x40) = self + 0x38;
-    RET(self);
-}
-static void ec_response_detach(Ctx *c, uint64_t r) {      /* [sdk 0x18de50]; no service is ever attached (@0x18 stays null) */
-    uint64_t acc = M64(r + 0x10);
-    if (M64(r + 0x18)) guest_trap("nn::ec AsyncResponse: a request is attached, which the runtime never does", c->x[30] - 4);
-    if (acc) {
-        ec_os(c, "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", acc + 0x18);
-        ec_unlink(r, acc + 0x38);
-        ec_os(c, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", acc + 0x18);
-    }
-    M64(r + 0x10) = 0;
-}
-static uint32_t ec_accessor_finalize(Ctx *c, uint64_t self) {
-    ec_os(c, "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", self + 0x18);
-    if (M64(self + 0x10)) {
-        while (M64(self + 0x40) != self + 0x38) ec_response_detach(c, M64(self + 0x40));
-        M64(self + 0x10) = 0;
-        ec_os(c, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", self + 0x18);
-        ec_unlink(self, P(g_ec_list));
-    } else ec_os(c, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", self + 0x18);
-    return 0;
-}
-static void ec_FinalizeForAccessors(Ctx *c) {
-    if (g_ec_ready) {
-        while (g_ec_list[1] != P(g_ec_list)) ec_accessor_finalize(c, g_ec_list[1]);
-        g_ec_ready = 0;
-    }
-    RET(0);
-}
-static void ec_Accessor_dtor(Ctx *c) {
-    uint64_t self = A0;
-    ec_accessor_finalize(c, self);
-    sock_call(c, "_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE", self + 0x18);
-    RET(self);
-}
-static void ec_Accessor_Initialize(Ctx *c) {              /* (this, const ShopService &) */
-    uint64_t self = A0;
-    if (!g_ec_ready) {
-        printf("\nnn::ec::ShopServiceAccessor::Initialize before nn::ec::InitializeForShopServiceAccessors: the SDK has no proxy (null pointer) here.\n");
-        guest_trap("nn::ec::ShopServiceAccessor::Initialize without the proxy", c->x[30] - 4);
-    }
-    ec_os(c, "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", self + 0x18);
-    M64(self + 0x10) = P(g_ec_service_token);
-    ec_os(c, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", self + 0x18);
-    {                                                     /* [sdk 0x192b14] Proxy::Attach */
-        uint64_t head = P(g_ec_list), x8 = M64(self), x9 = M64(head);
-        M64(self) = x9;
-        M64(x8 + 8) = head;
-        x9 = M64(head);
-        M64(x9 + 8) = self;
-        M64(head) = x8;
-    }
-    RET(0);
-}
-static void ec_Accessor_Request(Ctx *c) { RET(0x70a4u); } /* IsAnyInternetRequestAccepted is false */
-static void ec_AsyncResponse_dtor(Ctx *c) {
-    uint64_t self = A0;
-    ec_response_detach(c, self);
-    if (M8(self + 0x48)) sock_call(c, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE", self + 0x20);
-    RET(self);
-}
-static void ec_AsyncResponse_GetSize2(Ctx *c) {           /* (this, size_t *out): nothing attached */
-    if (M64(A0 + 0x18)) guest_trap("nn::ec AsyncResponse::GetSize: a request is attached, which the runtime never does", c->x[30] - 4);
-    RET(EC_NO_RESPONSE);
-}
-
 /* ================================================================== registration */
 #define SOK(n) "_ZN2nn6socket" n
-#define LDNK(n) "_ZN2nn3ldn" n
 static void sock_register(void) {
     static const ImportDef defs[] = {
         {"_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", nifm_GetCurrentPrimaryIpAddress},
-        {"_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", nifm_GetCurrentIpConfigInfo},
         {"_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", nifm_GetCurrentProxySetting},
-        {"_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", nifm_HandleNetworkRequestErrorResult},
-        {SOK("10InitializeEPvmmi"), socket_Initialize}, {SOK("8FinalizeEv"), socket_Finalize},
+        {SOK("10InitializeEPvmmi"), socket_Initialize},
         {SOK("12GetLastErrnoEv"), socket_GetLastErrno2}, {"nnsocketGetLastErrno", socket_GetLastErrno2}, {"nnsocketSetLastErrno", socket_SetLastErrno2},
-        {SOK("6SocketEiii"), socket_Socket}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), socket_Socket}, {"nnsocketSocket", socket_Socket},
+        {SOK("6SocketEiii"), socket_Socket}, {"nnsocketSocket", socket_Socket},
         {SOK("5CloseEi"), socket_Close}, {"nnsocketClose", socket_Close},
-        {SOK("4BindEiPK8sockaddrj"), socket_Bind}, {SOK("4BindEiPKNS0_8SockAddrEj"), socket_BindSockAddr}, {"nnsocketBind", socket_Bind},
+        {SOK("4BindEiPK8sockaddrj"), socket_Bind}, {"nnsocketBind", socket_Bind},
         {SOK("7ConnectEiPK8sockaddrj"), socket_Connect}, {"nnsocketConnect", socket_Connect},
         {SOK("6ListenEii"), socket_Listen}, {SOK("8ShutdownEii"), socket_Shutdown}, {SOK("6AcceptEiP8sockaddrPj"), socket_Accept},
         {SOK("11GetSockNameEiP8sockaddrPj"), socket_GetSockName}, {"nnsocketGetSockName", socket_GetSockName}, {"nnsocketGetPeerName", socket_GetPeerName},
         {SOK("4RecvEiPvmi"), socket_Recv}, {"nnsocketRecv", socket_Recv},
-        {SOK("8RecvFromEiPvmiP8sockaddrPj"), socket_RecvFrom}, {SOK("8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj"), socket_RecvFrom},
+        {SOK("8RecvFromEiPvmiP8sockaddrPj"), socket_RecvFrom},
         {SOK("4SendEiPKvmi"), socket_Send}, {"nnsocketSend", socket_Send},
-        {SOK("6SendToEiPKvmiPK8sockaddrj"), socket_SendTo}, {SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), socket_SendTo},
+        {SOK("6SendToEiPKvmiPK8sockaddrj"), socket_SendTo},
         {SOK("5FcntlEiiz"), socket_Fcntl}, {"nnsocketFcntl", socket_Fcntl},
         {SOK("4PollEP6pollfdmi"), socket_Poll}, {"nnsocketPoll", socket_Poll},
         {SOK("10GetSockOptEiiiPvPj"), socket_GetSockOpt}, {"nnsocketGetSockOpt", socket_GetSockOpt},
-        {SOK("10SetSockOptEiiiPKvj"), socket_SetSockOpt}, {SOK("10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj"), socket_SetSockOpt}, {"nnsocketSetSockOpt", socket_SetSockOpt},
-        {SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), socket_GetAddrInfo2}, {SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"), socket_GetAddrInfoNn},
-        {SOK("12FreeAddrInfoEP8addrinfo"), socket_FreeAddrInfo2}, {SOK("12FreeAddrInfoEPNS0_8AddrInfoE"), socket_FreeAddrInfoNn},
-        {SOK("11GAIStrErrorENS0_7AiErrnoE"), socket_GAIStrError2},
+        {SOK("10SetSockOptEiiiPKvj"), socket_SetSockOpt}, {"nnsocketSetSockOpt", socket_SetSockOpt},
+        {SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), socket_GetAddrInfo2},
+        {SOK("12FreeAddrInfoEP8addrinfo"), socket_FreeAddrInfo2},
         {"nnsocketGetHostByNameWithOptions", socket_GetHostByNameWithOptions},
         {"nnsocketResolverGetOption", nnsocket_ResolverGetOption}, {"nnsocketResolverSetOption", nnsocket_ResolverSetOption},
-        {"nnsslInitialize", nnssl_Initialize}, {"nnsslFinalize", nnssl_Finalize},
+        {"nnsslInitialize", nnssl_Initialize},
         {"_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", ssl_Context_Create},
         {"_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", ssl_Context_ImportServerPki},
         {"nnsslContextDestroy", nnssl_ContextDestroy}, {"nnsslContextGetContextId", nnssl_ContextGetContextId},
@@ -1071,28 +895,6 @@ static void sock_register(void) {
         {"nnsslConnectionPending", nnssl_ConnectionPending}, {"nnsslConnectionGetVerifyCertError", nnssl_ConnectionGetVerifyCertError},
         {"nnsslConnectionGetConnectionId", nnssl_ConnectionGetConnectionId},
         {"_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", nsd_ResolveEx},
-        {LDNK("10InitializeEv"), ldn_Initialize}, {LDNK("8GetStateEv"), ldn_GetState},
-        {LDNK("8FinalizeEv"), ldn_no_service}, {LDNK("22AttachStateChangeEventEPNS_2os15SystemEventTypeE"), ldn_no_service},
-        {LDNK("32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE"), ldn_no_service},
-        {LDNK("11OpenStationEv"), ldn_no_service}, {LDNK("12CloseStationEv"), ldn_no_service}, {LDNK("15OpenAccessPointEv"), ldn_no_service},
-        {LDNK("16CloseAccessPointEv"), ldn_no_service}, {LDNK("10DisconnectEv"), ldn_no_service}, {LDNK("14DestroyNetworkEv"), ldn_no_service},
-        {LDNK("14GetNetworkInfoEPNS0_11NetworkInfoE"), ldn_no_service}, {LDNK("16GetNetworkConfigEPNS0_13NetworkConfigE"), ldn_no_service},
-        {LDNK("14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE"), ldn_no_service},
-        {LDNK("20GetSecurityParameterEPNS0_17SecurityParameterE"), ldn_no_service}, {LDNK("16SetAdvertiseDataEPKvm"), ldn_no_service},
-        {LDNK("22SetStationAcceptPolicyENS0_12AcceptPolicyE"), ldn_no_service}, {LDNK("6RejectENS0_11Ipv4AddressE"), ldn_no_service},
-        {LDNK("4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_no_service},
-        {LDNK("11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_no_service},
-        {LDNK("13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE"), ldn_no_service},
-        {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_no_service},
-        {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_no_service},
-        {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_no_service},
-        {LDNK("19GetDisconnectReasonEv"), ldn_no_service},
-        {"_ZN2nn2ec33InitializeForShopServiceAccessorsEPvm", ec_InitializeForAccessors}, {"_ZN2nn2ec31FinalizeForShopServiceAccessorsEv", ec_FinalizeForAccessors},
-        {"_ZN2nn2ec19ShopServiceAccessorC1Ev", ec_Accessor_ctor}, {"_ZN2nn2ec19ShopServiceAccessorD1Ev", ec_Accessor_dtor},
-        {"_ZN2nn2ec19ShopServiceAccessor10InitializeERKNS0_11ShopServiceE", ec_Accessor_Initialize},
-        {"_ZN2nn2ec19ShopServiceAccessor7RequestEPNS1_13AsyncResponseERKNS_7account3UidENS0_11ShopService6MethodEPKcRKNS1_8PostDataENS_8TimeSpanE", ec_Accessor_Request},
-        {"_ZN2nn2ec19ShopServiceAccessor13AsyncResponseD1Ev", ec_AsyncResponse_dtor},
-        {"_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7GetSizeEPm", ec_AsyncResponse_GetSize2},
     };
     int n = (int)(sizeof defs / sizeof defs[0]);
     for (int i = 0; i < n; i++)
@@ -1127,25 +929,22 @@ static int sock_selftest(Ctx *c) {
     g_nifm_init = 0;
     ok = H("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", P(ip)) == 0xca6e && ip[0] == 0xeeeeeeee;
     ok = ok && H("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", P(proxy)) == 0xca6e;
-    ok = ok && H("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", 0) == 0;
     SOCK_CHECK("nifm: before Initialize 0xca6e (110-101), nothing written");
     ok = H("_ZN2nn4nifm10InitializeEv", 0) == 0 && g_nifm_init == 1;
     ok = ok && H("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", P(ip)) == 0 && ip[0] == 0;
-    ok = ok && H("_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", P(ip), P(ip + 1), P(ip + 2), P(ip + 3), P(ip + 4)) == 0 && !ip[1] && !ip[2] && !ip[3] && !ip[4];
     memset(proxy, 0xee, sizeof proxy);
     ok = ok && H("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", P(proxy)) == 0 && proxy[0] == 0 && proxy[0xa9] == 0 && proxy[0xaa] == 0xee;
-    ok = ok && H("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", 0) == 0;
-    SOCK_CHECK("nifm: no connection: address 0.0.0.0, config zero, proxy setting 0xaa zero bytes, error result not handled");
+    SOCK_CHECK("nifm: no connection: address 0.0.0.0, proxy setting 0xaa zero bytes");
     g_nifm_init = was;
     /* ---- sockets */
     uint8_t *pool = VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     uint8_t sa[16], sb[16], buf[64];
     uint32_t len;
-    ok = (int)H(SOK("12GetLastErrnoEv"), 0) == 22 && !strcmp((const char *)(uintptr_t)H(SOK("11GAIStrErrorENS0_7AiErrnoE"), 2), "Error string is not available");
+    ok = (int)H(SOK("12GetLastErrnoEv"), 0) == 22;
     uint64_t list = 0x1234;
     ok = ok && (int)H(SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), P("127.0.0.1"), 0, 0, P(&list)) == 11 && list == 0x1234;
     ok = ok && H("nnsocketGetHostByNameWithOptions", P("127.0.0.1"), 0, 0) == 0;
-    SOCK_CHECK("socket: before Initialize: GetLastErrno 22, GAIStrError \"not available\", GetAddrInfo 11, GetHostByName null");
+    SOCK_CHECK("socket: before Initialize: GetLastErrno 22, GetAddrInfo 11, GetHostByName null");
     ok = H(SOK("10InitializeEPvmmi"), P(pool), 0x90000, 0x20000, 4) == 0x21b && !g_so_init;
     ok = ok && H(SOK("10InitializeEPvmmi"), P(pool), 0x100000, 0x20000, 4) == 0 && g_so_init;
     SOCK_CHECK("socket: Initialize: pool below 0xa0000 -> 0x21b, then success");
@@ -1161,7 +960,6 @@ static int sock_selftest(Ctx *c) {
     sock_sa(sa, 10, 1, 2, 3, 4000);
     ok = ok && (int)H(SOK("4BindEiPK8sockaddrj"), u2, P(sa), 16) == -1 && sock_errno(c) == 99;
     ok = ok && (int)H(SOK("4BindEiPK8sockaddrj"), u2, 0, 16) == -1 && sock_errno(c) == 22;
-    ok = ok && (int)H(SOK("4BindEiPKNS0_8SockAddrEj"), u2, P(sa), 0) == -1 && sock_errno(c) == 22;
     len = 0;
     ok = ok && (int)H("nnsocketGetSockName", u1, P(sb), P(&len)) == -1 && sock_errno(c) == 22;
     SOCK_CHECK("socket: Bind 127.0.0.1:0 + GetSockName (port assigned); Bind 10.1.2.3 -> EADDRNOTAVAIL; null / zero length -> EINVAL");
@@ -1180,13 +978,12 @@ static int sock_selftest(Ctx *c) {
     SOCK_CHECK("socket: UDP loopback SendTo -> Poll (POLLIN; negative fd ignored; unknown fd POLLNVAL) -> RecvFrom with the sender's address");
     sock_sa(sa, 93, 184, 216, 34, 80);
     ok = (int64_t)H(SOK("6SendToEiPKvmiPK8sockaddrj"), u2, P("ping"), 4, 0, P(sa), 16) == -1 && sock_errno(c) == 101;
-    ok = ok && (int64_t)H(SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), u2, P("ping"), 0, 0, P(sa), 16) == 0;
     ok = ok && (int64_t)H(SOK("4SendEiPKvmi"), u2, 0, 4, 0) == -1 && sock_errno(c) == 22;
     ok = ok && (int64_t)H("nnsocketRecv", u2, P(buf), 0x100000000ull, 0) == -1 && sock_errno(c) == 14;
-    int t0 = (int)H(SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), 2, 1, 6);
+    int t0 = (int)H(SOK("6SocketEiii"), 2, 1, 6);
     ok = ok && t0 >= 0 && (int)H(SOK("7ConnectEiPK8sockaddrj"), t0, P(sa), 16) == -1 && sock_errno(c) == 101;
     ok = ok && (int)H("nnsocketConnect", t0, 0, 16) == -1 && sock_errno(c) == 22;
-    SOCK_CHECK("socket: no network: SendTo / Connect to 93.184.216.34 -> ENETUNREACH (101); size 0 -> 0; null buffer EINVAL; 4 GiB EFAULT");
+    SOCK_CHECK("socket: no network: SendTo / Connect to 93.184.216.34 -> ENETUNREACH (101); null buffer EINVAL; 4 GiB EFAULT");
     int ls = (int)H(SOK("6SocketEiii"), 2, 1, 0), one = 1, v = -1;
     sock_sa(sa, 0, 0, 0, 0, 0);
     ok = ls >= 0 && (int)H(SOK("10SetSockOptEiiiPKvj"), ls, 0xffff, 4, P(&one), 4) == 0;
@@ -1209,7 +1006,7 @@ static int sock_selftest(Ctx *c) {
     ok = ok && (int)H(SOK("10GetSockOptEiiiPvPj"), t0, 0xffff, 0x1007, P(&v), P(&len)) == 0 && v == 0 && len == 4;
     len = 4;
     ok = ok && (int)H("nnsocketGetSockOpt", t0, 0xffff, 0x1008, P(&v), P(&len)) == 0 && v == 1;
-    ok = ok && (int)H(SOK("10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj"), t0, 0xffff, 8, 0, 4) == -1 && sock_errno(c) == 22;
+    ok = ok && (int)H(SOK("10SetSockOptEiiiPKvj"), t0, 0xffff, 8, 0, 4) == -1 && sock_errno(c) == 22;
     ok = ok && (int)H(SOK("8ShutdownEii"), t0, 1) == 0 && (int64_t)H(SOK("4RecvEiPvmi"), as, P(buf), sizeof buf, 0) == 0;
     ok = ok && (int)H(SOK("5CloseEi"), as) == 0 && (int)H(SOK("5CloseEi"), as) == -1 && sock_errno(c) == 9;
     SOCK_CHECK("socket: TCP over loopback: SO_REUSEADDR, Bind 0.0.0.0 (reported as such), Listen, Connect, Accept, Send / Recv, MSG_DONTWAIT,\n"
@@ -1226,18 +1023,13 @@ static int sock_selftest(Ctx *c) {
         ok = M32(list + 4) == 2 && M32(list + 8) == 1 && M32(list + 0x10) == 16 && M8(a + 1) == 2 && M8(a + 2) == 0x1f && M8(a + 3) == 0x90 && M8(a + 4) == 127 && M8(a + 7) == 1 && M64(list + 0x28) == 0;
         H(SOK("12FreeAddrInfoEP8addrinfo"), list);
     }
-    list = 0;
-    ok = ok && (int)H(SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"), P("10.0.0.7"), 0, 0, P(&list)) == 0 && list && M8(list + 4) == 2 && M8(M64(list + 0x18) + 4) == 10 && M8(M64(list + 0x18) + 7) == 7;
-    if (list) H(SOK("12FreeAddrInfoEPNS0_8AddrInfoE"), list);
     SOCK_CHECK("resolver: GetAddrInfo: no arguments 8, null result 11 + EINVAL, a DNS name without network EAI_AGAIN (2) / TRY_AGAIN,\n"
-              "          numeric 127.0.0.1:8080 and 10.0.0.7 converted (both result layouts)");
+              "          numeric 127.0.0.1:8080 converted");
     uint64_t he = H("nnsocketGetHostByNameWithOptions", P("192.168.0.9"), 0, 0);
     ok = he && !strcmp((const char *)(uintptr_t)M64(he), "192.168.0.9") && M32(he + 0x10) == 2 && M32(he + 0x14) == 4 && M8(M64(M64(he + 0x18))) == 192 && M8(M64(M64(he + 0x18)) + 3) == 9 && M64(M64(he + 0x18) + 8) == 0;
     ok = ok && H("nnsocketGetHostByNameWithOptions", P("www.example.com"), 0, 0) == 0 && t_so_herrno == 2;
     ok = ok && H("nnsocketGetHostByNameWithOptions", 0, 0, 0) == 0 && t_so_herrno == 1 && sock_errno(c) == 22;
-    ok = ok && !strcmp((const char *)(uintptr_t)H(SOK("11GAIStrErrorENS0_7AiErrnoE"), 2), "Temporary failure in name resolution");
-    ok = ok && !strcmp((const char *)(uintptr_t)H(SOK("11GAIStrErrorENS0_7AiErrnoE"), 99), "Unknown error");
-    SOCK_CHECK("resolver: GetHostByName numeric / DNS name (TRY_AGAIN) / null (HOST_NOT_FOUND + EINVAL); GAIStrError texts");
+    SOCK_CHECK("resolver: GetHostByName numeric / DNS name (TRY_AGAIN) / null (HOST_NOT_FOUND + EINVAL)");
     uint64_t opt[4] = {0, 0, 0, 0}, saved;
     ok = (int)H("nnsocketResolverGetOption", 0, 0x11171) == -1 && sock_errno(c) == 22;
     ok = ok && (int)H("nnsocketResolverGetOption", P(opt), 0x11171) == 0 && (uint32_t)opt[0] == 0x11171 && (uint32_t)(opt[0] >> 32) == 0x67 && opt[1] == 8 && opt[2] == 0x200;
@@ -1255,11 +1047,10 @@ static int sock_selftest(Ctx *c) {
     uint64_t sctx[2] = {0, 0xeeeeeeeeeeeeeeeeull}, id = 0, sconn[8];
     int pend = 77;
     uint32_t cs = 9, cn = 9;
-    while (g_ssl_count) H("nnsslFinalize", 0);
-    ok = H("nnsslFinalize", 0) == 0xca7b && H("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", P(sctx), 1) == 0xca7b;
+    ok = H("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", P(sctx), 1) == 0xca7b;
     ok = ok && H("nnsslConnectionCreate", P(sconn), P(sctx)) == 0xca7b && (int32_t)sconn[2] == -1;
-    ok = ok && H("nnsslInitialize", 0) == 0 && H("nnsslInitialize", 0) == 0x1927b && H("nnsslFinalize", 0) == 0;
-    SOCK_CHECK("ssl: Finalize / Context::Create before Initialize 0xca7b; second Initialize 0x1927b and one Finalize takes it back");
+    ok = ok && H("nnsslInitialize", 0) == 0 && H("nnsslInitialize", 0) == 0x1927b;
+    SOCK_CHECK("ssl: Context::Create before Initialize 0xca7b; second Initialize 0x1927b");
     ok = H("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", P(sctx), 1) == 0 && sctx[0] && sctx[1] == 0xeeeeeeeeeeeeeeeeull && ssl_scramble(ssl_scramble(sctx[0])) == sctx[0];
     ok = ok && H("nnsslContextGetContextId", P(sctx), P(&id)) == 0 && id == sctx[0] && H("nnsslContextGetContextId", P(sctx), 0) == 0xe27b && H("nnsslContextGetContextId", 0, P(&id)) == 0xe27b;
     id = 5;
@@ -1284,13 +1075,9 @@ static int sock_selftest(Ctx *c) {
     ok = ok && H("nnsslConnectionSetSocketDescriptor", P(sconn), u1) == 0 && (int32_t)sconn[2] == -1 && H("nnsslConnectionSetIoMode", P(sconn), 1) == 0;
     ok = ok && H("nnsslConnectionDestroy", P(sconn)) == 0 && sconn[0] == 0 && H("nnsslConnectionDestroy", P(sconn)) == 0xda7b && H("nnsslConnectionRead", 0, 0, 0, 0) == 0xe27b;
     ok = ok && H("nnsslContextDestroy", P(sctx)) == 0 && sctx[0] == 0 && H("nnsslContextDestroy", P(sctx)) == 0xdc7b && H("nnsslContextDestroy", 0) == 0xe27b;
-    ok = ok && H("nnsslFinalize", 0) == 0 && H("nnsslFinalize", 0) == 0xca7b;
     ok = ok && (int)H(SOK("5FcntlEiiz"), u1, 3, 0) >= 0;  /* the application's own descriptor survives the connection */
     SOCK_CHECK("ssl: connection: create / ids / setters; no socket: SetIoMode + DoHandshake 0xce7b; Pending 0; argument checks 0xe27b, 0xe07b;\n"
               "          unknown descriptor 0xd47b; descriptor duplicated and released; Destroy twice 0xda7b; context with a connection 0xd67b");
-    /* ---- sockets: Finalize closes everything */
-    ok = H(SOK("8FinalizeEv"), 0) == 0 && !g_so_init && !g_so_fd[u1].o && !g_so_fd[ls].o && (int)H(SOK("12GetLastErrnoEv"), 0) == 22;
-    SOCK_CHECK("socket: Finalize closes the descriptors; GetLastErrno is 22 again");
     VirtualFree(pool, 0, MEM_RELEASE);
     /* ---- nsd */
     char fq[0x110], fin[0x100];
@@ -1298,29 +1085,6 @@ static int sock_selftest(Ctx *c) {
     strcpy(fin, "api.example.srv.nintendo.net");
     ok = H("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", P(fq), P(fin)) == 0 && !strcmp(fq, fin) && fq[0xff] == 0 && fq[0x100] == 0x7e;
     SOCK_CHECK("nsd: ResolveEx returns the name unchanged in a 0x100-byte Fqdn");
-    /* ---- ldn */
-    ok = H(LDNK("10InitializeEv"), 0) == 0x2ecb && H(LDNK("8GetStateEv"), 0) == 0;
-    SOCK_CHECK("ldn: Initialize 0x2ecb (203-23, wireless communication not available), state None");
-    /* ---- ec */
-    uint64_t acc[16], acc2[16], resp[16], size = 123;
-    memset(acc, 0xee, sizeof acc); memset(acc2, 0xee, sizeof acc2); memset(resp, 0xee, sizeof resp);
-    ok = H("_ZN2nn2ec33InitializeForShopServiceAccessorsEPvm", P(buf), 0x1000) == 0;
-    H("_ZN2nn2ec19ShopServiceAccessorC1Ev", P(acc)); H("_ZN2nn2ec19ShopServiceAccessorC1Ev", P(acc2));
-    ok = ok && acc[0] == P(acc) && acc[1] == P(acc) && acc[2] == 0 && acc[7] == P(acc + 7) && acc[8] == P(acc + 7) && acc[9] == 0xeeeeeeeeeeeeeeeeull;
-    uint32_t service = 0;
-    ok = ok && H("_ZN2nn2ec19ShopServiceAccessor10InitializeERKNS0_11ShopServiceE", P(acc), P(&service)) == 0 && acc[2] != 0;
-    ok = ok && H("_ZN2nn2ec19ShopServiceAccessor10InitializeERKNS0_11ShopServiceE", P(acc2), P(&service)) == 0;
-    ok = ok && g_ec_list[0] == P(acc2) && g_ec_list[1] == P(acc) && acc[0] == P(g_ec_list) && acc[1] == P(acc2) && acc2[0] == P(acc) && acc2[1] == P(g_ec_list);
-    H("_ZN2nn2ec19ShopServiceAccessor13AsyncResponseC1Ev", P(resp));
-    ok = ok && H("_ZN2nn2ec19ShopServiceAccessor7RequestEPNS1_13AsyncResponseERKNS_7account3UidENS0_11ShopService6MethodEPKcRKNS1_8PostDataENS_8TimeSpanE", P(acc), P(resp), P(buf), 0, P("/v1/x"), P(buf), 1000) == 0x70a4;
-    ok = ok && resp[3] == 0 && H("_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7GetSizeEPm", P(resp), P(&size)) == 0x190a4 && size == 123;
-    H("_ZN2nn2ec19ShopServiceAccessor13AsyncResponseD1Ev", P(resp));
-    H("_ZN2nn2ec19ShopServiceAccessorD1Ev", P(acc));
-    ok = ok && acc[2] == 0 && acc[0] == P(acc) && g_ec_list[0] == P(acc2) && g_ec_list[1] == P(acc2);
-    ok = ok && H("_ZN2nn2ec31FinalizeForShopServiceAccessorsEv", 0) == 0 && acc2[2] == 0 && g_ec_list[0] == P(g_ec_list) && g_ec_list[1] == P(g_ec_list);
-    H("_ZN2nn2ec19ShopServiceAccessorD1Ev", P(acc2));
-    SOCK_CHECK("ec: accessor constructor layout, Initialize links it into the proxy list, Request 0x70a4 (no accepted network request),\n"
-              "          GetSize 0x190a4 without writing, destructors and FinalizeForShopServiceAccessors unlink");
-    printf("  network (nifm, sockets, ssl, nsd, ldn, ec accessor): %d cases, %d failed\n", cases, bad);
+    printf("  network (nifm, sockets, ssl, nsd): %d cases, %d failed\n", cases, bad);
     return bad;
 }

@@ -103,27 +103,6 @@ static void os_AllocateMemoryBlock(Ctx *c) {
     }
 }
 
-static void os_FreeMemoryBlock(Ctx *c) {
-    uint64_t addr = c->x[0], size = c->x[1];
-    if (!g_heap || addr < (uint64_t)(uintptr_t)g_heap || (addr - (uint64_t)(uintptr_t)g_heap) % UNIT || size % UNIT)
-        guest_trap("nn::os::FreeMemoryBlock: not a block of the memory heap", c->x[30] - 4);
-    uint64_t g = (addr - (uint64_t)(uintptr_t)g_heap) / UNIT;
-    AcquireSRWLockExclusive(&g_heap_lock);
-    memset(g_used + g, 0, (size_t)(size / UNIT));
-    ReleaseSRWLockExclusive(&g_heap_lock);
-}
-
-static void oe_EnableGamePlayRecording(Ctx *c) { (void)c; }          /* see the file header: no video capture */
-
-/* ---- nn::settings: operator==(const LanguageCode&, const LanguageCode&) [doc]: LanguageCode is 8 chars, compared as
- * a string (the same comparison nnmisc.c makes for the Language / LanguageCode forms). */
-static void settings_CodeEqualsCode(Ctx *c) {
-    char a[9] = {0}, b[9] = {0};
-    memcpy(a, (const void *)(uintptr_t)c->x[0], 8);
-    memcpy(b, (const void *)(uintptr_t)c->x[1], 8);
-    c->x[0] = strcmp(a, b) == 0;
-}
-
 /* ---- nn::diag / nn::os: debugger, user exception handler, abort observers.
  *   IsDebuggerAttached()       [doc] false: no debugger is attached to the program (true of a retail run).
  *   SetUserExceptionHandler(handler, stack, size, info)  [doc] the kernel calls the handler on a CPU exception. The runtime
@@ -216,20 +195,6 @@ void smo_heap_report(FILE *out) {
             (unsigned long long)g_heap_size, g_alloc_calls, g_alloc_fail, (unsigned long long)g_peak);
 }
 
-/* ---- nn::oe::GetDisplayVersion(DisplayVersion *out {char[16]}): the application's display version, which the console
- * takes from the title's control data (NACP +0x3060, 16 bytes). Read from the control.nacp extract.py wrote from the
- * user's dump (..\dump\update\control.nacp, relative to the run folder build\bin; SMO_NACP overrides); "" when it cannot
- * be read. */
-static void oe_GetDisplayVersion(Ctx *c) {
-    char v[16] = {0};
-    const char *path = getenv("SMO_NACP") ? getenv("SMO_NACP") : "..\\dump\\update\\control.nacp";
-    FILE *f = fopen(path, "rb");
-    if (f) { if (fseek(f, 0x3060, SEEK_SET) != 0 || fread(v, 1, 16, f) != 16) memset(v, 0, sizeof v); fclose(f); }
-    v[15] = 0;
-    static int said;
-    if (!said++) printf("nn::oe::GetDisplayVersion: \"%s\" (from %s%s)\n", v, path, f ? "" : ": NOT READ");
-    memcpy((void *)(uintptr_t)c->x[0], v, 16);
-}
 /* ---- nn::diag, the forms SMO imports that had no handler (a call returned 0 and the game went on) [doc]:
  *   AbortImpl(condition, function, file, line, const Result *, format, ...)  the program stops with that message.
  *   OnAssertionFailure(type, condition, function, file, line)  an SDK assertion failed: the program stops.
@@ -365,7 +330,6 @@ static void oe_IsUserInactivityDetectionTimeExtended(Ctx *c) { c->x[0] = (uint64
  * anything else as an error. This console has no network, so: 0x17c6e (it used to answer 0 and the game went on to its
  * account check as if connected). SetLocalNetworkMode(bool): local communication only; nothing to set. */
 static void nifm_HandleNetworkRequestResult(Ctx *c) { c->x[0] = 0x17c6e; }
-static void nifm_SetLocalNetworkMode(Ctx *c) { (void)c; }
 
 /* ---- Labo VR, as the game drives it ([game] 0x7b4c80: pl::BeginVrMode, and only when it succeeds
  * BeginBlockingHomeButton + DisableRecording; 0x7b4cc0: EndVrMode, EndBlockingHomeButton, EnableRecording):
@@ -392,7 +356,6 @@ static void pctl_SetStereoVisionRestriction(Ctx *c) { InterlockedExchange(&g_ste
 
 static const ImportDef smo_imports[] = {
     {"_ZN2nn4nifm26HandleNetworkRequestResultEv", nifm_HandleNetworkRequestResult},
-    {"_ZN2nn4nifm19SetLocalNetworkModeEb", nifm_SetLocalNetworkMode},
     {"_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z", diag_AbortImpl_result},
     {"_ZN2nn4diag6detail18OnAssertionFailureENS0_13AssertionTypeEPKcS4_S4_i", diag_OnAssertionFailure},
     {"_ZN2nn4diag6detail7LogImplERKNS0_11LogMetaDataEPKcz", diag_LogImpl},
@@ -405,12 +368,8 @@ static const ImportDef smo_imports[] = {
     {"_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE", oe_SetScreenShotImageOrientation},
     {"_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", oe_SetUserInactivityDetectionTimeExtended},
     {"_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv", oe_IsUserInactivityDetectionTimeExtended},
-    {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", oe_GetDisplayVersion},
     {"_ZN2nn2os17SetMemoryHeapSizeEm", os_SetMemoryHeapSize},
     {"_ZN2nn2os19AllocateMemoryBlockEPmm", os_AllocateMemoryBlock},
-    {"_ZN2nn2os15FreeMemoryBlockEmm", os_FreeMemoryBlock},
-    {"_ZN2nn2oe23EnableGamePlayRecordingEPvm", oe_EnableGamePlayRecording},
-    {"_ZN2nn8settingseqERKNS0_12LanguageCodeES3_", settings_CodeEqualsCode},
     {"_ZN2nn4diag18IsDebuggerAttachedEv", diag_IsDebuggerAttached}, {"_ZN2nn4diag6detail11NotNullImplEm", diag_NotNullImpl},
     {"_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_", os_SetUserExceptionHandler},
     {"_ZN2nn4diag29InitializeAbortObserverHolderEPNS0_19AbortObserverHolderEPFvRKNS0_9AbortInfoEE", diag_InitializeAbortObserverHolder},

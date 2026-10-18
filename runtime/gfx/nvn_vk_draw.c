@@ -2315,9 +2315,9 @@ static void vk_write_texels(void *arg) {
     WriteJob *j = arg;
     if (V.alive && j->tex && !j->tex->dead) write_region(j->tex, j->has_view ? &j->view : NULL, j->region, j->data, j->row_stride, 0);
 }
-/* CopyTextureToBuffer, ReadTexels, the movie maker's present: a region of one level to host memory, as the
+/* CopyTextureToBuffer, ReadTexels: a region of one level to host memory, as the
  * OpenGL path's glGetTextureSubImage (tight rows, or the given row / image strides). Synchronous: the command buffer is
- * submitted and waited for (these calls are rare: album, replays, screenshots). Returns the bytes written, 0 when it stopped. */
+ * submitted and waited for (these calls are rare: replays, screenshots). Returns the bytes written, 0 when it stopped. */
 static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64_t row_stride, int64_t image_stride) {
     VTex *vt = vt_get(t);
     if (vt->decode || vt->expand || vt->samples > 1) { nvn_vk_missing("ReadTexels / CopyTextureToBuffer of an ASTC-decoded, 3-component or multisample texture"); return 0; }
@@ -2419,22 +2419,6 @@ static void vk_read_texels(void *arg) {
     if (j->to_pool) { vk_invalidate_texels(j); return; }
     cb_sync();
     read_region(j->tex, j->has_view ? &j->view : NULL, j->region, j->out, j->row_stride, j->image_stride);
-}
-int album_movie_push_frame(const uint8_t *rgba, int w, int h, int stride, int bottom_up);      /* nnalbum.c, as nvn_gl.c job_present_movie */
-static void vk_present_movie(void *arg) {
-    PresentJob *j = arg;
-    Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
-    if (!V.alive || !t || t->dead || t->b.width <= 0 || t->b.height <= 0) return;
-    VTex *vt = vt_get(t);
-    int w = vt->rs ? t->b.width : vt->w, h = vt->rs ? t->b.height : vt->h, r[6] = {0, 0, 0, w, h, 1}, bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;      /* read_region takes the game's rectangle */
-    if (vt->bpb != 4 || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { nvn_vk_missing("nvnQueuePresentTexture to the movie maker's window with a window texture that is not 8-bit RGBA"); return; }
-    uint8_t *px = malloc((size_t)w * h * 4);
-    if (!px) return;
-    if (read_region(t, NULL, r, px, 0, 0)) {
-        if (bgr) for (size_t i = 0; i < (size_t)w * h; i++) { uint8_t b = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = b; }
-        album_movie_push_frame(px, w, h, w * 4, 0);
-    }
-    free(px);
 }
 static LONG64 g_blit_same;                         /* copies within one texture (blit_tex) */
 static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *dv, const int *dr, int linear) {
@@ -3119,7 +3103,7 @@ static void overlay_draw(uint32_t index) {
 /* the console's Capture button (F12 in the game window; a pad's share / capture button: display.c and
  * nnpad_sdl.c call smo_capture_request). The frame being presented is read back like a SMO_SHOT picture, made 8-bit
  * opaque RGBA, and handed to nnalbum.c, which turns it as the game asked (nn::oe::SetScreenShotImageOrientation: snapshot
- * mode with the camera turned) and saves it in the album folder beside the game's own screenshots. */
+ * mode with the camera turned) and saves it in the album folder. */
 static volatile LONG g_capture_req;
 void smo_capture_request(void) { InterlockedExchange(&g_capture_req, 1); }
 int album_save_capture(const uint8_t *rgba, int w, int h, char *out_path, size_t out_cap);       /* nnalbum.c */
@@ -3436,7 +3420,7 @@ swap: ;
     }
     R.frame_draws = R.frame_skipped = R.frame_clears = 0;
 }
-const RBackend rb_vk = {"vk", vk_submit, vk_submit_async, vk_present, vk_present_movie, vk_fence, vk_sync_wait, vk_server_wait, vk_sync_drop, vk_flush, vk_finish, vk_write_texels, vk_read_texels, vk_housekeeping,
+const RBackend rb_vk = {"vk", vk_submit, vk_submit_async, vk_present, vk_fence, vk_sync_wait, vk_server_wait, vk_sync_drop, vk_flush, vk_finish, vk_write_texels, vk_read_texels, vk_housekeeping,
                         vk_reset_status, vk_no_grid, vk_idle, vk_menu};
 
 /* ---------------------------------------------------------------- start and end */

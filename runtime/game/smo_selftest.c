@@ -50,18 +50,7 @@ static void test_libc(Ctx *c) {
     call(c, "modf"); check("libc", "modf(3.75) = 0.75, 3", c->v[0].df[0] == 0.75 && ip == 3.0);
     c->v[0].df[0] = -2.5; c->x[0] = P(&ip);
     call(c, "modf"); check("libc", "modf(-2.5) = -0.5, -2", c->v[0].df[0] == -0.5 && ip == -2.0);
-    static const char num[] = "3.25e2xyz", hex[] = "0x1p3";
-    uint64_t end = 0;
-    args(c, P(num), P(&end), 0, 0);
-    call(c, "strtod"); check("libc", "strtod(\"3.25e2xyz\") = 325, end at xyz", c->v[0].df[0] == 325.0 && end == P(num + 6));
-    args(c, P(hex), 0, 0, 0);
-    call(c, "strtod"); check("libc", "strtod(\"0x1p3\") = 8", c->v[0].df[0] == 8.0);
-    args(c, (uint64_t)(uint32_t)-7, 0, 0, 0);
-    call(c, "abs"); check("libc", "abs(-7) = 7", (uint32_t)c->x[0] == 7);
-    static const uint32_t w[] = {'a', 'b', 0x1F600, 0};
-    args(c, P(w), 0, 0, 0);
-    call(c, "wcslen"); check("libc", "wcslen of 3 four-byte characters = 3", c->x[0] == 3);
-    printf("  libc (ldexpf, modf, strtod, abs, wcslen): %s\n", g_bad == before ? "ok" : "FAILED");
+    printf("  libc (ldexpf, modf): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
 static void test_os(Ctx *c) {
@@ -80,20 +69,16 @@ static void test_os(Ctx *c) {
     args(c, P(ev2), 0, 0, 0); call(c, "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE"); check("os", "auto-clear TryWaitEvent = true once", c->x[0] == 1);
     args(c, P(ev2), 0, 0, 0); call(c, "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE"); check("os", "auto-clear: then false", c->x[0] == 0);
     args(c, P(mq), P(mqbuf), 4, 0); call(c, "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm");
-    args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE"); check("os", "TryPeekMessageQueue of an empty queue = false", c->x[0] == 0);
     args(c, P(mq), 42, 0, 0); call(c, "_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm");
     args(c, P(mq), 43, 0, 0); call(c, "_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm");
-    out = 0; args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE"); check("os", "TryPeekMessageQueue = true, the oldest (42)", c->x[0] == 1 && out == 42);
-    out = 0; args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os16PeekMessageQueueEPmPKNS0_16MessageQueueTypeE"); check("os", "PeekMessageQueue leaves it in the queue (42 again)", out == 42);
-    out = 0; args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE"); check("os", "then received: 42", c->x[0] == 1 && out == 42);
-    out = 0; args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE"); check("os", "next peek: 43", c->x[0] == 1 && out == 43);
+    out = 0; args(c, P(&out), P(mq), 0, 0); call(c, "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE"); check("os", "TryReceiveMessageQueue: the oldest (42)", c->x[0] == 1 && out == 42);
     static const char name[] = "SelfTestThread";
     args(c, P(th), P(name), 0, 0); call(c, "_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc");
     args(c, P(th), 0, 0, 0); call(c, "_ZN2nn2os20GetThreadNamePointerEPKNS0_10ThreadTypeE"); check("os", "GetThreadNamePointer = the name set", c->x[0] == P(name));
     static uint8_t th2[0x200];
     args(c, P(th2), 0, 0, 0); call(c, "_ZN2nn2os20GetThreadNamePointerEPKNS0_10ThreadTypeE");
     check("os", "an unnamed thread is Thread_0x<address>", c->x[0] && !strncmp((const char *)(uintptr_t)c->x[0], "Thread_0x", 9));
-    printf("  nn::os (TryWaitEvent, Peek / TryPeekMessageQueue, GetThreadNamePointer): %s\n", g_bad == before ? "ok" : "FAILED");
+    printf("  nn::os (TryWaitEvent, TryReceiveMessageQueue, GetThreadNamePointer): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
 static void test_fs(Ctx *c) {
@@ -127,15 +112,10 @@ static void test_fs(Ctx *c) {
 
 static void test_cxx(Ctx *c) {
     int before = g_bad;
-    static uint8_t s1[24], obj[64];
-    /* a short string only: a long one takes its buffer from the game's allocator, which does not exist before the game
-     * starts (the long form goes through the same s_init as the string functions the game already uses) */
-    args(c, P(s1), 5, 'z', 0); call(c, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc");
-    check("libc++", "__init(5, 'z'): short string \"zzzzz\"", s1[0] == 10 && !memcmp(s1 + 1, "zzzzz", 5) && s1[6] == 0);
-    args(c, P(s1), 0, 0, 0); call(c, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev");
+    static uint8_t obj[64];
     args(c, P(obj), 0, 0, 0); call(c, "_ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEED2Ev");
     check("libc++", "basic_iostream destructor returns", c->x[0] == P(obj));
-    printf("  libc++ (basic_string __init / D1, basic_iostream destructors): %s\n", g_bad == before ? "ok" : "FAILED");
+    printf("  libc++ (basic_iostream destructor): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
 static void test_util(Ctx *c) {
@@ -339,14 +319,8 @@ static void test_sdk7(Ctx *c) {
     call(c, "_ZN2nn4pctl26GetStereoVisionRestrictionEv"); check("pctl", "SetStereoVisionRestriction(true) is kept", (c->x[0] & 1) == 1);
     args(c, 0, 0, 0, 0); call(c, "_ZN2nn4pctl26SetStereoVisionRestrictionEb");
     call(c, "_ZN2nn4pctl26GetStereoVisionRestrictionEv"); check("pctl", "and false again", (c->x[0] & 1) == 0);
-    uint8_t alloc[0x40] = {0};
-    args(c, P(alloc), 0x100000, 0x200000, 1);
-    call(c, "_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
-    args(c, P(alloc), 0, 0, 0);
-    call(c, "_ZNK2nn3mem17StandardAllocator16GetTotalFreeSizeEv");
-    check("mem", "StandardAllocator::Initialize(addr, size, cache) then GetTotalFreeSize = size", c->x[0] == 0x200000);
-    printf("  hid, bcat, friends, pctl, mem (IsVibrationDeviceMounted, DeliveryCacheFile::Open(path), Profile::GetAccountId, stereo vision, "
-           "StandardAllocator::Initialize with cache): %s\n", g_bad == before ? "ok" : "FAILED");
+    printf("  hid, bcat, friends, pctl (IsVibrationDeviceMounted, DeliveryCacheFile::Open(path), Profile::GetAccountId, stereo vision): %s\n",
+           g_bad == before ? "ok" : "FAILED");
 }
 
 int smo_import_selftest(void) {

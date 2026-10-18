@@ -1,8 +1,9 @@
 /* movie:: (the SDK's video player library): the placeholder used with SMO_MOVIE=0 (nnmovie_mf.c plays the movies).
  *
- * Extractor and Decoder are C++ objects the game drives through their virtual tables. Here they get
- * a table whose every entry reports failure, so the game's movie player gives up on the film instead
- * of jumping through an uninitialised pointer: the movies are skipped.
+ * The Decoder is a C++ object the game drives through its virtual table. Here it gets a table whose every entry
+ * reports failure, so the game's movie player gives up on the film instead of jumping through an uninitialised
+ * pointer: the movies are skipped. The Extractor constructor the game imports (the form with a cache size) has no
+ * placeholder: with SMO_MOVIE=0 it is an import without a handler.
  * Every virtual call is logged once with its slot number. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +17,7 @@
 #define SLOTS 64
 #define STATUS_FAILED 0x4000u                     /* the code the game itself uses when it cannot create the player */
 
-static uint64_t g_extractor_vtable[SLOTS], g_decoder_vtable[SLOTS];
+static uint64_t g_decoder_vtable[SLOTS];
 static char g_names[2][SLOTS][40];
 static unsigned char g_seen[2][SLOTS];
 
@@ -45,13 +46,6 @@ static void build(int kind, const char *what, uint64_t *table) {
     }
 }
 
-static void extractor_ctor(Ctx *c) {
-    if (!g_extractor_vtable[0]) build(0, "Extractor", g_extractor_vtable);
-    printf("movie: Extractor created (container type %u)\n", (unsigned)c->x[1]);
-    wr64(A0, (uint64_t)(uintptr_t)g_extractor_vtable);
-    wr64(A0 + 8, 0);
-}
-
 static void decoder_ctor(Ctx *c) {
     if (!g_decoder_vtable[0]) build(1, "Decoder", g_decoder_vtable);
     printf("movie: Decoder created (type %u)\n", (unsigned)c->x[1]);
@@ -62,10 +56,9 @@ static void nothing(Ctx *c) { (void)c; }
 static void ret0(Ctx *c) { RET(0); }
 
 static const ImportDef movie_imports[] = {
-    {"_ZN5movie9ExtractorC1ENS_13ContainerTypeE", extractor_ctor},
     {"_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", decoder_ctor},
     {"_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", nothing}, {"_ZN5movie11SetCoreMaskEm", nothing},
-    {"_ZN5movie17SetThreadPriorityEi", nothing}, {"_ZN5movie17GetThreadPriorityEv", ret0},
+    {"_ZN5movie17GetThreadPriorityEv", ret0},
 };
 
 void register_movie_imports(void) {

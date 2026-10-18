@@ -61,25 +61,6 @@ static void os_TryLock(Ctx *c) { RET(1); }
 static int g_errno;
 static void c_errno_location(Ctx *c) { RET(&g_errno); }
 
-/* ---- nn::err::ErrorResultVariant: remembers the last nn::Result assigned to it */
-static void err_Variant_ctor(Ctx *c) { memset(P(0), 0, 0x10); }
-static void err_Variant_assign(Ctx *c) { wr32(A0, rd32(A1)); }      /* returns *this in x0 */
-
-/* ---- nn::ldn */
-static void ldn_MakeIpv4Address(Ctx *c) { RET(((A0 & 0xff) << 24) | ((A1 & 0xff) << 16) | ((A2 & 0xff) << 8) | (A3 & 0xff)); }
-
-/* ---- nn::os: virtual memory, used by the game's own allocator (jemalloc) */
-void cxxrt_guest_region(uint64_t base, uint64_t size); void cxxrt_mem_changed(void);      /* nncxxrt.c */
-static void os_AllocateAddressRegion(Ctx *c) {
-    void *p = VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);      /* write watch: nvn_gl.c asks the OS which texture pages were written */
-    if (p) cxxrt_guest_region((uint64_t)(uintptr_t)p, A1);      /* nncxxrt.c: readable checks inside this region are remembered */
-    wr64(A0, (uint64_t)p);
-    RET(p ? 0 : 0x1015);                                 /* any non-zero nn::Result means failure */
-}
-static void os_AllocateMemoryPages(Ctx *c) { RET(VirtualAlloc(P(0), (SIZE_T)A1, MEM_COMMIT, PAGE_READWRITE) ? 0 : 0x1015); }
-static void os_FreeMemoryPages(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), (SIZE_T)A1, MEM_DECOMMIT); cxxrt_mem_changed(); RET(0); }
-static void os_FreeAddressRegion(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(); RET(0); }
-
 /* ---- more libc */
 static void c_strtol(Ctx *c) {
     char *end = NULL;
@@ -87,44 +68,23 @@ static void c_strtol(Ctx *c) {
     if (A1) wr64(A1, (uint64_t)end);
     RET(v);
 }
-static void c_write(Ctx *c) {
-    if (A0 == 1 || A0 == 2) fwrite(P(1), 1, (size_t)A2, stdout);
-    RET(A2);
-}
-static void c_ffsl(Ctx *c) { RET(A0 ? (uint64_t)__builtin_ctzll(A0) + 1 : 0); }
 
 /* ---- nn::os: current thread (one guest thread for now) */
 static uint8_t g_main_thread[0x400];
 static void os_GetCurrentThread(Ctx *c) { RET(g_main_thread); }
-static void c_gettimeofday(Ctx *c) {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    uint64_t us = ((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10) - 11644473600000000ULL;
-    if (A0) { wr64(A0, us / 1000000); wr64(A0 + 8, us % 1000000); }
-    RET(0);
-}
 
 /* ---- nn::oe: operating environment. Fixed answers: docked, Italian. */
-static uint8_t g_notification_event[0x40];
 /* 0 handheld, 1 console (docked). console_mode = handheld in config\graphics.ini (gfx_options.c) answers 0. */
 static void oe_GetOperationMode(Ctx *c) {
     static int mode = -1;
     if (mode < 0) { mode = gfx_options()->handheld ? 0 : 1; printf("nn::oe::GetOperationMode: %s (graphics.ini console_mode), first asked from %llx\n", mode ? "docked" : "handheld", (unsigned long long)c->x[30]); }
     RET(mode);
 }
-static void oe_GetNotificationMessageEvent(Ctx *c) { RET(g_notification_event); }
 static void oe_GetDesiredLanguage(Ctx *c) { RET(0x7469); }           /* LanguageCode "it" */
 static void settings_LanguageEquals(Ctx *c) { RET(rd32(A1) == 4); }   /* nn::settings::Language_Italian */
 
 /* ---- nn::fs: nothing is mounted yet; calls succeed so start-up can go on */
 static void fs_QueryMountRomCacheSize(Ctx *c) { wr64(A0, 0x10000); RET(0); }
-
-/* ---- nu (NintendoWare utility) allocation hooks. These only observe: the game allocates
- * with its own memalign (f_710392dc40) right before VirtualAllocHook and frees with its own
- * free (f_710392e590) right after VirtualFreeHook, so the hooks must not touch the block. */
-static void nu_VirtualAllocHook(Ctx *c) { RET(1); }
-static void nu_VirtualFreeHook(Ctx *c) { RET(1); }
-static void c_wmemcpy(Ctx *c) { memcpy(P(0), P(1), (size_t)A2 * 4); }
 
 /* True when a printf format has a floating-point conversion (looks only at conversion
  * specifiers, so letters in literal text such as "uTexture%d" are ignored). */
@@ -150,7 +110,6 @@ static int format_has_float(const char *fmt) {
  * (the file address when 0) to each 8-byte pointer: structCount groups of offsetCount pointers,
  * skipping padding*8 bytes between groups. */
 static void util_BinaryFileHeader_GetAlignment(Ctx *c) { RET(1u << rd8(A0 + 0xe)); }
-static void util_BinaryFileHeader_GetFileSize(Ctx *c) { RET(rd32(A0 + 0x1c)); }
 static void util_BinaryFileHeader_IsRelocated(Ctx *c) { RET(rd16(A0 + 0x14) & 1); }
 static void util_BinaryFileHeader_GetFirstBlock(Ctx *c) { uint32_t off = rd16(A0 + 0x16); RET(off ? A0 + off : 0); }
 static void util_BinaryFileHeader_GetRelocationTable(Ctx *c) { uint32_t off = rd32(A0 + 0x18); RET(off ? A0 + off : 0); }
@@ -234,39 +193,6 @@ static void lmem_AllocateFromFrameHeap(Ctx *c) {         /* (HeapHead *, size_t 
 }
 static void lmem_DestroyFrameHeap(Ctx *c) { (void)c; }
 
-/* ---- nn::mem::NumberLineAllocator: hands out integer ids from registered ranges (the game uses
- * it for texture/sampler descriptor slots). The game owns bytes +0x40.. of the object; the SDK
- * part (+0..+0x3f) holds a host pointer to a bitmap and the covered range. */
-typedef struct { uint8_t *bits; int32_t begin, end; } NumberLine;
-static NumberLine *numberline(uint64_t self) { return (NumberLine *)(uintptr_t)self; }
-static void nla_Initialize(Ctx *c) { NumberLine *n = numberline(A0); n->bits = NULL; n->begin = n->end = 0; }
-static void nla_AddRange(Ctx *c) {                        /* (this, int begin, int end): ids in [begin, end) */
-    NumberLine *n = numberline(A0);
-    int32_t b = (int32_t)A1, e = (int32_t)A2;
-    if (e <= b) return;
-    if (!n->bits) { n->begin = b; n->end = e; n->bits = calloc((size_t)(e - b + 7) / 8, 1); return; }
-    int32_t nb = b < n->begin ? b : n->begin, ne = e > n->end ? e : n->end;
-    uint8_t *bits = calloc((size_t)(ne - nb + 7) / 8, 1);
-    for (int32_t i = n->begin; i < n->end; i++)
-        if (n->bits[(i - n->begin) / 8] & (1 << ((i - n->begin) % 8))) bits[(i - nb) / 8] |= (uint8_t)(1 << ((i - nb) % 8));
-    free(n->bits);
-    n->bits = bits; n->begin = nb; n->end = ne;
-}
-static void nla_Allocate(Ctx *c) {                        /* (this, int *outId) -> bool */
-    NumberLine *n = numberline(A0);
-    for (int32_t i = n->begin; n->bits && i < n->end; i++) {
-        uint8_t *byte = &n->bits[(i - n->begin) / 8];
-        uint8_t mask = (uint8_t)(1 << ((i - n->begin) % 8));
-        if (!(*byte & mask)) { *byte |= mask; wr32(A1, (uint32_t)i); RET(1); return; }
-    }
-    RET(0);
-}
-static void nla_Free(Ctx *c) {                            /* (this, int id) */
-    NumberLine *n = numberline(A0);
-    int32_t i = (int32_t)A1;
-    if (n->bits && i >= n->begin && i < n->end) n->bits[(i - n->begin) / 8] &= (uint8_t)~(1 << ((i - n->begin) % 8));
-}
-
 /* ---- nn::Result helpers: value 0 is success; module = low 9 bits, description = next 13. */
 static void result_IsFailure(Ctx *c) { RET((uint32_t)A0 != 0); }
 static void result_IsSuccess(Ctx *c) { RET((uint32_t)A0 == 0); }
@@ -286,10 +212,7 @@ static void result_GetDescription(Ctx *c) { RET(((uint32_t)A0 >> 9) & 0x1fff); }
  * [sdk] 0xc2110 RequestSyncDeliveryCache(progress): aborts when the storage is mounted; when
  *   nn::nifm::IsAnyInternetRequestAccepted(GetClientId()) is false it returns 0x107a (module 122, description 8)
  *   WITHOUT asking the bcat module. No network request is ever accepted here (nifm: no network).
- * [sdk] 0xc2260 the form with a directory name: a name of 32 or more characters, or one that
- *   DirectoryName::IsValid [0xc1be0] refuses (1..31 characters of A-Z a-z 0-9 _ -), gives 0x27a (description 1)
- *   before the mounted / network checks. */
-#define BCAT_INVALID_ARGUMENT 0x27au
+ * [sdk] 0xc1be0 DirectoryName::IsValid: 1..31 characters of A-Z a-z 0-9 _ - (nnonline.inc opens directories). */
 #define BCAT_ALREADY_MOUNTED 0x87au
 #define BCAT_INTERNET_REQUEST_NOT_ACCEPTED 0x107au
 volatile LONG g_bcat_mounted;                             /* also read by nnonline.inc (DeliveryCacheDirectory / File Open) */
@@ -322,11 +245,6 @@ static uint32_t bcat_sync_common(Ctx *c) {
     return BCAT_INTERNET_REQUEST_NOT_ACCEPTED;
 }
 static void bcat_RequestSync(Ctx *c) { RET(bcat_sync_common(c)); }               /* (DeliveryCacheProgress *) */
-static void bcat_RequestSyncDir(Ctx *c) {                                         /* (DeliveryCacheProgress *, const char *name) */
-    const char *name = (const char *)(uintptr_t)A1;
-    if (strnlen(name, 32) >= 32 || !bcat_dirname_valid(name)) { RET(BCAT_INVALID_ARGUMENT); return; }
-    RET(bcat_sync_common(c));
-}
 int bcat_selftest(Ctx *c) {
     static const struct { const char *name; int valid; } t[] = {
         {"", 0}, {"a", 1}, {"spirits_event-01", 1}, {"with space", 0}, {"dot.name", 0},
@@ -341,8 +259,6 @@ int bcat_selftest(Ctx *c) {
         int ok2 = 1;
         uint64_t lr = c->x[30];
         bcat_RequestSync(c); ok2 &= (uint32_t)c->x[0] == BCAT_INTERNET_REQUEST_NOT_ACCEPTED;
-        c->x[1] = (uint64_t)(uintptr_t)"bad name"; bcat_RequestSyncDir(c); ok2 &= (uint32_t)c->x[0] == BCAT_INVALID_ARGUMENT;
-        c->x[1] = (uint64_t)(uintptr_t)"good_name"; bcat_RequestSyncDir(c); ok2 &= (uint32_t)c->x[0] == BCAT_INTERNET_REQUEST_NOT_ACCEPTED;
         bcat_Mount(c); ok2 &= (uint32_t)c->x[0] == 0;
         bcat_Mount(c); ok2 &= (uint32_t)c->x[0] == BCAT_ALREADY_MOUNTED;
         c->x[0] = (uint64_t)(uintptr_t)&count; c->x[1] = 0; c->x[2] = 100; bcat_Enumerate(c); ok2 &= (uint32_t)c->x[0] == 0 && count == 0;
@@ -350,27 +266,13 @@ int bcat_selftest(Ctx *c) {
         bcat_Mount(c); ok2 &= (uint32_t)c->x[0] == 0;
         bcat_Unmount(c);
         c->x[30] = lr;
-        printf("  bcat: sync refused 0x107a / 0x27a, mount, second mount 0x87a, 0 directories, unmount, mount again: %s\n", ok2 ? "ok" : "FAILED");
+        printf("  bcat: sync refused 0x107a, mount, second mount 0x87a, 0 directories, unmount, mount again: %s\n", ok2 ? "ok" : "FAILED");
         ok &= ok2;
     }
     return !ok;
 }
 static void bcat_DirectoryRead(Ctx *c) { if (A1) wr32(A1, 0); RET(0); }      /* (this, int *outCount, entries, max) */
 static void bcat_unavailable(Ctx *c) { RET(RESULT_UNAVAILABLE); }
-
-/* ---- nn::friends: no friends, no network */
-/* [sdk 0x1d9ed0] GetFriendList(int *outCount, Friend *out, const Uid &, offset, max, filter): detail::CheckUserStatus(uid)
- * [0x1e0350] first, its Result returned with the count untouched; then ONE request to the friend service (IFriendService slot
- * +0x38), a failure returned with the count untouched, success writes the count. The service (not in the dump) answers
- * success with 0 friends (suyu friend/friend.cpp GetFriendList, command 10101). */
-uint32_t fr_check_user(Ctx *c, uint64_t uid);               /* nnnet.c */
-static void friends_GetFriendList(Ctx *c) {
-    uint64_t out_count = A0;
-    uint32_t r = fr_check_user(c, A2);
-    if (r) { RET(r); return; }
-    wr32(out_count, 0);
-    RET(0);
-}
 
 /* ---- nn::mem::StandardAllocator: backed by the host heap. The region the game hands to
  * Initialize is left untouched; its size is only remembered for GetTotalFreeSize. */
@@ -380,32 +282,6 @@ static void stdalloc_Allocate(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1,
 static void stdalloc_AllocateAligned(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1, A2 < 16 ? 16 : (size_t)A2)); }
 static void stdalloc_Free(Ctx *c) { _aligned_free((void *)(uintptr_t)A1); }
 static void stdalloc_Reallocate(Ctx *c) { RET(_aligned_realloc((void *)(uintptr_t)A1, A2 ? (size_t)A2 : 1, 16)); }
-static void stdalloc_GetTotalFreeSize(Ctx *c) { RET(g_std_alloc_size); }
-
-/* ---- nn::mii::detail layout helpers.
- * BufferAllocator { void *current; size_t remaining; }: the game reads `current` directly
- * (first field) between AlignUp and Advance. CalculateSizeAndAlignment is used only through
- * its methods, so its layout here ({ size, alignment }) is ours. */
-static void mii_BufferAllocator_ctor(Ctx *c) { wr64(A0, A1); wr64(A0 + 8, A2); }
-static void mii_BufferAllocator_AlignUp(Ctx *c) {
-    uint64_t p = rd64(A0), a = A1 ? A1 : 1, q = (p + a - 1) / a * a;
-    wr64(A0 + 8, rd64(A0 + 8) - (q - p));
-    wr64(A0, q);
-}
-static void mii_BufferAllocator_Advance(Ctx *c) { wr64(A0, rd64(A0) + A1); wr64(A0 + 8, rd64(A0 + 8) - A1); }
-static void mii_Calc_ctor(Ctx *c) { wr64(A0, 0); wr64(A0 + 8, 1); }
-static void mii_Calc_AddSize(Ctx *c) { wr64(A0, rd64(A0) + A1); }
-static void mii_Calc_AddSizeAligned(Ctx *c) {             /* (this, size, alignment) */
-    uint64_t a = A2 ? A2 : 1, s = (rd64(A0) + a - 1) / a * a;
-    wr64(A0, s + A1);
-    if (a > rd64(A0 + 8)) wr64(A0 + 8, a);
-}
-static void mii_Calc_AddSizeAlignedCount(Ctx *c) {        /* (this, size, alignment, count) */
-    uint64_t a = A2 ? A2 : 1, s = (rd64(A0) + a - 1) / a * a;
-    wr64(A0, s + A1 * (uint64_t)(int64_t)(int32_t)A3);
-    if (a > rd64(A0 + 8)) wr64(A0 + 8, a);
-}
-static void mii_Calc_GetSize(Ctx *c) { RET(rd64(A0)); }
 
 /* ---- nn::util string and bit helpers */
 static void util_SNPrintf(Ctx *c) {                       /* (char *buf, size_t size, const char *fmt, ...) */
@@ -438,11 +314,6 @@ static void util_SNPrintf(Ctx *c) {                       /* (char *buf, size_t 
     }
     RET((int64_t)n);
 }
-static void util_BitArray_reset(Ctx *c) {                 /* object: { uint64_t *words; uint32_t bitCount; } */
-    uint64_t words = rd64(A0);
-    uint32_t bits = rd32(A0 + 8);
-    if (words) memset((void *)(uintptr_t)words, 0, ((size_t)bits + 63) / 64 * 8);
-}
 static void util_ConvertCharacterUtf8ToUtf32(Ctx *c) {    /* (uint32_t *out, const char *s) -> bytes consumed, or 0 */
     const uint8_t *s = (const uint8_t *)(uintptr_t)A1;
     uint32_t cp; int n;
@@ -462,7 +333,6 @@ static void util_PickOutCharacterFromUtf8String(Ctx *c) { /* (char out[4], const
     wr64(A1, (uint64_t)(uintptr_t)(s + n));
     RET(n);
 }
-static void util_DecompressZlib(Ctx *c) { guest_trap("nn::util::DecompressZlib is not implemented yet", c->x[30] - 4); }
 
 static const ImportDef sdk_imports[] = {
     {"nnResultIsFailure", result_IsFailure}, {"nnResultIsSuccess", result_IsSuccess},
@@ -473,21 +343,13 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn4bcat22DeliveryCacheDirectoryC1Ev", keep}, {"_ZN2nn4bcat22DeliveryCacheDirectoryD1Ev", keep},
     {"_ZN2nn4bcat22DeliveryCacheDirectory4OpenERKNS0_13DirectoryNameE", bcat_unavailable},
     {"_ZN2nn4bcat22DeliveryCacheDirectory4ReadEPiPNS0_27DeliveryCacheDirectoryEntryEi", bcat_DirectoryRead},
-    {"_ZN2nn4bcat22DeliveryCacheDirectory5CloseEv", keep},
     {"_ZN2nn4bcat17DeliveryCacheFileC1Ev", keep}, {"_ZN2nn4bcat17DeliveryCacheFileD1Ev", keep},
-    {"_ZN2nn4bcat17DeliveryCacheFile4OpenERKNS0_13DirectoryNameERKNS0_8FileNameE", bcat_unavailable},
     {"_ZN2nn4bcat17DeliveryCacheFile5CloseEv", keep},
     {"_ZN2nn4bcat21DeliveryCacheProgressC1Ev", keep}, {"_ZN2nn4bcat21DeliveryCacheProgressD1Ev", keep},
     {"_ZN2nn4bcat21DeliveryCacheProgress6UpdateEv", keep},
     {"_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE", bcat_RequestSync},
-    {"_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressEPKc", bcat_RequestSyncDir},
-    {"_ZN2nn7friends13GetFriendListEPiPNS0_6FriendERKNS_7account3UidEiiRKNS0_12FriendFilterE", friends_GetFriendList},
-    {"_ZN2nn7friends10InitializeEv", ret0}, {"_ZN2nn7friends6FriendC1Ev", keep}, {"_ZN2nn7friends7ProfileC1Ev", keep},
-    {"_ZN2nn7friends12AsyncContextC1Ev", keep}, {"_ZN2nn7friends12UserPresenceC1Ev", keep},
-    {"_ZN2nn7friends17NotificationQueueC1Ev", keep},
-    {"_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", ret0},
-    {"_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ret0},
-    {"_ZN2nn7friends17NotificationQueue8FinalizeEv", ret0},
+    {"_ZN2nn7friends10InitializeEv", ret0}, {"_ZN2nn7friends7ProfileC1Ev", keep},
+    {"_ZN2nn7friends12AsyncContextC1Ev", keep},
     {"_ZN2nn3mem17StandardAllocator10InitializeEPvm", stdalloc_Initialize},
     /* the game imports this overload: the bool turns on a per-thread cache (stored at +1, a TLS slot
      * allocated, [sdk 7.3.2 0x2de1d0]); the host heap has no such cache, so it is the same call */
@@ -497,31 +359,13 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn3mem17StandardAllocator8AllocateEmm", stdalloc_AllocateAligned},
     {"_ZN2nn3mem17StandardAllocator4FreeEPv", stdalloc_Free},
     {"_ZN2nn3mem17StandardAllocator10ReallocateEPvm", stdalloc_Reallocate},
-    {"_ZNK2nn3mem17StandardAllocator16GetTotalFreeSizeEv", stdalloc_GetTotalFreeSize},
-    {"_ZN2nn3mii6detail15BufferAllocatorC1EPvm", mii_BufferAllocator_ctor},
-    {"_ZN2nn3mii6detail15BufferAllocatorD1Ev", keep},
-    {"_ZN2nn3mii6detail15BufferAllocator7AlignUpEm", mii_BufferAllocator_AlignUp},
-    {"_ZN2nn3mii6detail15BufferAllocator7AdvanceEm", mii_BufferAllocator_Advance},
-    {"_ZN2nn3mii6detail25CalculateSizeAndAlignmentC1Ev", mii_Calc_ctor},
-    {"_ZN2nn3mii6detail25CalculateSizeAndAlignmentD1Ev", keep},
-    {"_ZN2nn3mii6detail25CalculateSizeAndAlignment7AddSizeEm", mii_Calc_AddSize},
-    {"_ZN2nn3mii6detail25CalculateSizeAndAlignment20AddSizeWithAlignmentEmm", mii_Calc_AddSizeAligned},
-    {"_ZN2nn3mii6detail25CalculateSizeAndAlignment20AddSizeWithAlignmentEmmi", mii_Calc_AddSizeAlignedCount},
-    {"_ZNK2nn3mii6detail25CalculateSizeAndAlignment7GetSizeEv", mii_Calc_GetSize},
     {"_ZN2nn4util8SNPrintfEPcmPKcz", util_SNPrintf},
-    {"_ZN2nn4util8BitArray5resetEv", util_BitArray_reset},
     {"_ZN2nn4util27ConvertCharacterUtf8ToUtf32EPjPKc", util_ConvertCharacterUtf8ToUtf32},
     {"_ZN2nn4util30PickOutCharacterFromUtf8StringEPcPPKc", util_PickOutCharacterFromUtf8String},
-    {"_ZN2nn4util14DecompressZlibEPvmPKvmS1_m", util_DecompressZlib},
-    {"_ZN2nn3mem19NumberLineAllocator10InitializeEPFPvmS2_ES2_PFvS2_S2_ES2_b", nla_Initialize},
-    {"_ZN2nn3mem19NumberLineAllocator8AddRangeEii", nla_AddRange},
-    {"_ZN2nn3mem19NumberLineAllocator8AllocateEPii", nla_Allocate},
-    {"_ZN2nn3mem19NumberLineAllocator4FreeEi", nla_Free},
     {"_ZN2nn4lmem15CreateFrameHeapEPvmi", lmem_CreateFrameHeap},
     {"_ZN2nn4lmem21AllocateFromFrameHeapEPNS0_6detail8HeapHeadEmi", lmem_AllocateFromFrameHeap},
     {"_ZN2nn4lmem16DestroyFrameHeapEPNS0_6detail8HeapHeadE", lmem_DestroyFrameHeap},
     {"_ZNK2nn4util16BinaryFileHeader12GetAlignmentEv", util_BinaryFileHeader_GetAlignment},
-    {"_ZNK2nn4util16BinaryFileHeader11GetFileSizeEv", util_BinaryFileHeader_GetFileSize},
     {"_ZNK2nn4util16BinaryFileHeader11IsRelocatedEv", util_BinaryFileHeader_IsRelocated},
     {"_ZN2nn4util16BinaryFileHeader13GetFirstBlockEv", util_BinaryFileHeader_GetFirstBlock},
     {"_ZNK2nn4util16BinaryFileHeader13GetFirstBlockEv", util_BinaryFileHeader_GetFirstBlock},   /* const overload */
@@ -530,15 +374,11 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn4util15RelocationTable8RelocateEv", util_RelocationTable_Relocate},
     {"_ZN2nn4util11ReferSymbolEPKv", util_ReferSymbol},
     {"sprintf", c_sprintf}, {"snprintf", c_snprintf},
-    {"_ZN2nu16VirtualAllocHookEmmPv", nu_VirtualAllocHook},
-    {"_ZN2nu15VirtualFreeHookEPv", nu_VirtualFreeHook},
-    {"wmemcpy", c_wmemcpy},
     {"_ZN2nn2oe10InitializeEv", keep},
     {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", keep},
     {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", keep},
     {"_ZN2nn2oe16DisableRecordingEv", keep},
     {"_ZN2nn2oe16GetOperationModeEv", oe_GetOperationMode},
-    {"_ZN2nn2oe27GetNotificationMessageEventEv", oe_GetNotificationMessageEvent},
     {"_ZN2nn2oe18GetDesiredLanguageEv", oe_GetDesiredLanguage},
     {"_ZN2nn8settingseqERKNS0_12LanguageCodeERKNS0_8LanguageE", settings_LanguageEquals},
     {"_ZN2nn2fs22QueryMountRomCacheSizeEPm", fs_QueryMountRomCacheSize},
@@ -546,21 +386,13 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn4time13IsInitializedEv", ret0},
     {"_ZN2nn4time10InitializeEv", ret0},
     {"_ZN2nn2os16GetCurrentThreadEv", os_GetCurrentThread},
-    {"_ZN2nn2os25GetCurrentProcessorNumberEv", ret0},
     {"_ZN2nn2os20GetCurrentCoreNumberEv", ret0},
-    {"gettimeofday", c_gettimeofday},
-    {"_ZN2nn2os21AllocateAddressRegionEPmm", os_AllocateAddressRegion},
-    {"_ZN2nn2os19AllocateMemoryPagesEmm", os_AllocateMemoryPages},
-    {"_ZN2nn2os15FreeMemoryPagesEmm", os_FreeMemoryPages},
-    {"_ZN2nn2os17FreeAddressRegionEm", os_FreeAddressRegion},
-    {"strtol", c_strtol}, {"strtoll", c_strtol}, {"write", c_write}, {"ffsl", c_ffsl}, {"ffsll", c_ffsl},
+    {"strtol", c_strtol},
     {"_ZN2nn3mem17StandardAllocatorC1Ev", keep},
     {"_ZN2nn2os11GetHostArgcEv", os_GetHostArgc},
     {"_ZN2nn2os11GetHostArgvEv", os_GetHostArgv},
-    {"_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", keep},
     {"_ZN2nn2os13GetSystemTickEv", os_GetSystemTick},
     {"_ZN2nn2os22GetSystemTickFrequencyEv", os_GetSystemTickFrequency},
-    {"_ZN2nn2os18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE", os_AllocateTlsSlot},
     {"_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE", os_AllocateTlsSlot},
     {"_ZN2nn2os11GetTlsValueENS0_7TlsSlotE", os_GetTlsValue},
     {"_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm", os_SetTlsValue},
@@ -569,19 +401,7 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", keep},
     {"_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", keep},
     {"_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE", os_TryLock},
-    {"pthread_mutex_lock", ret0}, {"pthread_mutex_unlock", ret0}, {"pthread_mutex_trylock", ret0},
-    {"pthread_mutex_init", ret0}, {"pthread_mutex_destroy", ret0},
     {"__errno_location", c_errno_location},
-    {"_ZN2nn3err18ErrorResultVariantC1Ev", err_Variant_ctor},
-    {"_ZN2nn3err18ErrorResultVariantaSERKNS_6ResultE", err_Variant_assign},
-    {"_ZN2nn3ldn15MakeIpv4AddressEhhhh", ldn_MakeIpv4Address},
-    {"_ZNSt3__115recursive_mutexC1Ev", keep},
-    {"_ZNSt3__115recursive_mutexD1Ev", keep},
-    {"_ZNSt3__115recursive_mutex4lockEv", keep},
-    {"_ZNSt3__115recursive_mutex6unlockEv", keep},
-    {"_ZNSt3__15mutex4lockEv", keep},
-    {"_ZNSt3__15mutex6unlockEv", keep},
-    {"_ZNSt3__15mutexD1Ev", keep},
 };
 
 void register_sdk_imports(void) {

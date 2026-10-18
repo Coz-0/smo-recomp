@@ -266,10 +266,10 @@ The end of every log has the counts that tell whether a run was healthy:
   handler, and stops (exit code 5); `SMO_STRICT=report` lists them and goes on. The `strict check:` line of every log
   counts them.
 - `SMO_VK_CSLOG=1` logs compute dispatches with large work groups.
-- `SMO_NACP=<file>` reads the version string from another `control.nacp`.
 - `SMO_USERDATA=<folder>` is the save folder (`scripts\run.py --userdata` sets it).
-- `SMO_SDK_SELFTEST=1` runs the self-test of the service families (`runtime/services/nnservices.c`); it stops at
-  `log2f`, which this game does not import.
+- `SMO_SDK_SELFTEST=1` runs the self-test of the service families (`runtime/services/nnservices.c`); it fails two
+  checks (the `errno` location, `NumberLineAllocator` not lifted) and stops at `nn::image::JpegDecoder`, a game import
+  without a handler.
 
 ## Looking things up in the executable
 

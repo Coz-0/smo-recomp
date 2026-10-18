@@ -41,8 +41,7 @@ HOST_SOURCES = {
             'tex_decode.c', 'display.c', 'gfx_options.c'],
     'audio': ['nnaudio.c', 'smo_audio.c'],
     'input': ['nnhid.c', 'nnpad_sdl.c'],
-    'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnmii.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c',
-                 'nnmovie_mf.c'],
+    'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmovie_mf.c'],
     'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c'],
 }
 INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c')]

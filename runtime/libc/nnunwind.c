@@ -2,8 +2,8 @@
  * console.
  *
  * How it works
- *   - nncxxrt.c (eh_runtime.h) owns the exception objects, the ABI entry points and the personality (LSDA lookup and
- *     type matching); it calls raise() here for every throw and every _Unwind_Resume.
+ *   - nncxxrt.c (eh_runtime.h) owns the exception objects and the personality (LSDA lookup and type matching); it calls
+ *     raise() here for every throw.
  *   - The guest stack is real: lifted code keeps x29/x30 and the callee-saved registers exactly where the original
  *     code does, and the .eh_frame tables are mapped with the image. raise() walks the GUEST frames with the CFI of
  *     each function (CFA and saved x19..x30, d8..d15) and asks the personality about every call site. A throw first
@@ -228,7 +228,7 @@ static void regs_from(Ctx *c, Regs *r) {
     memset(r, 0, sizeof *r);
     for (int i = 19; i <= 31; i++) r->x[i] = c->x[i];
     for (int i = 0; i < 8; i++) r->d[i] = c->v[8 + i].d[0];
-    r->pc = c->x[30];                                     /* return address of the __cxa_throw / _Unwind_Resume call */
+    r->pc = c->x[30];                                     /* return address of the call that threw */
 }
 
 /* One frame: what its call site does with the exception, then the caller's registers. Returns 0 at the end of the
@@ -275,7 +275,7 @@ static void eh_raise(Ctx *c, int reason) {
             printf("unwind: throw #%ld of %s at 0x%llx: handler in %s f_%llx (landing pad %llx), %d frames up\n", (long)seq, eh_type_name(exc),
                    (unsigned long long)c->x[30] - 4, owner, (unsigned long long)pad.function.start, (unsigned long long)pad.landing_pad, depth);
     }
-    /* phase 2 (and every _Unwind_Resume): the nearest pad from here */
+    /* phase 2: the nearest pad from here */
     regs_from(c, &cur);
     for (int depth = 0; depth < 4096; depth++) {
         Regs at = cur;                                    /* registers of this frame at its call */

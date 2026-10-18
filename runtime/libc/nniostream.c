@@ -2,8 +2,8 @@
  *
  * The game has its own stream classes (std::ostringstream / istringstream with their stringbuf are
  * compiled into the game) but takes the base-class pieces from the SDK: ios_base::init, the
- * basic_streambuf constructor and default virtuals, ostream::sentry, operator<< for integers,
- * istream::get and operator>>(float&). Layouts are libc++'s on AArch64 (the stringbuf fields the game
+ * basic_streambuf constructor and default virtuals, ostream::sentry, ios_base::clear / getloc and the stream
+ * destructors. Layouts are libc++'s on AArch64 (the stringbuf fields the game
  * reads in f_7102d099c0 -- pbase +0x28, pptr +0x30, high mark +0x58, mode +0x60 -- agree with them):
  *
  *   basic_streambuf: +0 vtable, +8 locale, +0x10 eback, +0x18 gptr, +0x20 egptr, +0x28 pbase, +0x30 pptr, +0x38 epptr
@@ -47,17 +47,6 @@ static uint64_t vcall(Ctx *c, uint64_t obj, int slot, uint64_t a1, uint64_t a2) 
 
 static uint64_t ios_of(uint64_t stream) { return stream + rd64(rd64(stream) - 0x18); }
 void cxxrt_throw_ios_failure(Ctx *c, const char *msg);          /* nncxxrt.c: throws std::ios_base::failure */
-/* setstate() as it behaves inside libc++'s stream operations: they run under `try { ... setstate(bits); } catch (...)
- * { __set_badbit_and_consider_rethrow(); }`, so a bit enabled in exceptions() turns into badbit, and the exception
- * leaves the operation only when badbit itself is enabled in exceptions(). */
-static void set_state_c(Ctx *c, uint64_t ios, uint32_t bits) {
-    uint32_t state = rd32(ios + IOS_STATE) | bits, exceptions = rd32(ios + IOS_EXCEPTIONS);
-    if (state & exceptions) state |= BADBIT;
-    wr32(ios + IOS_STATE, state);
-    if ((state & exceptions) && (exceptions & BADBIT)) cxxrt_throw_ios_failure(c, "ios_base::clear");
-}
-#define set_state(ios, bits) set_state_c(c, ios, bits)
-
 /* ---- basic_streambuf */
 static void sb_ctor(Ctx *c) {
     uint64_t sb = A0;
@@ -70,7 +59,6 @@ static void sb_sync(Ctx *c) { RET(0); }
 static void sb_imbue(Ctx *c) { (void)c; }
 static void sb_setbuf(Ctx *c) { RET(A0); }
 static void sb_showmanyc(Ctx *c) { RET(0); }
-static void sb_eof(Ctx *c) { RET(EOF_INT); }                         /* underflow, pbackfail, overflow */
 static void sb_uflow(Ctx *c) {
     uint64_t sb = A0;
     if ((uint32_t)vcall(c, sb, VT_UNDERFLOW, 0, 0) == EOF_INT) { RET(EOF_INT); return; }
@@ -150,101 +138,19 @@ static void os_sentry_ctor(Ctx *c) {                                  /* (sentry
     RET(s);
 }
 
-/* Writes one formatted field honouring width, fill and adjustment, then resets the width. */
-static void put_field(Ctx *c, uint64_t os, const char *text) {
-    uint64_t ios = ios_of(os), sb = rd64(ios + IOS_RDBUF);
-    if (rd32(ios + IOS_STATE) != 0 || !sb) { set_state(ios, FAILBIT); return; }
-    char buf[160];
-    int len = (int)strlen(text), width = (int)rd64(ios + IOS_WIDTH), fill = (int)rd32(ios + IOS_FILL);
-    if (fill <= 0 || fill > 0xff) fill = ' ';                         /* libc++ fills lazily: an unset fill means a space */
-    if (width > (int)sizeof buf - 1) width = (int)sizeof buf - 1;
-    int pad = width > len ? width - len : 0, left = (rd32(ios + IOS_FLAGS) & F_LEFT) != 0;
-    memset(buf, fill, sizeof buf);
-    /* ios_base::internal (0x10): the padding goes after the sign or the 0x prefix (libc++ __pad_and_output) */
-    int prefix = 0;
-    if ((rd32(ios + IOS_FLAGS) & 0xb0) == 0x10 && pad) {
-        if (text[0] == '-' || text[0] == '+') prefix = 1;
-        else if (len >= 2 && text[0] == '0' && (text[1] | 0x20) == 'x') prefix = 2;
-    }
-    if (prefix) { memcpy(buf, text, (size_t)prefix); memcpy(buf + prefix + pad, text + prefix, (size_t)(len - prefix)); }
-    else memcpy(buf + (left ? 0 : pad), text, (size_t)len);
-    wr64(ios + IOS_WIDTH, 0);
-    if (put_chars(c, sb, buf, len + pad) != len + pad) set_state(ios_of(os), BADBIT);
-}
-static void put_integer(Ctx *c, uint64_t os, uint64_t value, int is_signed) {
-    uint32_t flags = rd32(ios_of(os) + IOS_FLAGS);
-    char text[80];
-    if (flags & F_HEX) snprintf(text, sizeof text, flags & F_UPPERCASE ? "%s%llX" : "%s%llx", flags & F_SHOWBASE ? (flags & F_UPPERCASE ? "0X" : "0x") : "", (unsigned long long)value);
-    else if (flags & F_OCT) snprintf(text, sizeof text, "%s%llo", flags & F_SHOWBASE && value ? "0" : "", (unsigned long long)value);
-    else if (is_signed) snprintf(text, sizeof text, flags & F_SHOWPOS ? "%+lld" : "%lld", (long long)value);
-    else snprintf(text, sizeof text, "%llu", (unsigned long long)value);
-    put_field(c, os, text);
-}
-static void os_put_int(Ctx *c) {                                      /* operator<<(int): hex and oct print the 32-bit pattern */
-    uint64_t os = A0;
-    uint32_t flags = rd32(ios_of(os) + IOS_FLAGS);
-    int32_t v = (int32_t)A1;
-    put_integer(c, os, flags & (F_HEX | F_OCT) ? (uint64_t)(uint32_t)v : (uint64_t)(int64_t)v, 1);
-    RET(os);
-}
-static void os_put_ulong(Ctx *c) { uint64_t os = A0; put_integer(c, os, A1, 0); RET(os); }
-
-/* ---- basic_istream */
-static uint32_t peek_char(Ctx *c, uint64_t sb) {
-    uint64_t g = rd64(sb + SB_GPTR);
-    if (g < rd64(sb + SB_EGPTR)) return *(uint8_t *)(uintptr_t)g;
-    return (uint32_t)vcall(c, sb, VT_UNDERFLOW, 0, 0);
-}
-static uint32_t take_char(Ctx *c, uint64_t sb) {
-    uint64_t g = rd64(sb + SB_GPTR);
-    if (g < rd64(sb + SB_EGPTR)) { wr64(sb + SB_GPTR, g + 1); return *(uint8_t *)(uintptr_t)g; }
-    return (uint32_t)vcall(c, sb, VT_UFLOW, 0, 0);
-}
-static void is_get(Ctx *c) {                                          /* int get(): also records gcount at +8 */
-    uint64_t is = A0, ios = ios_of(is), sb = rd64(ios + IOS_RDBUF);
-    uint32_t ch = EOF_INT;
-    wr64(is + 8, 0);
-    if (rd32(ios + IOS_STATE) == 0 && sb) ch = take_char(c, sb);
-    if (ch == EOF_INT) set_state(ios_of(is), EOFBIT | FAILBIT); else wr64(is + 8, 1);
-    RET(ch);
-}
-static void is_read_float(Ctx *c) {                                   /* operator>>(float &) */
-    uint64_t is = A0, out = A1, ios = ios_of(is), sb = rd64(ios + IOS_RDBUF);
-    char text[80];
-    int n = 0;
-    if (rd32(ios + IOS_STATE) != 0 || !sb) { set_state(ios, FAILBIT); RET(is); return; }
-    uint32_t ch = peek_char(c, sb);
-    if (rd32(ios_of(is) + IOS_FLAGS) & F_SKIPWS)
-        while (ch == ' ' || (ch >= 9 && ch <= 13)) { take_char(c, sb); ch = peek_char(c, sb); }
-    while (ch != EOF_INT && n < (int)sizeof text - 1 && (strchr("+-.eExXpP", (int)ch) || (ch >= '0' && ch <= '9') || (ch | 0x20) == 'n' || (ch | 0x20) == 'a' ||
-           (ch | 0x20) == 'i' || (ch | 0x20) == 'f' || ((ch | 0x20) >= 'a' && (ch | 0x20) <= 'f' && n > 1 && (text[1] | 0x20) == 'x'))) {
-        text[n++] = (char)ch;
-        take_char(c, sb);
-        ch = peek_char(c, sb);
-    }
-    text[n] = 0;
-    char *end = text;
-    float v = strtof(text, &end);
-    ios = ios_of(is);
-    if (end == text) { v = 0; set_state(ios, FAILBIT); }
-    if (ch == EOF_INT) set_state(ios, EOFBIT);
-    *(float *)(uintptr_t)out = v;
-    RET(is);
-}
-
 #define SBUF "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE"
 #define OSTR "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE"
 #define ISTR "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE"
 #define IOSTR "_ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEE"
 static const ImportDef iostream_imports[] = {
     {SBUF "C2Ev", sb_ctor}, {SBUF "D2Ev", sb_dtor}, {SBUF "4syncEv", sb_sync}, {SBUF "5imbueERKNS_6localeE", sb_imbue},
-    {SBUF "6setbufEPcl", sb_setbuf}, {SBUF "9showmanycEv", sb_showmanyc}, {SBUF "6xsgetnEPcl", sb_xsgetn}, {SBUF "9underflowEv", sb_eof},
-    {SBUF "5uflowEv", sb_uflow}, {SBUF "9pbackfailEi", sb_eof}, {SBUF "6xsputnEPKcl", sb_xsputn}, {SBUF "8overflowEi", sb_eof},
+    {SBUF "6setbufEPcl", sb_setbuf}, {SBUF "9showmanycEv", sb_showmanyc}, {SBUF "6xsgetnEPcl", sb_xsgetn},
+    {SBUF "5uflowEv", sb_uflow}, {SBUF "6xsputnEPKcl", sb_xsputn},
     {"_ZNSt3__18ios_base4initEPv", ios_init}, {"_ZNSt3__18ios_base5clearEj", ios_clear}, {"_ZNKSt3__18ios_base6getlocEv", ios_getloc},
     {"_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev", ret_this},
-    {OSTR "6sentryC1ERS3_", os_sentry_ctor}, {OSTR "6sentryD1Ev", nothing}, {OSTR "lsEi", os_put_int}, {OSTR "lsEm", os_put_ulong},
-    {OSTR "D0Ev", ret_this}, {OSTR "D1Ev", ret_this}, {OSTR "D2Ev", ret_this},
-    {ISTR "3getEv", is_get}, {ISTR "rsERf", is_read_float}, {ISTR "D1Ev", ret_this},
+    {OSTR "6sentryC1ERS3_", os_sentry_ctor}, {OSTR "6sentryD1Ev", nothing},
+    {OSTR "D0Ev", ret_this}, {OSTR "D1Ev", ret_this},
+    {ISTR "D1Ev", ret_this},
     /* basic_iostream's destructors and their thunks (std::stringstream's base: SessionMusicianNpc::init). Like
      * the ostream ones above they have nothing to release here (classic locale only, no buffers of their own). */
     {IOSTR "D0Ev", ret_this}, {IOSTR "D1Ev", ret_this}, {IOSTR "D2Ev", ret_this},

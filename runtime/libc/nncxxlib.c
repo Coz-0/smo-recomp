@@ -1,18 +1,5 @@
-/* libc++ (std::__1) pieces beyond libcxx.c / nniostream.c: futures, locale facets, random_device, stream vtables.
+/* libc++ (std::__1) pieces beyond libcxx.c / nniostream.c: locale facets, stream vtables.
  * Layouts marked [sdk] were read from the real SDK module (Super Smash Bros. Ultimate 13.0.4's, by ssbu-recomp).
- *
- * std::__assoc_sub_state [sdk: promise<void>::promise() allocates 0x48 bytes and initialises them; set_value,
- * __sub_wait, ~promise read the fields]:
- *   +0x00 vptr (vtable: ~D1, ~D0, __on_zero_shared, __execute)      +0x08 long shared_owners (0 = one owner)
- *   +0x10 exception_ptr                                            +0x18 mutex (0x20 bytes)
- *   +0x38 condition_variable (8 bytes)                             +0x40 unsigned state
- *   state bits: 1 = value constructed, 2 = future attached, 4 = ready, 8 = deferred
- * promise<void> and future<void> are one pointer to that state. The mutex and condition variable are driven through
- * the registered std::mutex / std::condition_variable handlers (os_threads.c), exactly like the game's inlined code.
- *
- * std::random_device [sdk]: on this platform it is NOT a hardware source: the constructor seeds a mt19937 with the
- * default seed 5489 inside the object (624 words, index at +0x9c0) and operator() is the generator's next output, so
- * every random_device yields the same sequence 3499211612, 581869302, ... The game sees the same here.
  *
  * Locale facets [sdk]: ctype<char> = { vptr, refs, const unsigned short *table, bool del }, classic table copied from
  * the SDK (mask bits: 0x1 blank, 0x2 cntrl, 0x4 punct, 0x100 upper, 0x200 lower, 0x400 alpha, 0x800 digit,
@@ -38,27 +25,12 @@
 uint64_t cxxrt_call(Ctx *c, uint64_t addr, uint64_t a0, uint64_t a1, uint64_t a2);
 void cxxrt_guest_delete(Ctx *c, uint64_t p);
 uint64_t cxxrt_allocate_exception(size_t size);
-void cxxrt_exception_init(uint64_t obj, uint64_t type, uint64_t dtor);
-void cxxrt_exception_release(Ctx *c, uint64_t obj);
 void cxxrt_throw_report(Ctx *c, const char *how, uint64_t obj, uint64_t type);
 uint64_t cxxrt_refstring_new(const char *s, size_t n);
-uint64_t cxxrt_ti_logic_error(void);
 uint64_t cxxrt_class_ti_vptr(int kind);
 /* libcxx.c */
 void cxx_string_init(Ctx *c, uint64_t str, const char *p, size_t n);
 
-static void call_import(Ctx *c, const char *name, uint64_t a0, uint64_t a1) {
-    ImportFn fn = import_lookup(name);
-    if (!fn) { printf("\nnncxxlib: %s has no handler\n", name); report_and_exit(3); }
-    uint64_t save[3] = {c->x[0], c->x[1], c->x[30]};
-    c->x[0] = a0; c->x[1] = a1;
-    fn(c);
-    c->x[0] = save[0]; c->x[1] = save[1]; c->x[30] = save[2];
-}
-#define MUTEX_LOCK "_ZNSt3__15mutex4lockEv"
-#define MUTEX_UNLOCK "_ZNSt3__15mutex6unlockEv"
-#define CV_WAIT "_ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE"
-#define CV_NOTIFY_ALL "_ZNSt3__118condition_variable10notify_allEv"
 /* a short std::string (at most 22 characters) written in place: no allocation */
 static void short_string(uint64_t s, const char *text) {
     size_t n = strlen(text);
@@ -66,159 +38,6 @@ static void short_string(uint64_t s, const char *text) {
     wr8(s, (uint8_t)(n << 1));
     memcpy((void *)(uintptr_t)(s + 1), text, n);
 }
-
-/* ================================================================ future_error / future_category */
-static uint64_t g_vt_future_error[5], g_ti_future_error[3];
-static uint64_t g_vt_future_category[9], g_ti_future_category[3], g_ti_error_category[2], g_future_category[1];
-static const char *future_message(int ev) {
-    switch (ev) {                                       /* libc++ __future_error_category::message; future_errc values */
-    case 4: return "The associated promise has been destructed prior to the associated state becoming ready.";
-    case 1: return "The future has already been retrieved from the promise or packaged_task.";
-    case 2: return "The state of the promise has already been set.";
-    case 3: return "Operation not permitted on an object without an associated state.";
-    }
-    return "unspecified future_errc value\n";
-}
-static void future_error_build(uint64_t self, int ev) {
-    const char *msg = future_message(ev);
-    wr64(self, P64(&g_vt_future_error[2]));
-    wr64(self + 8, cxxrt_refstring_new(msg, strlen(msg)));
-    wr64(self + 0x10, (uint32_t)ev);
-    wr64(self + 0x18, P64(g_future_category));
-}
-static void future_error_ctor(Ctx *c) {                 /* future_error(error_code): the 16-byte code arrives in x1, x2 */
-    uint64_t self = A0, cat = A2;
-    future_error_build(self, (int)(int32_t)A1);
-    wr64(self + 0x18, cat);
-    RET(self);
-}
-static void throw_future_error(Ctx *c, int ev) {
-    uint64_t obj = cxxrt_allocate_exception(0x20);
-    future_error_build(obj, ev);
-    cxxrt_exception_init(obj, P64(g_ti_future_error), g_vt_future_error[2]);
-    cxxrt_throw_report(c, "throw by the future/promise library", obj, P64(g_ti_future_error));
-}
-static void future_category(Ctx *c) { RET(g_future_category); }
-static void cat_dtor(Ctx *c) { RET(A0); }
-static void cat_name(Ctx *c) { RET("future"); }
-static void cat_default_condition(Ctx *c) { uint64_t self = A0; RET((uint32_t)A1); c->x[1] = self; }      /* error_condition { int, category * } in x0, x1 */
-static void cat_equivalent_cond(Ctx *c) { RET((uint32_t)rd32(A2) == (uint32_t)A1 && rd64(A2 + 8) == A0); } /* (int code, const error_condition &) */
-static void cat_equivalent_code(Ctx *c) { RET(rd64(A1 + 8) == A0 && rd32(A1) == (uint32_t)A2); }           /* (const error_code &, int cond) */
-static void cat_message(Ctx *c) {                       /* string message(int) const: result through x8 */
-    const char *m = future_message((int)(int32_t)A1);
-    cxx_string_init(c, c->x[8], m, strlen(m));
-}
-
-/* ================================================================ __assoc_sub_state, promise<void>, future<void> */
-enum { ST_OWNERS = 8, ST_EXCEPTION = 0x10, ST_MUTEX = 0x18, ST_CV = 0x38, ST_STATE = 0x40, ST_SIZE = 0x48 };
-enum { S_CONSTRUCTED = 1, S_ATTACHED = 2, S_READY = 4, S_DEFERRED = 8 };
-static uint64_t g_vt_assoc[6], g_ti_assoc[3], g_ti_shared_count2[2];
-
-static void state_release(Ctx *c, uint64_t st) {        /* __shared_count::__release_shared() */
-    if (InterlockedDecrement64((volatile LONG64 *)(uintptr_t)(st + ST_OWNERS)) == -1)
-        cxxrt_call(c, rd64(rd64(st) + 0x10), st, 0, 0);                /* virtual __on_zero_shared() */
-}
-static void assoc_dtor(Ctx *c) {                        /* ~__assoc_sub_state: the members' destructors */
-    uint64_t st = A0;
-    cxxrt_exception_release(c, rd64(st + ST_EXCEPTION));
-    wr64(st + ST_EXCEPTION, 0);
-    RET(st);
-}
-static void assoc_dtor_delete(Ctx *c) {                 /* only objects created by promise<void>() below have this entry */
-    uint64_t st = A0;
-    cxxrt_exception_release(c, rd64(st + ST_EXCEPTION));
-    _aligned_free((void *)(uintptr_t)st);
-}
-static void assoc_on_zero_shared(Ctx *c) { uint64_t st = A0; if (st) cxxrt_call(c, rd64(rd64(st) + 8), st, 0, 0); }   /* [sdk] delete this (virtual D0) */
-static void assoc_execute(Ctx *c) { throw_future_error(c, 3); }                                                      /* [sdk] base __execute throws no_state */
-static void assoc_sub_wait(Ctx *c) {                    /* (this, unique_lock<mutex> &lk) */
-    uint64_t st = A0, lk = A1;
-    uint32_t state = rd32(st + ST_STATE);
-    if (state & S_READY) return;
-    if (state & S_DEFERRED) {
-        wr32(st + ST_STATE, state & ~(uint32_t)S_DEFERRED);
-        if (!rd8(lk + 8)) { printf("\nC++ RUNTIME: unique_lock::unlock on a lock that is not owned (std::system_error)\n"); cxxrt_throw_report(c, "throw by the future library", 0, 0); }
-        call_import(c, MUTEX_UNLOCK, rd64(lk), 0);
-        wr8(lk + 8, 0);
-        cxxrt_call(c, rd64(rd64(st) + 0x18), st, 0, 0);                /* virtual __execute() */
-        return;
-    }
-    while (!(rd32(st + ST_STATE) & S_READY)) call_import(c, CV_WAIT, st + ST_CV, lk);
-}
-static void promise_ctor(Ctx *c) {
-    uint64_t self = A0;
-    uint8_t *st = _aligned_malloc(ST_SIZE, 16);
-    memset(st, 0, ST_SIZE);
-    wr64(P64(st), P64(&g_vt_assoc[2]));
-    wr16(P64(st) + ST_MUTEX, 1);                                       /* [sdk] the bytes the SDK's inlined mutex / condvar */
-    wr8(P64(st) + ST_CV, 1);                                           /*       initialisers write                          */
-    wr64(self, P64(st));
-    RET(self);
-}
-static void promise_get_future(Ctx *c) {                /* future<void> get_future(): result through x8 */
-    uint64_t st = rd64(A0), out = c->x[8];
-    if (!st) throw_future_error(c, 3);
-    call_import(c, MUTEX_LOCK, st + ST_MUTEX, 0);
-    uint32_t state = rd32(st + ST_STATE);
-    if (state & S_ATTACHED) { call_import(c, MUTEX_UNLOCK, st + ST_MUTEX, 0); throw_future_error(c, 1); }
-    InterlockedIncrement64((volatile LONG64 *)(uintptr_t)(st + ST_OWNERS));
-    wr32(st + ST_STATE, state | S_ATTACHED);
-    call_import(c, MUTEX_UNLOCK, st + ST_MUTEX, 0);
-    wr64(out, st);
-}
-static void promise_set_value(Ctx *c) {
-    uint64_t st = rd64(A0);
-    if (!st) throw_future_error(c, 3);
-    call_import(c, MUTEX_LOCK, st + ST_MUTEX, 0);
-    if ((rd32(st + ST_STATE) & S_CONSTRUCTED) || rd64(st + ST_EXCEPTION)) { call_import(c, MUTEX_UNLOCK, st + ST_MUTEX, 0); throw_future_error(c, 2); }
-    wr32(st + ST_STATE, rd32(st + ST_STATE) | S_CONSTRUCTED | S_READY);
-    call_import(c, CV_NOTIFY_ALL, st + ST_CV, 0);
-    call_import(c, MUTEX_UNLOCK, st + ST_MUTEX, 0);
-}
-static void promise_dtor(Ctx *c) {
-    uint64_t self = A0, st = rd64(self);
-    if (st) {
-        /* [sdk] no value, no exception, and a future still attached: store future_error(broken_promise) for it */
-        if (!(rd8(st + ST_STATE) & S_CONSTRUCTED) && !rd64(st + ST_EXCEPTION) && (int64_t)rd64(st + ST_OWNERS) >= 1) {
-            uint64_t obj = cxxrt_allocate_exception(0x20);
-            future_error_build(obj, 4);
-            cxxrt_exception_init(obj, P64(g_ti_future_error), g_vt_future_error[2]);
-            call_import(c, MUTEX_LOCK, st + ST_MUTEX, 0);
-            wr64(st + ST_EXCEPTION, obj);
-            wr32(st + ST_STATE, rd32(st + ST_STATE) | S_READY);
-            call_import(c, CV_NOTIFY_ALL, st + ST_CV, 0);
-            call_import(c, MUTEX_UNLOCK, st + ST_MUTEX, 0);
-        }
-        state_release(c, st);
-    }
-    RET(self);
-}
-static void future_dtor(Ctx *c) { uint64_t self = A0, st = rd64(self); if (st) state_release(c, st); RET(self); }
-
-/* ================================================================ random_device (mt19937, see the top of the file) */
-static void rd_ctor(Ctx *c) {
-    uint64_t self = A0;
-    uint32_t x = 5489;
-    wr32(self, x);
-    for (uint32_t i = 1; i < 624; i++) { x = (x ^ (x >> 30)) * 1812433253u + i; wr32(self + 4ull * i, x); }
-    wr64(self + 0x9c0, 0);
-    RET(self);
-}
-static void rd_call(Ctx *c) {
-    uint64_t self = A0, i = rd64(self + 0x9c0) % 624, j = (i + 1) % 624, k = (i + 397) % 624;
-    uint32_t xj = rd32(self + 4 * j);
-    uint32_t y = (rd32(self + 4 * i) & 0x80000000u) | (xj & 0x7fffffffu);
-    uint32_t v = rd32(self + 4 * k) ^ (y >> 1) ^ ((xj & 1) * 0x9908b0dfu);
-    wr32(self + 4 * i, v);
-    wr64(self + 0x9c0, j);
-    v ^= v >> 11;
-    v ^= (v << 7) & 0x9d2c5680u;
-    v ^= (v << 15) & 0xefc60000u;
-    v ^= v >> 18;
-    RET(v);
-}
-static void rd_dtor(Ctx *c) { RET(A0); }
-static void rd_entropy(Ctx *c) { vzero(&c->v[0]); c->v[0].df[0] = 0.0; }
 
 /* ================================================================ locale facets of the classic locale */
 static const uint16_t classic_table[256] = {            /* [sdk] ctype<char>::classic_table(), entries 0..127; the rest are 0 */
@@ -265,12 +84,6 @@ static void locale_use_facet(Ctx *c) {                  /* const facet *locale::
            (unsigned long long)id, (unsigned long long)c->x[30] - 4);
     cxxrt_throw_report(c, "throw by std::locale::use_facet", 0, 0);
 }
-static void locale_has_facet(Ctx *c) { RET(A1 == P64(g_id_ctype) || A1 == P64(g_id_numpunct)); }
-
-/* ================================================================ basic_string<wchar_t>
- * same representation as std::string with 4-byte characters: bit 0 of byte 0 = long, data pointer at +0x10.
- * [sdk] the destructor passes the buffer to operator delete, which is the game's own (it exports _ZdlPv). */
-static void wstr_dtor(Ctx *c) { uint64_t s = A0; if (rd8(s) & 1) cxxrt_guest_delete(c, rd64(s + 0x10)); RET(s); }
 
 /* ================================================================ basic_ostream / basic_istream vtables
  * [sdk] _ZTVNSt3__113basic_ostreamIcNS_11char_traitsIcEEEE: { vbase offset 8, 0, typeinfo, D1, D0,
@@ -317,8 +130,8 @@ static void sbuf_dtor(Ctx *c) {
 static void sentry_dtor(Ctx *c) {
     uint64_t s = A0, os = rd64(s + 8), ios = os + rd64(rd64(os) - 0x18);
     if (rd64(ios + 0x28) && rd32(ios + 0x20) == 0 && (rd8(ios + 9) & 0x20)) {
-        call_handler(c, "_ZSt18uncaught_exceptionv");
-        if (!(c->x[0] & 1)) {
+        int cxxrt_uncaught(Ctx *c);                                                 /* nncxxrt.c: std::uncaught_exception() */
+        if (!cxxrt_uncaught(c)) {
             ios = rd64(s + 8) + rd64(rd64(rd64(s + 8)) - 0x18);
             uint64_t sb = rd64(ios + 0x28);
             c->x[0] = sb;
@@ -354,38 +167,7 @@ static void make_stream_vtable(uint64_t *vt, uint64_t *ti, const char *cls, int6
 }
 
 void cxxlib_install_data(void) {
-    uint64_t vt_class = cxxrt_class_ti_vptr(1), vt_si = cxxrt_class_ti_vptr(2);
-    /* future_error, future_category */
-    g_ti_future_error[0] = vt_si; g_ti_future_error[1] = P64("NSt3__112future_errorE"); g_ti_future_error[2] = cxxrt_ti_logic_error();
-    g_vt_future_error[0] = 0; g_vt_future_error[1] = P64(g_ti_future_error);
-    g_vt_future_error[2] = hostfn_address("std::logic_error::~std::logic_error [D1]", NULL);       /* same entries as logic_error (nncxxrt.c) */
-    g_vt_future_error[3] = hostfn_address("std::logic_error::~std::logic_error [D0]", NULL);
-    g_vt_future_error[4] = hostfn_address("std::logic_error::what", NULL);
-    g_ti_error_category[0] = vt_class; g_ti_error_category[1] = P64("NSt3__114error_categoryE");
-    g_ti_future_category[0] = vt_si; g_ti_future_category[1] = P64("NSt3__123__future_error_categoryE"); g_ti_future_category[2] = P64(g_ti_error_category);
-    g_vt_future_category[0] = 0; g_vt_future_category[1] = P64(g_ti_future_category);
-    g_vt_future_category[2] = hostfn_address("future_category::~ [D1]", cat_dtor);
-    g_vt_future_category[3] = hostfn_address("future_category::~ [D0]", cat_dtor);
-    g_vt_future_category[4] = hostfn_address("future_category::name", cat_name);
-    g_vt_future_category[5] = hostfn_address("error_category::default_error_condition", cat_default_condition);
-    g_vt_future_category[6] = hostfn_address("error_category::equivalent(int, error_condition)", cat_equivalent_cond);
-    g_vt_future_category[7] = hostfn_address("error_category::equivalent(error_code, int)", cat_equivalent_code);
-    g_vt_future_category[8] = hostfn_address("future_category::message", cat_message);
-    g_future_category[0] = P64(&g_vt_future_category[2]);
-    import_set_address("_ZTVNSt3__112future_errorE", g_vt_future_error);
-    import_set_address("_ZTINSt3__112future_errorE", g_ti_future_error);
-
-    /* __assoc_sub_state: [sdk] { 0, typeinfo, D1, D0, __on_zero_shared, __execute } */
-    g_ti_shared_count2[0] = vt_class; g_ti_shared_count2[1] = P64("NSt3__114__shared_countE");
-    g_ti_assoc[0] = vt_si; g_ti_assoc[1] = P64("NSt3__117__assoc_sub_stateE"); g_ti_assoc[2] = P64(g_ti_shared_count2);
-    g_vt_assoc[0] = 0; g_vt_assoc[1] = P64(g_ti_assoc);
-    g_vt_assoc[2] = hostfn_address("std::__assoc_sub_state::~ [D1]", assoc_dtor);
-    g_vt_assoc[3] = hostfn_address("std::__assoc_sub_state::~ [D0]", assoc_dtor_delete);
-    g_vt_assoc[4] = hostfn_address("std::__assoc_sub_state::__on_zero_shared", assoc_on_zero_shared);
-    g_vt_assoc[5] = hostfn_address("std::__assoc_sub_state::__execute", assoc_execute);
-    import_set_address("_ZTVNSt3__117__assoc_sub_stateE", g_vt_assoc);
-    import_set_address("_ZTINSt3__117__assoc_sub_stateE", g_ti_assoc);
-
+    uint64_t vt_class = cxxrt_class_ti_vptr(1);
     /* facets: [sdk] vtable orders of ctype<char> and numpunct<char> */
     static const struct { const char *name; ImportFn fn; } ct[] = {
         {"std::ctype<char>::~ [D1]", facet_dtor}, {"std::ctype<char>::~ [D0]", facet_dtor}, {"std::locale::facet::__on_zero_shared", facet_nop},
@@ -433,30 +215,11 @@ static const ImportDef cxxlib_replace[] = {
     {OSTR "6sentryD1Ev", sentry_dtor},
 };
 static const ImportDef cxxlib_fill[] = {
-    {"_ZNKSt3__16locale9has_facetERNS0_2idE", locale_has_facet},
     {"_ZTv0_n24_" "NSt3__113basic_ostreamIcNS_11char_traitsIcEEED1Ev", stream_thunk_dtor},
     {"_ZTv0_n24_" "NSt3__113basic_ostreamIcNS_11char_traitsIcEEED0Ev", stream_thunk_dtor_delete},
     {"_ZTv0_n24_" "NSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev", stream_thunk_dtor},
     {"_ZTv0_n24_" "NSt3__113basic_istreamIcNS_11char_traitsIcEEED0Ev", stream_thunk_dtor_delete},
-    {"_ZNSt3__17promiseIvEC1Ev", promise_ctor}, {"_ZNSt3__17promiseIvEC2Ev", promise_ctor},
-    {"_ZNSt3__17promiseIvE10get_futureEv", promise_get_future}, {"_ZNSt3__17promiseIvE9set_valueEv", promise_set_value},
-    {"_ZNSt3__17promiseIvED1Ev", promise_dtor}, {"_ZNSt3__17promiseIvED2Ev", promise_dtor},
-    {"_ZNSt3__16futureIvED1Ev", future_dtor}, {"_ZNSt3__16futureIvED2Ev", future_dtor},
-    {"_ZNSt3__117__assoc_sub_state10__sub_waitERNS_11unique_lockINS_5mutexEEE", assoc_sub_wait},
-    {"_ZNSt3__117__assoc_sub_state9__executeEv", assoc_execute},
-    {"_ZNSt3__117__assoc_sub_state16__on_zero_sharedEv", assoc_on_zero_shared},
-    {"_ZNSt3__112future_errorC1ENS_10error_codeE", future_error_ctor}, {"_ZNSt3__112future_errorC2ENS_10error_codeE", future_error_ctor},
-    {"_ZNSt3__115future_categoryEv", future_category},
-    {"_ZNSt3__113random_deviceC1ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE", rd_ctor},
-    {"_ZNSt3__113random_deviceC2ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE", rd_ctor},
-    {"_ZNSt3__113random_deviceclEv", rd_call}, {"_ZNSt3__113random_deviceD1Ev", rd_dtor}, {"_ZNSt3__113random_deviceD2Ev", rd_dtor},
-    {"_ZNKSt3__113random_device7entropyEv", rd_entropy},
-    {"_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEED2Ev", wstr_dtor},
-    {"_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEED1Ev", wstr_dtor},
 };
-
-/* test access (cxxrt_selftest.h) */
-uint64_t cxxlib_test_object(int which) { return which == 0 ? P64(g_id_ctype) : which == 1 ? P64(g_id_numpunct) : which == 2 ? P64(&g_vt_ostream[3]) : P64(g_future_category); }
 
 void register_cxxlib_imports(void) {
     register_imports(cxxlib_replace, (int)(sizeof cxxlib_replace / sizeof cxxlib_replace[0]));

@@ -1,6 +1,6 @@
 /* Library applets and small device services, as an OFFLINE console answers them:
- * nn::web (offline HTML page, web page, YouTube, lobby), nn::swkbd::ShowKeyboard, nn::ec shop pages,
- * the amiibo settings applets, nn::nfp (an NFC reader to which the amiibo menu holds amiibo), nn::oe volume balance.
+ * nn::web::ShowOfflineHtmlPage, nn::swkbd::ShowKeyboard, nn::nfp (an NFC reader to which the amiibo menu holds amiibo),
+ * nn::oe volume balance.
  *
  * Everything that only fills a caller structure (nn::web *Arg constructors and setters, *ReturnValue
  * constructors and getters, nn::swkbd MakePreset / Set*Text / SetInitialText / SetTextCheckCallback /
@@ -14,19 +14,13 @@
  * pops 0x1010 bytes into the OfflineHtmlPageReturnValue; Result 0 when that storage exists, 0x2d2 (module
  * 210, description 1) when the applet ended without one. Layout ([sdk] 0x3be5a0 constructor, [doc] suyu
  * WebCommonReturnValue): u32 exitReason @0 (constructor: 0x14 = "none"), char lastUrl[0x1000] @8,
- * u64 lastUrlSize @0x1008. ShowLobbyPage ([sdk] 0x2c41d8) is the same shape.
- * [sdk] 0x3bd154 ShowWebPage / 0x3bd2c4 ShowYouTubeVideo: the output is 0x2000 bytes of TLVs:
- * u16 count @0, u32 shim kind @4, then entries { u16 type, u16 size, u32 pad, data[size] } packed without
- * alignment ([sdk] 0x3c0ef8 walks them as offset += size + 8); type 1 = u32 exit reason, 2 = last URL,
- * 3 = u64 URL size, 9 = u8 "media player closed by completion".
+ * u64 lastUrlSize @0x1008.
  * [doc] suyu WebExitReason: 0 EndButtonPressed, 1 BackButtonPressed, 2 ExitRequested, 3 CallbackURL,
  * 4 WindowClosed, 7 ErrorDialog.
- * What happens here: no page can be shown (no browser applet; the game's offline HTML documents are in
- * its manual/legal NCA, not in the extracted RomFS), so each call answers what the applet returns when
- * the user closes the page at once: exit reason 0 (EndButtonPressed), last URL "http://localhost/" (what
- * suyu's applet without a browser frontend reports). [game] 0x710375535c ignores the Result and the value
- * of ShowOfflineHtmlPage; [game] 0x7103341e50 only acts on ShowWebPage when the exit reason is 3
- * (callback URL), which cannot happen without a network.
+ * What happens here: ShowOfflineHtmlPage shows the game's own document when it can (web_open_offline below), then
+ * answers what the applet returns when the user closes the page: exit reason 0 (EndButtonPressed), last URL
+ * "http://localhost/" (what suyu's applet without a browser frontend reports). [game] 0x710375535c ignores the
+ * Result and the value of ShowOfflineHtmlPage.
  *
  * ---- nn::swkbd::ShowKeyboard(String *out, const ShowKeyboardArg &arg)
  * [sdk] 0x38a390. ShowKeyboardArg: KeyboardConfig (0x4d0 bytes) @0; work buffer @0x4d0, size @0x4d8;
@@ -52,8 +46,7 @@
  * Console modelled: the player-1 controller has an NFC reader (as a Pro Controller / right Joy-Con does).
  * An amiibo is held to it only by the amiibo menu (smo_amiibo.c, nfp_place_amiibo): the reader then finds
  * it the next time the game searches, the game mounts it and reads its tag and model information, and the
- * amiibo is taken away again once the game has read it (one touch). [sdk] 0x309900 GetState: 0 before
- * Initialize, the service's state after (1 = initialised); [sdk] 0x309a84 GetDeviceState: 5 before
+ * amiibo is taken away again once the game has read it (one touch). [sdk] 0x309a84 GetDeviceState: 5 before
  * Initialize. [doc] suyu nfc_types.h DeviceState 0 Initialized, 1 SearchingForTag, 2 TagFound,
  * 3 TagRemoved, 4 TagMounted, 5 Unavailable; nfp_result.h (module 115): DeviceNotFound 64,
  * InvalidArgument 65, WrongDeviceState 73, TagRemoved 97.
@@ -72,7 +65,6 @@
  * the game reads it ([game] 0x960478 al::isEqualCharacterId, 0x960530 al::isEqualNumberingId): the
  * amiibo's identification block as stored on the tag, bytes 0 and 1 (game and character), 2 (variant),
  * 3 (type), the model number at 4 as a little-endian u16 (big-endian on the tag), 6 (series).
- * [sdk] 0x308814 amiibo settings applet closed without a change: Result 0x1a073 (module 115, description 208).
  * NOT VERIFIED on a console: the DeviceHandle value (8 bytes; the npad id 0 is used), and the Result of
  * calls made before Initialize (WrongDeviceState is returned). */
 #include <stdio.h>
@@ -121,29 +113,6 @@ static void web_fill_common(uint64_t ret) {                /* 0x1010 bytes */
     memcpy((void *)(uintptr_t)(ret + 8), g_last_url, sizeof g_last_url);
     wr64(ret + 0x1008, sizeof g_last_url - 1);
 }
-static void web_fill_tlv(uint64_t ret, uint32_t shim_kind) {   /* 0x2000 bytes */
-    uint8_t *p = (uint8_t *)(uintptr_t)ret;
-    uint32_t off = 8;
-    memset(p, 0, 0x2000);
-    wr16(ret + off, 1); wr16(ret + off + 2, 4); wr32(ret + off + 8, WEB_EXIT_END_BUTTON); off += 8 + 4;
-    wr16(ret + off, 2); wr16(ret + off + 2, (uint16_t)sizeof g_last_url); memcpy(p + off + 8, g_last_url, sizeof g_last_url); off += 8 + (uint32_t)sizeof g_last_url;
-    wr16(ret + off, 3); wr16(ret + off + 2, 8); wr64(ret + off + 8, sizeof g_last_url - 1);
-    wr16(ret, 3);
-    wr32(ret + 4, shim_kind);
-}
-/* ShowWebPage / ShowYouTubeVideo / ShowLobbyPage, as read:
- * [sdk] 0x3bd0c0 ShowWebPage and 0x3bd210 ShowYouTubeVideo: library applet 0x13, common arguments (version 0x80000) + the
- * 0x2000-byte argument, start (a failure aborts), then CommonApi::JoinAndFinishLibraryApplet reads 0x2000 bytes: Result 0,
- * or 0x2d2 when the applet left no storage.  [sdk] 0x2c4160 ShowLobbyPage: library applet 0x18, 0x1010 bytes back, same
- * Results.  The SDK makes NO connection check of its own: what comes back on a console without a network is decided
- * inside the browser applet (it shows its own error screen and returns some exit reason), and neither the SDK nor
- * [doc] suyu am/frontend/applet_web_browser.cpp shows which: suyu opens a host browser for Web (ExecuteWeb) and ends
- * Lobby at once with exit reason 0 because "Lobby Applet is not implemented".
- * What the game does with the answers: [game] 0x7103341e50 ShowWebPage: only exit reason 3 (callback URL) is acted on,
- * every other answer and every failure take the same path; [game] 0x71002ab9fc ShowLobbyPage: stores 0 when the exit
- * reason is 0x14 or 0xc and 1 for anything else -- so the unknown exit reason IS visible to the game there;
- * [game] 0x71017634cc / 0x7103341bac ShowYouTubeVideo: reads IsMediaPlayerAutoClosedByCompletion (TLV 9, absent here =
- * false). */
 /* ShowOfflineHtmlPage with the game's own offline document: SMO's Help, its Action Guide (al::HtmlViewer::call
  * asks for "htmlcontents.htdocs/html/<region and language>/index.html<query>"). On the console the browser applet shows
  * the page full screen and the game waits until the player closes it. Here the page, from the extracted document
@@ -298,26 +267,6 @@ static void web_ShowOfflineHtmlPage(Ctx *c) {
     if (!doc || !web_open_offline(doc)) web_log(c, "nn::web::ShowOfflineHtmlPage", A1);
     web_fill_common(ret);
     RET(0);
-}
-static void web_ShowLobbyPage(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowLobbyPage", A1); web_fill_common(ret); RET(0); }
-static void web_ShowWebPage(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowWebPage", A1); web_fill_tlv(ret, 5); RET(0); }     /* [doc] ShimKind::Web = 5 */
-static void web_ShowYouTubeVideo(Ctx *c) { uint64_t ret = A0; web_log(c, "nn::web::ShowYouTubeVideo", A1); web_fill_tlv(ret, 5); RET(0); }
-
-/* ================================================================ nn::ec shop pages
- * [sdk] 0x18cad0 ShowShopAddOnContentList(ApplicationId), 0x18cb10 (+ UserHandle), 0x18d250 ShowShopProductDetails,
- * 0x18d130 ShowShopProductList: void functions.  The UserHandle forms turn the handle into a Uid (account::GetUserId,
- * zero Uid on failure, 0x18cb2c); the Impl (0x1907a0, 0x191330, 0x190ff0) builds the page path and calls
- * detail::ShowShopPage (0x1933a0): library applet 0x14 with the common arguments and the page argument, start, wait,
- * 0x1010 bytes of return value read into an SDK-internal buffer (0xc860c0).  The Result is only inspected for an abort
- * (anything but success and 0x690, 0x190898); neither it nor the return value is handed to the caller.
- * So whatever the shop applet does on a console without a connection (it is the web applet in shop mode; [doc] suyu
- * am/frontend/applet_web_browser.cpp ExecuteShop: ends at once with exit reason 0), the GAME sees a function that
- * returns nothing and writes nothing: that is what the handler does.  Not modelled: the applet's own screen and the
- * focus messages a library applet in front causes. */
-static void ec_ShowShop(Ctx *c) {
-    printf("nn::ec: the game asked for a Nintendo eShop page (caller 0x%llx); there is no shop here, returning as if it was closed\n",
-           (unsigned long long)c->x[30] - 4);
-    trace_printf("     nn::ec::ShowShop* -> closed\n");
 }
 
 /* ================================================================ nn::oe volume balance
@@ -526,7 +475,6 @@ static void swkbd_ShowKeyboard(Ctx *c) {
 #define NFP_WRONG_STATE NFP_RESULT(73)
 #define NFP_INVALID_ARGUMENT NFP_RESULT(65)
 #define NFP_TAG_REMOVED NFP_RESULT(97)
-#define NFP_SETTINGS_CLOSED 0x1a073u
 enum { NFP_INITIALIZED, NFP_SEARCHING, NFP_FOUND, NFP_REMOVED, NFP_MOUNTED, NFP_UNAVAILABLE };
 /* The reader. Its calls come from the game's NFC thread, the amiibo from the amiibo menu on the game's main thread. */
 static SRWLOCK g_nfp_lock = SRWLOCK_INIT;
@@ -577,7 +525,6 @@ static void nfp_Finalize(Ctx *c) {
     g_nfp_init = 0; g_nfp_state = NFP_UNAVAILABLE;
     nfp_unlock();
 }
-static void nfp_GetState(Ctx *c) { RET(g_nfp_init ? 1 : 0); }
 static void nfp_GetDeviceState(Ctx *c) { RET(g_nfp_state); }
 static void nfp_ListDevices(Ctx *c) {                      /* (DeviceHandle *out, int *outCount, int max) */
     if (A1) wr32(A1, 0);
@@ -598,7 +545,6 @@ static void nfp_attach(Ctx *c, uint64_t *slot) {           /* (SystemEventType *
 }
 static void nfp_AttachEvent(Ctx *c) { nfp_attach(c, &g_nfp_ev_on); }                  /* AttachActivateEvent */
 static void nfp_AttachDeactivateEvent(Ctx *c) { nfp_attach(c, &g_nfp_ev_off); }
-static void nfp_AttachAvailabilityChangeEvent(Ctx *c) { os_init_event(A0, 0); RET(0); }
 static void nfp_StartDetection(Ctx *c) {
     nfp_lock();
     if (!g_nfp_init || (g_nfp_state != NFP_INITIALIZED && g_nfp_state != NFP_REMOVED)) RET(NFP_WRONG_STATE);
@@ -662,59 +608,25 @@ static void nfp_GetModelInfo(Ctx *c) {                     /* (ModelInfo *out, h
     }
     nfp_unlock();
 }
-static void nfp_needs_tag(Ctx *c) { RET(NFP_WRONG_STATE); }                 /* every call that needs a found or mounted tag */
-static void nfp_GetApplicationArea(Ctx *c) { if (A1) wr64(A1, 0); RET(NFP_WRONG_STATE); }   /* (void *out, size_t *outSize, handle, size) */
-/* StartNicknameAndOwnerSettings (2 forms, [sdk] 0x308970 / 0x308af0), StartGameDataEraser ([sdk] 0x308c50), StartRestorer
- * ([sdk] 0x308d90).  The SDK checks NOTHING before the applet (no device state, no tag presence): it fills the 0x1a8-byte
- * StartParamForAmiiboSettings (mode byte @1: 0 / 1 / 2, flags @2, the caller's device handle @4, TagInfo @0xc, RegisterInfo
- * @0x64) and runs library applet 0xb with StartLibraryAppletEasy ([sdk] 0x3087f0).  The Result is 0x1a073 when the applet
- * could not run or when the first byte of its 0x188-byte answer is 0, and only otherwise are the outputs (device handle from
- * answer+4, the "registered" flag = bit 2, RegisterInfo) written ([sdk] 0x308844..0x308858, 0x308a84..0x308ab8).
- * The applet's answer is the system's: [suyu] am/frontend/applet_cabinet.cpp DisplayCompleted -> Cancel() when the reader's
- * state is neither TagFound nor TagMounted: answer byte 0 (CabinetResult::Cancel).  There is no amiibo settings applet here
- * (and SMO does not import these four), so every call takes that path: 0x1a073 and no output written. */
-static void nfp_settings_applet(Ctx *c) {
-    trace_printf("     nn::nfp amiibo settings applet -> closed without a change (0x1a073)\n");
-    RET(NFP_SETTINGS_CLOSED);
-}
 
 /* ================================================================ registration */
 #define NFP(n) "_ZN2nn3nfp" n
 /* These replace the placeholders nnmisc.c used to hold for the same names (removed there). */
 static const ImportDef applet_imports[] = {
     {"_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", web_ShowOfflineHtmlPage},
-    {"_ZN2nn3web13ShowLobbyPageEPNS0_20LobbyPageReturnValueERKNS0_16ShowLobbyPageArgE", web_ShowLobbyPage},
-    {"_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPageArgE", web_ShowWebPage},
-    {"_ZN2nn3web16ShowYouTubeVideoEPNS0_18WebPageReturnValueERKNS0_19ShowYouTubeVideoArgE", web_ShowYouTubeVideo},
-    {"_ZN2nn2ec24ShowShopAddOnContentListENS_13ApplicationIdE", ec_ShowShop},
-    {"_ZN2nn2ec24ShowShopAddOnContentListENS_13ApplicationIdERKNS_7account10UserHandleE", ec_ShowShop},
-    {"_ZN2nn2ec22ShowShopProductDetailsENS0_5NsUidERKNS_7account10UserHandleE", ec_ShowShop},
-    {"_ZN2nn2ec19ShowShopProductListEPKNS0_5NsUidEiPKcRKNS_7account10UserHandleE", ec_ShowShop},
     {"_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", oe_GetExpectedVolumeBalance},
     {"_ZN2nn2oe24SetExpectedVolumeBalanceEff", oe_SetExpectedVolumeBalance},
     {"_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", swkbd_ShowKeyboard},
-    {NFP("10InitializeEv"), nfp_Initialize}, {NFP("8FinalizeEv"), nfp_Finalize}, {NFP("8GetStateEv"), nfp_GetState},
+    {NFP("10InitializeEv"), nfp_Initialize}, {NFP("8FinalizeEv"), nfp_Finalize},
     {NFP("14GetDeviceStateERKNS0_12DeviceHandleE"), nfp_GetDeviceState}, {NFP("11ListDevicesEPNS0_12DeviceHandleEPii"), nfp_ListDevices},
     {NFP("9GetNpadIdEPjRKNS0_12DeviceHandleE"), nfp_GetNpadId},
-    {NFP("29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE"), nfp_AttachAvailabilityChangeEvent},
     {NFP("19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE"), nfp_AttachEvent},
     {NFP("21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE"), nfp_AttachDeactivateEvent},
     {NFP("14StartDetectionERKNS0_12DeviceHandleE"), nfp_StartDetection}, {NFP("13StopDetectionERKNS0_12DeviceHandleE"), nfp_StopDetection},
     {NFP("5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE"), nfp_Mount},
-    {NFP("5MountERKNS0_12DeviceHandleENS0_9ModelTypeE"), nfp_needs_tag}, {NFP("7UnmountERKNS0_12DeviceHandleE"), nfp_Unmount},
-    {NFP("19OpenApplicationAreaERKNS0_12DeviceHandleEj"), nfp_needs_tag}, {NFP("5FlushERKNS0_12DeviceHandleE"), nfp_needs_tag},
-    {NFP("7RestoreERKNS0_12DeviceHandleE"), nfp_needs_tag}, {NFP("10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE"), nfp_GetTagInfo},
-    {NFP("15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
-    {NFP("13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE"), nfp_needs_tag},
+    {NFP("7UnmountERKNS0_12DeviceHandleE"), nfp_Unmount},
+    {NFP("10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE"), nfp_GetTagInfo},
     {NFP("12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE"), nfp_GetModelInfo},
-    {NFP("18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm"), nfp_GetApplicationArea},
-    {NFP("18SetApplicationAreaERKNS0_12DeviceHandleEPKvm"), nfp_needs_tag},
-    {NFP("21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE"), nfp_needs_tag},
-    {NFP("23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE"), nfp_needs_tag},
-    {NFP("29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"), nfp_settings_applet},
-    {NFP("29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoERKS4_"), nfp_settings_applet},
-    {NFP("13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"), nfp_settings_applet},
-    {NFP("19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"), nfp_settings_applet},
 };
 
 void register_nnapplet_imports(void) {
@@ -812,24 +724,6 @@ int nnapplet_selftest(Ctx *c) {
     ok = ok && c->x[0] == 0 && rd32(P(buf2)) == 0 && strcmp((char *)buf2 + 8, "http://localhost/") == 0 && rd64(P(buf2) + 0x1008) == 17 && guard_ok(buf2, 0x1010, 0x8000, 0xee);
     printf("  web: OfflineHtmlPageReturnValue: constructor 0x14, after the page: exit reason 0, last URL set, 0x1010 bytes: %s\n", ok ? "ok" : "FAILED");
     bad += !ok;
-    memset(buf, 0xee, 0x8000);
-    c->x[0] = P(buf); c->x[1] = P("https://example.invalid/"); h("_ZN2nn3web14ShowWebPageArgC1EPKc")(c);
-    c->x[0] = P(buf); c->x[1] = P("https://example.invalid/cb"); h("_ZN2nn3web14ShowWebPageArg14SetCallbackUrlEPKc")(c);
-    ok = guard_ok(buf, 0x2000, 0x8000, 0xee);
-    memset(buf2, 0xee, 0x8000);
-    c->x[0] = P(buf2); h("_ZN2nn3web18WebPageReturnValueC1Ev")(c);
-    c->x[0] = P(buf2); h("_ZNK2nn3web18WebPageReturnValue16GetWebExitReasonEv")(c);
-    ok = ok && c->x[0] == 0x14;                            /* no TLV yet */
-    c->x[0] = P(buf2); c->x[1] = P(buf); web_ShowWebPage(c);
-    ok = ok && c->x[0] == 0 && guard_ok(buf2, 0x2000, 0x8000, 0xee);
-    c->x[0] = P(buf2); h("_ZNK2nn3web18WebPageReturnValue16GetWebExitReasonEv")(c);      /* the SDK's own getters read what was written */
-    ok = ok && c->x[0] == 0;
-    c->x[0] = P(buf2); h("_ZNK2nn3web18WebPageReturnValue10GetLastUrlEv")(c);
-    ok = ok && c->x[0] && strcmp((const char *)(uintptr_t)c->x[0], "http://localhost/") == 0;
-    c->x[0] = P(buf2); h("_ZN2nn3web35IsMediaPlayerAutoClosedByCompletionERKNS0_18WebPageReturnValueE")(c);
-    ok = ok && (c->x[0] & 1) == 0;
-    printf("  web: WebPageReturnValue TLVs read back by the SDK's getters (exit reason 0, last URL, not auto-closed): %s\n", ok ? "ok" : "FAILED");
-    bad += !ok;
     /* --- nn::swkbd: config (lifted) is 0x4d0 bytes; a scripted answer goes through ShowKeyboard */
     memset(buf, 0xee, 0x8000);
     c->x[0] = P(buf); c->x[1] = 0; h("_ZN2nn5swkbd10MakePresetEPNS0_14KeyboardConfigENS0_6PresetE")(c);
@@ -878,64 +772,18 @@ int nnapplet_selftest(Ctx *c) {
     uint64_t handle = 0xeeeeeeeeeeeeeeeeull, ev[8];
     int count = -1;
     nfp_Finalize(c);
-    nfp_GetState(c); ok = c->x[0] == 0;
-    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == 5;
+    c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = c->x[0] == 5;
     nfp_Initialize(c);
-    nfp_GetState(c); ok = ok && c->x[0] == 1;
     c->x[0] = P(&handle); c->x[1] = P(&count); c->x[2] = 1; nfp_ListDevices(c); ok = ok && c->x[0] == 0 && count == 1 && handle == 0;
     c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == 0;
     c->x[0] = P(&handle); nfp_StartDetection(c); ok = ok && c->x[0] == 0;
     c->x[0] = P(&handle); nfp_GetDeviceState(c); ok = ok && c->x[0] == 1;
-    c->x[0] = P(&handle); c->x[1] = 0; nfp_needs_tag(c); ok = ok && c->x[0] == NFP_WRONG_STATE;
     c->x[0] = P(&handle); nfp_StopDetection(c); ok = ok && c->x[0] == 0;
     c->x[0] = P(ev); c->x[1] = P(&handle); nfp_AttachEvent(c); ok = ok && c->x[0] == 0;
     nfp_Finalize(c);
-    printf("  nfp: Initialize / ListDevices (1 reader) / StartDetection / StopDetection state machine, tag calls refused: %s\n", ok ? "ok" : "FAILED");
+    printf("  nfp: Initialize / ListDevices (1 reader) / StartDetection / StopDetection state machine: %s\n", ok ? "ok" : "FAILED");
     bad += !ok;
     bad += nfp_amiibo_selftest(c);
-    {   /* amiibo settings applets: 0x1a073 and no output written ([sdk] 0x308844..0x308858, 0x308a84) */
-        static const char *const names[4] = {
-            NFP("29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"),
-            NFP("29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoERKS4_"),
-            NFP("13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"),
-            NFP("19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE")};
-        uint8_t out_handle[8], out_flag[1], out_reg[0x100], in_a[0x100], in_b[0x100], in_c[0x100];
-        ok = 1;
-        for (int i = 0; i < 4; i++) {
-            ImportFn f = import_lookup(names[i]);
-            memset(out_handle, 0x5a, sizeof out_handle); memset(out_flag, 0x5a, sizeof out_flag); memset(out_reg, 0x5a, sizeof out_reg);
-            memset(in_a, 0, sizeof in_a); memset(in_b, 0, sizeof in_b); memset(in_c, 0, sizeof in_c);
-            c->x[0] = P(out_handle);
-            if (i < 2) { c->x[1] = P(out_flag); c->x[2] = P(out_reg); c->x[3] = P(in_a); c->x[4] = P(in_b); c->x[5] = P(in_c); }
-            else { c->x[1] = P(in_a); c->x[2] = P(in_b); }
-            if (!f) { ok = 0; continue; }
-            f(c);
-            ok = ok && c->x[0] == 0x1a073 && out_flag[0] == 0x5a;
-            for (int k = 0; k < 8; k++) ok = ok && out_handle[k] == 0x5a;
-            for (int k = 0; k < 0x100; k++) ok = ok && out_reg[k] == 0x5a;
-        }
-        printf("  nfp: the 4 amiibo settings applets with no amiibo: 0x1a073, device handle / flag / RegisterInfo untouched: %s\n", ok ? "ok" : "FAILED");
-        bad += !ok;
-    }
-    {   /* nn::ec shop pages: void, nothing written through any argument ([sdk] 0x18cad0, 0x1907a0, 0x1933a0) */
-        uint8_t arg[0x40], uid[0x20];
-        memset(arg, 0x5a, sizeof arg); memset(uid, 0x5a, sizeof uid);
-        c->x[0] = P(arg); c->x[1] = 2; c->x[2] = P(arg + 0x20); c->x[3] = P(uid); ec_ShowShop(c);
-        ok = 1;
-        for (int k = 0; k < 0x40; k++) ok = ok && arg[k] == 0x5a;
-        for (int k = 0; k < 0x20; k++) ok = ok && uid[k] == 0x5a;
-        printf("  ec: ShowShop* returns and writes nothing: %s\n", ok ? "ok" : "FAILED");
-        bad += !ok;
-    }
-    {   /* nn::mii::AppendMii cancelled: 0xe7e, *outIndex untouched ([sdk] 0x300bc4, 0x301040) */
-        ImportFn f = import_lookup("_ZN2nn3mii9AppendMiiEPi");
-        int32_t index = 0x5a5a5a5a;
-        c->x[0] = P(&index);
-        if (f) f(c);
-        ok = f && c->x[0] == 0xe7e && index == 0x5a5a5a5a;
-        printf("  mii: AppendMii answered as cancelled: 0xe7e, index untouched: %s\n", ok ? "ok" : "FAILED");
-        bad += !ok;
-    }
     /* --- nn::oe */
     float a = -1, b = -1, a0 = g_volume_main, b0 = g_volume_library;
     c->v[0].f[0] = 0.5f; c->v[1].f[0] = 3.0f; oe_SetExpectedVolumeBalance(c);

@@ -1,15 +1,16 @@
 /* C++ exception RUNTIME (implemented in nncxxrt.c). STABLE INTERFACE for the unwinder (nnunwind.c).
  *
  * Division of work
- *   runtime (this header): exception objects, the per-context throw state, the Itanium ABI entry points the guest
- *       calls (__cxa_throw, __cxa_rethrow, _Unwind_Resume, __cxa_begin_catch, __cxa_end_catch, ...), the table of
- *       loaded images with their .eh_frame_hdr, and the PERSONALITY as a query: "for this call-site pc and this
- *       exception, is there a landing pad, which selector, clean-up or handler?".
+ *   runtime (this header): exception objects, the per-context throw state, the throw (eh_throw, for host code that
+ *       throws on behalf of the C++ library), the table of loaded images with their .eh_frame_hdr, and the
+ *       PERSONALITY as a query: "for this call-site pc and this exception, is there a landing pad, which selector,
+ *       clean-up or handler?". The game imports none of the Itanium ABI's throw / catch entry points (__cxa_throw,
+ *       __cxa_rethrow, __cxa_begin_catch, __cxa_end_catch, _Unwind_Resume): the runtime has no handlers for them.
  *   unwinder (not here): finds the guest frames, restores the guest registers of the frame that owns the pad and
  *       transfers control to the pad (resume entries of the lifted code).
  *
  * Flow
- *   1. The guest calls __cxa_throw / __cxa_rethrow / std::rethrow_exception / a libc++ __throw_* helper. The runtime
+ *   1. The guest calls a libc++ __throw_* helper (libcxx.c), or a stream operation throws (nniostream.c). The runtime
  *      fills the exception header, makes it the exception IN FLIGHT of that Ctx and calls the registered raise
  *      function: raise(c, EH_RAISE_THROW).
  *   2. The unwinder walks the guest frames from the innermost one. For each frame with return address `ret` it asks

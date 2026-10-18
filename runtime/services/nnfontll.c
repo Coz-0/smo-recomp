@@ -1062,7 +1062,7 @@ static void fe_Decode(Ctx *c) {
 
 #define F(n) "_ZN2nn6fontll18ScalableFontEngine" n
 static const ImportDef fontll_imports[] = {
-    {F("C1Ev"), fe_ctor}, {F("C2Ev"), fe_ctor}, {F("10InitializeEPvj"), fe_Initialize}, {F("8FinalizeEv"), fe_Finalize}, {F("8GetErrorEv"), fe_GetError},
+    {F("C1Ev"), fe_ctor}, {F("10InitializeEPvj"), fe_Initialize}, {F("8FinalizeEv"), fe_Finalize}, {F("8GetErrorEv"), fe_GetError},
     {F("22GetPointerToWorkBufferEv"), fe_GetPointerToWorkBuffer}, {F("8LoadFontEPcPKvjj"), fe_LoadFont}, {F("7SetFontEPc"), fe_SetFont},
     {F("8SetScaleEiiii"), fe_SetScale}, {F("13SetBoldWeightEi"), fe_SetBoldWeight}, {F("15SetOutlineWidthEt"), fe_SetOutlineWidth},
     {F("8SetFlagsENS1_5FlagsE"), fe_SetFlags}, {F("11SetAutoHintEb"), fe_SetAutoHint}, {F("14GetFontMetricsEPNS0_7MetricsE"), fe_GetFontMetrics},

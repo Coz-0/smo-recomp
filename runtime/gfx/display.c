@@ -443,9 +443,9 @@ static void vi_GetDisplayVsyncEvent(Ctx *c) {         /* (SystemEventType *out, 
 static void nothing(Ctx *c) { (void)c; }
 
 static const ImportDef vi_imports[] = {
-    {"_ZN2nn2vi10InitializeEv", nothing}, {"_ZN2nn2vi8FinalizeEv", nothing},
-    {"_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", vi_OpenDefaultDisplay}, {"_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE", nothing},
-    {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", vi_CreateLayer}, {"_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", nothing},
+    {"_ZN2nn2vi10InitializeEv", nothing},
+    {"_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", vi_OpenDefaultDisplay},
+    {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", vi_CreateLayer},
     {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_GetNativeWindow},
     {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", vi_GetDisplayVsyncEvent},
 };

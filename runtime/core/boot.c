@@ -21,20 +21,6 @@
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define P(n) ((void *)(uintptr_t)c->x[n])
 
-/* ---- C heap */
-static void i_malloc(Ctx *c) { RET(_aligned_malloc(A0 ? (size_t)A0 : 1, 16)); }
-static void i_free(Ctx *c) { _aligned_free(P(0)); }
-static void i_calloc(Ctx *c) { size_t n = (size_t)(A0 * A1); void *p = _aligned_malloc(n ? n : 1, 16); if (p) memset(p, 0, n); RET(p); }
-static void i_realloc(Ctx *c) { RET(_aligned_realloc(P(0), A1 ? (size_t)A1 : 1, 16)); }
-static void i_aligned_alloc(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1, A0 < 16 ? 16 : (size_t)A0)); }
-static void i_new_aligned(Ctx *c) { RET(_aligned_malloc(A0 ? (size_t)A0 : 1, A1 < 16 ? 16 : (size_t)A1)); }
-static void i_posix_memalign(Ctx *c) {
-    void *p = _aligned_malloc(A2 ? (size_t)A2 : 1, A1 < 16 ? 16 : (size_t)A1);
-    wr64(A0, (uint64_t)p);
-    RET(p ? 0 : 12);
-}
-static void i_usable_size(Ctx *c) { RET(A0 ? _aligned_msize(P(0), 16, 0) : 0); }
-
 /* ---- C strings and memory */
 static void i_memcpy(Ctx *c) { memcpy(P(0), P(1), (size_t)A2); }
 static void i_memmove(Ctx *c) { memmove(P(0), P(1), (size_t)A2); }
@@ -55,45 +41,27 @@ static void i_strstr(Ctx *c) { RET(strstr(P(0), P(1))); }
 /* ---- C++ runtime */
 static void i_guard_acquire(Ctx *c) { RET(rd8(A0) == 0); }
 static void i_guard_release(Ctx *c) { wr8(A0, 1); }
-static void i_ret0(Ctx *c) { RET(0); }
 static void i_abort(Ctx *c) { guest_trap("guest called abort()", c->x[30] - 4); }
 
 /* ---- math: arguments and result in v0/v1 */
 #define M1F(n, fn) static void n(Ctx *c) { float r = fn(c->v[0].f[0]); vzero(&c->v[0]); c->v[0].f[0] = r; }
 #define M2F(n, fn) static void n(Ctx *c) { float r = fn(c->v[0].f[0], c->v[1].f[0]); vzero(&c->v[0]); c->v[0].f[0] = r; }
-#define M1D(n, fn) static void n(Ctx *c) { double r = fn(c->v[0].df[0]); vzero(&c->v[0]); c->v[0].df[0] = r; }
 #define M2D(n, fn) static void n(Ctx *c) { double r = fn(c->v[0].df[0], c->v[1].df[0]); vzero(&c->v[0]); c->v[0].df[0] = r; }
 M1F(m_sinf, sinf) M1F(m_cosf, cosf) M1F(m_tanf, tanf) M1F(m_asinf, asinf) M1F(m_acosf, acosf) M1F(m_atanf, atanf)
-M1F(m_expf, expf) M1F(m_exp2f, exp2f) M1F(m_logf, logf) M1F(m_log2f, log2f) M1F(m_log10f, log10f) M1F(m_sqrtf, sqrtf)
-M1F(m_floorf, floorf) M1F(m_ceilf, ceilf) M1F(m_roundf, roundf) M1F(m_truncf, truncf) M1F(m_fabsf, fabsf)
+M1F(m_expf, expf) M1F(m_exp2f, exp2f) M1F(m_logf, logf) M1F(m_log10f, log10f) M1F(m_sqrtf, sqrtf)
 M2F(m_atan2f, atan2f) M2F(m_powf, powf) M2F(m_fmodf, fmodf)
-M1D(m_sin, sin) M1D(m_cos, cos) M1D(m_tan, tan) M1D(m_asin, asin) M1D(m_acos, acos) M1D(m_atan, atan)
-M1D(m_exp, exp) M1D(m_log, log) M1D(m_log2, log2) M1D(m_log10, log10) M1D(m_sqrt, sqrt)
-M1D(m_floor, floor) M1D(m_ceil, ceil) M1D(m_round, round) M1D(m_trunc, trunc) M1D(m_fabs, fabs)
-M2D(m_atan2, atan2) M2D(m_pow, pow) M2D(m_fmod, fmod)
+M2D(m_pow, pow)
 
 static const ImportDef base_imports[] = {
-    {"malloc", i_malloc}, {"free", i_free}, {"calloc", i_calloc}, {"realloc", i_realloc},
-    {"aligned_alloc", i_aligned_alloc}, {"memalign", i_aligned_alloc}, {"posix_memalign", i_posix_memalign},
-    {"malloc_usable_size", i_usable_size},
-    {"_Znwm", i_malloc}, {"_Znam", i_malloc}, {"_ZdlPv", i_free}, {"_ZdaPv", i_free},
-    {"_ZnwmRKSt9nothrow_t", i_malloc}, {"_ZnamRKSt9nothrow_t", i_malloc},
-    {"_ZdlPvm", i_free}, {"_ZdaPvm", i_free}, {"_ZdlPvRKSt9nothrow_t", i_free}, {"_ZdaPvRKSt9nothrow_t", i_free},
-    {"_ZnwmSt11align_val_t", i_new_aligned}, {"_ZnamSt11align_val_t", i_new_aligned},
-    {"_ZdlPvSt11align_val_t", i_free}, {"_ZdaPvSt11align_val_t", i_free},
     {"memcpy", i_memcpy}, {"memmove", i_memmove}, {"memset", i_memset}, {"memcmp", i_memcmp}, {"memchr", i_memchr},
     {"strlen", i_strlen}, {"strnlen", i_strnlen}, {"strcmp", i_strcmp}, {"strncmp", i_strncmp}, {"strcpy", i_strcpy},
     {"strncpy", i_strncpy}, {"strcat", i_strcat}, {"strchr", i_strchr}, {"strrchr", i_strrchr}, {"strstr", i_strstr},
-    {"__cxa_guard_acquire", i_guard_acquire}, {"__cxa_guard_release", i_guard_release}, {"__cxa_guard_abort", i_ret0},
-    {"__cxa_atexit", i_ret0}, {"abort", i_abort},
+    {"__cxa_guard_acquire", i_guard_acquire}, {"__cxa_guard_release", i_guard_release},
+    {"abort", i_abort},
     {"sinf", m_sinf}, {"cosf", m_cosf}, {"tanf", m_tanf}, {"asinf", m_asinf}, {"acosf", m_acosf}, {"atanf", m_atanf},
-    {"expf", m_expf}, {"exp2f", m_exp2f}, {"logf", m_logf}, {"log2f", m_log2f}, {"log10f", m_log10f}, {"sqrtf", m_sqrtf},
-    {"floorf", m_floorf}, {"ceilf", m_ceilf}, {"roundf", m_roundf}, {"truncf", m_truncf}, {"fabsf", m_fabsf},
+    {"expf", m_expf}, {"exp2f", m_exp2f}, {"logf", m_logf}, {"log10f", m_log10f}, {"sqrtf", m_sqrtf},
     {"atan2f", m_atan2f}, {"powf", m_powf}, {"fmodf", m_fmodf},
-    {"sin", m_sin}, {"cos", m_cos}, {"tan", m_tan}, {"asin", m_asin}, {"acos", m_acos}, {"atan", m_atan},
-    {"exp", m_exp}, {"log", m_log}, {"log2", m_log2}, {"log10", m_log10}, {"sqrt", m_sqrt},
-    {"floor", m_floor}, {"ceil", m_ceil}, {"round", m_round}, {"trunc", m_trunc}, {"fabs", m_fabs},
-    {"atan2", m_atan2}, {"pow", m_pow}, {"fmod", m_fmod},
+    {"pow", m_pow},
 };
 
 void register_sdk_imports(void);         /* nnsdk.c */
@@ -111,7 +79,7 @@ void register_fontll_imports(void);      /* nnfontll.c */
 void register_movie_imports(void);       /* nnmovie.c */
 void register_misc_imports(void);        /* nnmisc.c */
 void register_audio_imports(void);       /* nnaudio.c */
-void register_service_imports(void);        /* nnservices.c: sdklift_*.c, nnmii.c, nnapplet.c, nnalbum.c, nnnet.c, nnfsdir.c */
+void register_service_imports(void);        /* nnservices.c: sdklift_*.c, nnapplet.c, nnnet.c, nnfsdir.c */
 void register_movie_mf_imports(void);    /* nnmovie_mf.c */
 void cxxrt_install_data(void);           /* nncxxrt.c: vtables / typeinfo objects of the C++ runtime (before runtime_init) */
 void register_unwind_imports(void);      /* nnunwind.c: C++ exception unwinding through lifted module code */
@@ -268,7 +236,6 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     printf("[phase 3] nnMain\n");
     trace_printf("=== phase 3: nnMain\n");
     call_guest(&c, NN_MAIN);
-    { void clib_run_atexit(Ctx *c); clib_run_atexit(&c); }   /* clib.c: functions registered with atexit, as a normal exit does */
 
     printf("\nnnMain returned.\n");
     print_import_summary(stdout);

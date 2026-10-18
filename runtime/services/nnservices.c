@@ -1,11 +1,9 @@
-/* The service families: registration, a few SDK functions of their own (zlib, image, the lifted C library and
- * allocators), and the self-test of all of them.
+/* The service families: registration, a few SDK functions of their own (image, the lifted C library and allocators),
+ * and the self-test of all of them.
  *
  *   sdklift_rt.c / sdklift_gen.c   code lifted out of the real SDK module (pure functions, exact behaviour)
- *   nnmii.c      nn::mii Database (service side driven by lifted SDK code), AppendMii
- *   nnapplet.c   library applets: nn::web, nn::swkbd, nn::ec shop pages, amiibo settings; nn::nfp; nn::oe volume
- *   nnalbum.c    nn::album (screenshots, movie maker)
- *   nnnet.c      nn::ssl C API, nn::socket leftovers, nn::bcat, nn::friends, nn::account, nn::ldn, nn::ec accessor, glslc
+ *   nnapplet.c   library applets: nn::web offline pages, nn::swkbd; nn::nfp; nn::oe volume
+ *   nnnet.c      nn::ssl C API, nn::socket leftovers, nn::bcat, nn::friends, nn::account, glslc
  *   nnfsdir.c    nn::fs directory functions
  *
  * SMO_SDK_SELFTEST=1: run the tests below right after registration and exit (exit code = failures).
@@ -17,14 +15,10 @@
 #include <windows.h>
 #include "sdklift.h"
 
-void register_nnmii_imports(void);
 void register_nnapplet_imports(void);
-void register_nnalbum_imports(void);
 void register_nnnet_imports(void);
 void register_nnfsdir_imports(void);
-int nnmii_selftest(Ctx *c);
 int nnapplet_selftest(Ctx *c);
-int nnalbum_selftest(Ctx *c);
 int nnnet_selftest(Ctx *c);
 int nnfsdir_selftest(Ctx *c);
 int nnfs_selftest(Ctx *c);
@@ -32,8 +26,6 @@ int bcat_selftest(Ctx *c);
 int nnhid_selftest(Ctx *c);
 int nvn_sdk_selftest(Ctx *c);
 int nntime_selftest(Ctx *c);
-int libc2_stdio_selftest(Ctx *c);       /* nnstdio.inc: musl's stdio */
-void libc2_install_musl_stdio(void);
 void nnnet_register_final(void);
 
 #define P(v) ((uint64_t)(uintptr_t)(v))
@@ -43,37 +35,6 @@ static ImportFn handler(const char *name) {
     ImportFn f = import_lookup(name);
     if (!f) { printf("  no handler registered for %s\n", name); report_and_exit(3); }
     return f;
-}
-
-/* ---- nn::util::DecompressZlib(void *dst, size_t dstSize, const void *src, size_t srcSize, void *work, size_t workSize) -> bool */
-static int zlib_selftest(Ctx *c) {
-    ImportFn f = handler("_ZN2nn4util14DecompressZlibEPvmPKvmS1_m");
-    int bad = 0, n = (int)(sizeof zvecs / sizeof zvecs[0]);
-    size_t work_size = 0x10000;
-    uint8_t *work = malloc(work_size), *out = malloc(0x20000);
-    for (int i = 0; i < n; i++) {
-        memset(out, 0xcd, 0x20000);
-        c->x[0] = P(out); c->x[1] = zvecs[i].plain_size; c->x[2] = P(zvecs[i].comp); c->x[3] = zvecs[i].comp_size;
-        c->x[4] = P(work); c->x[5] = work_size;
-        f(c);
-        int ok = (c->x[0] & 1) && memcmp(out, zvecs[i].plain, zvecs[i].plain_size) == 0;
-        for (int k = 0; k < 32; k++) if (out[zvecs[i].plain_size + k] != 0xcd) ok = 0;         /* nothing past dstSize */
-        printf("  zlib: vector %-7s %5u -> %5u bytes: %s\n", zvecs[i].name, zvecs[i].comp_size, zvecs[i].plain_size, ok ? "ok" : "FAILED");
-        bad += !ok;
-    }
-    c->x[0] = P(out); c->x[1] = ZVEC_CORRUPT_PLAIN_SIZE; c->x[2] = P(zvec_corrupt); c->x[3] = sizeof zvec_corrupt; c->x[4] = P(work); c->x[5] = work_size;
-    f(c);
-    printf("  zlib: corrupted stream is refused: %s\n", (c->x[0] & 1) ? "FAILED (accepted)" : "ok");
-    bad += (int)(c->x[0] & 1);
-    c->x[0] = P(out); c->x[1] = 100; c->x[2] = P(zvecs[0].comp); c->x[3] = zvecs[0].comp_size; c->x[4] = P(work); c->x[5] = work_size;
-    memset(out, 0xcd, 0x20000);
-    f(c);
-    int ok = !(c->x[0] & 1);
-    for (int k = 0; k < 32; k++) if (out[100 + k] != 0xcd) ok = 0;
-    printf("  zlib: output buffer too small is refused without overrun: %s\n", ok ? "ok" : "FAILED");
-    bad += !ok;
-    free(work); free(out);
-    return bad;
 }
 
 /* ---- nn::image */
@@ -211,7 +172,6 @@ static void dump_unregistered(void) {
 #include <math.h>
 static float callf1(Ctx *c, ImportFn f, float a) { memset(&c->v[0], 0, 16); c->v[0].f[0] = a; f(c); return c->v[0].f[0]; }
 static float callf2(Ctx *c, ImportFn f, float a, float b) { memset(&c->v[0], 0, 32); c->v[0].f[0] = a; c->v[1].f[0] = b; f(c); return c->v[0].f[0]; }
-static double calld1(Ctx *c, ImportFn f, double a) { memset(&c->v[0], 0, 16); c->v[0].df[0] = a; f(c); return c->v[0].df[0]; }
 static double calld2(Ctx *c, ImportFn f, double a, double b) { memset(&c->v[0], 0, 32); c->v[0].df[0] = a; c->v[1].df[0] = b; f(c); return c->v[0].df[0]; }
 static long long ulp_f(float a, float b) {
     int32_t x, y;
@@ -237,14 +197,13 @@ static int libc_selftest(Ctx *c) {
     int bad = 0;
     static const struct { const char *name; float (*ref)(float); float lo, hi; } f1[] = {
         {"sinf", sinf, -20, 20}, {"cosf", cosf, -20, 20}, {"tanf", tanf, -1.5f, 1.5f}, {"asinf", asinf, -1, 1}, {"acosf", acosf, -1, 1},
-        {"atanf", atanf, -50, 50}, {"expf", expf, -20, 20}, {"exp2f", exp2f, -30, 30}, {"logf", logf, 1e-6f, 1e6f}, {"log2f", log2f, 1e-6f, 1e6f},
-        {"log10f", log10f, 1e-6f, 1e6f}, {"sqrtf", sqrtf, 0, 1e6f}, {"floorf", floorf, -1000, 1000}, {"ceilf", ceilf, -1000, 1000}, {"erfcf", erfcf, -3, 6},
+        {"atanf", atanf, -50, 50}, {"expf", expf, -20, 20}, {"exp2f", exp2f, -30, 30}, {"logf", logf, 1e-6f, 1e6f},
+        {"log10f", log10f, 1e-6f, 1e6f}, {"sqrtf", sqrtf, 0, 1e6f},
     };
     static const struct { const char *name; float (*ref)(float, float); float lo, hi; } f2[] = {
         {"atan2f", atan2f, -10, 10}, {"powf", powf, 0.01f, 12}, {"fmodf", fmodf, -100, 100},
     };
-    static const struct { const char *name; double (*ref)(double); double lo, hi; } d1[] = { {"sin", sin, -20, 20}, {"sqrt", sqrt, 0, 1e9}, {"exp2", exp2, -30, 30} };
-    static const struct { const char *name; double (*ref)(double, double); double lo, hi; } d2[] = { {"pow", pow, 0.01, 12}, {"fmod", fmod, -100, 100} };
+    static const struct { const char *name; double (*ref)(double, double); double lo, hi; } d2[] = { {"pow", pow, 0.01, 12} };
     enum { N = 4000 };
     for (unsigned k = 0; k < sizeof f1 / sizeof f1[0]; k++) {
         ImportFn f = handler(f1[k].name);
@@ -269,18 +228,6 @@ static int libc_selftest(Ctx *c) {
             if (u > worst) worst = u;
         }
         printf("  libm: %-7s %d of %d results differ from the host CRT in the last bits (largest %lld ulp): %s\n", f2[k].name, differ, n, worst, worst <= 4 ? "ok" : "FAILED");
-        bad += worst > 4;
-    }
-    for (unsigned k = 0; k < sizeof d1 / sizeof d1[0]; k++) {
-        ImportFn f = handler(d1[k].name);
-        long long worst = 0; int differ = 0;
-        for (int i = 0; i <= N; i++) {
-            double x = d1[k].lo + (d1[k].hi - d1[k].lo) * (double)i / N;
-            long long u = ulp_d(calld1(c, f, x), d1[k].ref(x));
-            if (u) differ++;
-            if (u > worst) worst = u;
-        }
-        printf("  libm: %-7s %d of %d results differ from the host CRT in the last bits (largest %lld ulp): %s\n", d1[k].name, differ, N + 1, worst, worst <= 4 ? "ok" : "FAILED");
         bad += worst > 4;
     }
     for (unsigned k = 0; k < sizeof d2 / sizeof d2[0]; k++) {
@@ -312,9 +259,8 @@ static int libc_selftest(Ctx *c) {
         c->x[0] = P(b); c->x[1] = P(a); c->x[2] = 20; handler("memcmp")(c); ok &= (int)c->x[0] == 0;
         c->x[0] = P("  -1234xyz"); handler("atoi")(c); ok &= (int)c->x[0] == -1234;
         c->x[0] = P("-0x1f"); c->x[1] = 0; c->x[2] = 0; handler("strtol")(c); ok &= (int64_t)c->x[0] == -31;
-        c->x[0] = P("3.25e2"); handler("atof")(c); ok &= c->v[0].df[0] == 325.0;
         c->x[0] = 'Q'; handler("tolower")(c); ok &= (int)c->x[0] == 'q';
-        printf("  libc: strlen strcpy strcmp strstr strchr memmove memset memcmp atoi strtol atof tolower: %s\n", ok ? "ok" : "FAILED");
+        printf("  libc: strlen strcpy strcmp strstr strchr memmove memset memcmp atoi strtol tolower: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
     }
     {   /* snprintf with integer, string and floating-point arguments (AArch64 variadic call: x3.., v0..) */
@@ -326,14 +272,6 @@ static int libc_selftest(Ctx *c) {
         snprintf(ref, sizeof ref, "%d|%5.2f|%s|%x|%lld|%e|%g", -42, 3.14159, "str", 0xbeef, -1234567890123ll, 12345.678, 0.0001);
         int ok = !strcmp(out, ref) && (int)c->x[0] == (int)strlen(ref);
         printf("  libc: snprintf \"%s\": %s\n", out, ok ? "ok" : "FAILED");
-        bad += !ok;
-    }
-    {   /* musl's rand: seed = 6364136223846793005 * seed + 1, result = seed >> 33; srand(s) sets seed = s - 1 */
-        uint64_t seed = 12345 - 1;
-        int ok = 1;
-        c->x[0] = 12345; handler("srand")(c);
-        for (int i = 0; i < 8; i++) { seed = 6364136223846793005ull * seed + 1; handler("rand")(c); ok &= (uint32_t)c->x[0] == (uint32_t)(seed >> 33); }
-        printf("  libc: srand(12345) + 8 x rand follow musl's generator: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
     }
     {   /* qsort with a guest callback, errno location, tick conversion, calendar, MD5, frame heap */
@@ -352,14 +290,10 @@ static int libc_selftest(Ctx *c) {
         c->x[0] = 0x7fffffffffull; handler("_ZN2nn2os17ConvertToTimeSpanENS0_4TickE")(c); ok &= c->x[0] == (uint64_t)(((unsigned __int128)0x7fffffffffull * 1000000000ull) / 19200000ull);
         printf("  nn::os: tick <-> time span conversions are exact integers: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
-        int64_t posix = 1700000000;                          /* 2023-11-14 22:13:20 UTC, a Tuesday */
-        c->x[0] = P(&posix); handler("_ZN2nn4time19ToCalendarTimeInUtcERKNS0_9PosixTimeE")(c);
-        uint64_t cal = c->x[0];
-        ok = (uint16_t)cal == 2023 && (uint8_t)(cal >> 16) == 11 && (uint8_t)(cal >> 24) == 14 && (uint8_t)(cal >> 32) == 22 && (uint8_t)(cal >> 40) == 13 && (uint8_t)(cal >> 48) == 20;
-        c->x[0] = P(&cal); handler("_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE")(c); ok &= (int64_t)c->x[0] == posix;
-        c->x[0] = 2023; c->x[1] = 11; c->x[2] = 14; handler("_ZN2nn4time12GetDayOfWeekEiii")(c); ok &= (int)c->x[0] == 2;
-        c->x[0] = 2023; c->x[1] = 2; c->x[2] = 29; handler("_ZN2nn4time11IsValidDateEiii")(c); ok &= !(c->x[0] & 1);
-        printf("  nn::time: calendar <-> posix in UTC, day of week, date validity: %s\n", ok ? "ok" : "FAILED");
+        /* CalendarTime { u16 year, u8 month, day, hour, minute, second }: 2023-11-14 22:13:20 UTC = posix 1700000000 */
+        uint64_t cal = 2023 | 11ull << 16 | 14ull << 24 | 22ull << 32 | 13ull << 40 | 20ull << 48;
+        c->x[0] = P(&cal); handler("_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE")(c); ok = (int64_t)c->x[0] == 1700000000;
+        printf("  nn::time: ToPosixTimeFromUtc(2023-11-14 22:13:20) = 1700000000: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
         uint8_t *md5 = calloc(1, 0x400), digest[16];
         static const uint8_t md5_abc[16] = {0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72};
@@ -420,7 +354,6 @@ static void os_FreeMemoryBlock(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0],
 static void os_SetMemoryPermission(Ctx *c) {
     DWORD old, prot = (uint32_t)c->x[2] == 3 ? PAGE_READWRITE : (uint32_t)c->x[2] == 1 ? PAGE_READONLY : PAGE_NOACCESS;
     if ((uint32_t)c->x[2] != 0 && (uint32_t)c->x[2] != 1 && (uint32_t)c->x[2] != 3) guest_trap("nn::os::SetMemoryPermission: invalid permission", c->x[30] - 4);
-    { void cxxrt_mem_changed(void); cxxrt_mem_changed(); }      /* nncxxrt.c: remembered readable checks are forgotten */
     if (!VirtualProtect((void *)(uintptr_t)c->x[0], (SIZE_T)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
 }
 static void os_SetMemoryAttribute(Ctx *c) { (void)c; }
@@ -513,21 +446,16 @@ static void selftest(void) {
     bad += missing;
     bad += libc_selftest(c);
     bad += mem_selftest(c);
-    bad += zlib_selftest(c);
     bad += jpeg_selftest(c);
-    bad += nnmii_selftest(c);
     bad += nnnet_selftest(c);
     bad += nnapplet_selftest(c);
-    bad += nnalbum_selftest(c);
     bad += nnfsdir_selftest(c);
     bad += nnfs_selftest(c);
     bad += bcat_selftest(c);
     bad += nnhid_selftest(c);
     bad += nvn_sdk_selftest(c);
     bad += nntime_selftest(c);
-    bad += libc2_stdio_selftest(c);
-    { int libc2_cxx_selftest(Ctx *c); bad += libc2_cxx_selftest(c); }      /* nnstdio.inc: libc++ leftovers */
-    { int pctl_protect_selftest(Ctx *c); bad += pctl_protect_selftest(c); }  /* nnmisc.c: pctl answers, image protection */
+    { int image_protect_selftest(Ctx *c); bad += image_protect_selftest(c); }  /* nnmisc.c: image protection */
     printf("SDK self-test: %d failure(s)\n", bad);
     fflush(stdout);
     ExitProcess((UINT)bad);
@@ -558,15 +486,11 @@ static void install_lifted(void) {
 
 void register_service_imports(void) {
     register_sdklift_imports();
-    register_nnmii_imports();
     register_nnapplet_imports();
-    register_nnalbum_imports();
     register_nnnet_imports();
     register_nnfsdir_imports();
-    if (sdk_image_ready()) sdk_install("_ZN2nn4util14DecompressZlibEPvmPKvmS1_m");   /* replaces nnsdk.c's trap with the SDK's zlib */
     install_mem_overrides();
     install_lifted();
-    libc2_install_musl_stdio();
     nnnet_register_final();
     dump_unregistered();
     if (getenv("SMO_SDK_SELFTEST")) selftest();

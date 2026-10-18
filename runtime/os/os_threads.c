@@ -25,18 +25,12 @@ typedef struct Obj {
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
     int signaled, autoclear;                 /* events */
-    int count, max;                          /* semaphores */
     uint64_t *buf, cap, len, head;           /* message queues */
     HANDLE thread;                           /* threads */
     uint64_t fn, arg, stack, stack_size, name;
     int priority, finished;
-    void *fiber;                             /* fibers */
-    uint64_t tp;                             /* fibers: thread block (tpidr) of the host thread that runs the fiber now */
     int ideal_core, core_set;                /* threads: nn::os ideal core and affinity mask as the game set them */
     uint64_t core_mask;
-    uint64_t target, user;                   /* multi-wait holders */
-    struct Obj *holders[64];                 /* multi-wait */
-    int holder_count;
     struct Obj *alias;                       /* system event attached by handle: the event object it shares */
     uint32_t rhandle, whandle;               /* kernel-style handles of a system event created here */
 } Obj;
@@ -75,9 +69,8 @@ static Obj *obj_raw(uint64_t key) {
 static void obj_reset(uint64_t key) {
     Obj *o = obj(key);
     EnterCriticalSection(&o->cs);
-    o->signaled = o->autoclear = o->count = o->max = 0;
+    o->signaled = o->autoclear = 0;
     o->len = o->head = 0;
-    o->holder_count = 0;
     LeaveCriticalSection(&o->cs);
 }
 
@@ -108,7 +101,7 @@ static void sleep_ns(int64_t ns) {
         QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
         double ms = (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)fq.QuadPart, asked = (double)ns / 1e6;
         {   /* per thread and frame: how many sleeps, asked and slept in all; a line when a frame after 1900 had over 8 ms of them */
-            static __declspec(thread) long long fr0, cnt, zero; static __declspec(thread) double a_sum, s_sum, a_max; static LONG nf;
+            static __declspec(thread) long long fr0, cnt; static __declspec(thread) double a_sum, s_sum, a_max; static LONG nf;
             long long fr = nvn_front_frame_next();
             if (fr != fr0) {
                 if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
@@ -223,8 +216,6 @@ static __declspec(thread) uint64_t t_tls[64];
 static uint64_t g_tls_dtor[64];                       /* guest destructor of each slot, 0 = none */
 static volatile LONG g_tls_used[64];
 static void tls_run_destructors(Ctx *c);
-static __declspec(thread) uint64_t t_fiber;           /* guest FiberType* currently running, 0 if none */
-static __declspec(thread) void *t_thread_fiber;       /* host fiber of the thread itself */
 static uint8_t g_main_thread[0x400];
 uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; }   /* boot.c: stored at thread block +0x1f8, as [sdk 0x3349dc] does */
 uint64_t g_main_stack_base, g_main_stack_size;        /* set by boot.c */
@@ -259,7 +250,6 @@ int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h) {
     *c = g_threads[i].c; *name = g_threads[i].o->name ? (const char *)(uintptr_t)g_threads[i].o->name : NULL; *h = g_threads[i].o->finished ? NULL : g_threads[i].o->thread;
     return 1;
 }
-void hitch_cur_ctx(Ctx *c);
 /* Name of the guest thread running on host thread `tid`, or NULL (nvn_gl.c: CPU time per thread). */
 const char *guest_thread_name_of(DWORD tid) {
     for (int i = 0; i < g_threads_n && i < 256; i++) {
@@ -435,7 +425,6 @@ static void os_GetCurrentCoreNumber(Ctx *c) {
 }
 static void os_AvailableCoreMask(Ctx *c) { RET(7); }
 static void nothing(Ctx *c) { (void)c; }
-static void ret0(Ctx *c) { RET(0); }
 
 /* thread-local storage slots */
 static volatile LONG g_tls_next;
@@ -465,9 +454,6 @@ static void mtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); }
 static void mtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 1 : 0); }
 /* hitch.c (SMO_HITCH): host thread id that owns the guest mutex `key` now, 0 = nobody. Diagnostics only. */
 DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs.OwningThread : 0; }
-static void pmtx_lock(Ctx *c) { EnterCriticalSection(&obj(A0)->cs); RET(0); }
-static void pmtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); RET(0); }
-static void pmtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 0 : 16); }   /* EBUSY */
 
 /* ---------------------------------------------------------------- events (Event, LightEvent, SystemEvent) */
 /* nn::os::EventClearMode: 0 = ManualClear, 1 = AutoClear */
@@ -547,19 +533,6 @@ static void sev_attach_readable(Ctx *c) {      /* (SystemEventType*, Handle, boo
     raw->alias = t == raw ? NULL : t;
     raw->autoclear = A3 == 1;
 }
-static void sev_attach_writable(Ctx *c) {      /* (SystemEventType*, Handle, bool managed, EventClearMode) */
-    Obj *raw = obj_raw(A0), *t = handle_obj((uint32_t)A1);
-    if (!t) guest_trap("os: AttachWritableHandleToSystemEvent with a handle no event of this process has", c->x[30] - 4);
-    raw->alias = t == raw ? NULL : t;
-    raw->autoclear = A3 == 1;
-}
-static void sev_attach(Ctx *c) {               /* (SystemEventType*, rHandle, bool, wHandle, bool, EventClearMode) */
-    Obj *raw = obj_raw(A0), *t = handle_obj((uint32_t)A1);
-    if (!t) t = handle_obj((uint32_t)A3);
-    if (!t) guest_trap("os: AttachSystemEvent with handles no event of this process has", c->x[30] - 4);
-    raw->alias = t == raw ? NULL : t;
-    raw->autoclear = c->x[5] == 1;
-}
 /* Host side: a new system event with a handle (as a system module would create one and pass its readable handle);
  * returns the handle, *key receives a host key to signal it with os_signal_event. */
 uint32_t os_system_event_new(int autoclear, uint64_t *key) {
@@ -573,8 +546,6 @@ uint32_t os_system_event_new(int autoclear, uint64_t *key) {
     return o->rhandle;
 }
 static void sev_get_readable(Ctx *c) { Obj *o = obj(A0); if (!o->rhandle) o->rhandle = handle_new(o); RET(o->rhandle); }
-static void sev_get_writable(Ctx *c) { Obj *o = obj(A0); if (!o->whandle) o->whandle = handle_new(o); RET(o->whandle); }
-static void sev_detach(Ctx *c) { obj_raw(A0)->alias = NULL; RET(0); }
 static void sev_destroy(Ctx *c) { obj_raw(A0)->alias = NULL; }
 static void sev_wait_h(Ctx *c) { sev_wait(A0, INFINITE); }
 static void sev_trywait_h(Ctx *c) { RET(sev_wait(A0, 0)); }
@@ -587,31 +558,6 @@ static void cv_timedwait(Ctx *c) {                    /* returns ConditionVariab
 }
 static void cv_signal(Ctx *c) { WakeConditionVariable(&obj(A0)->cv); }
 static void cv_broadcast(Ctx *c) { WakeAllConditionVariable(&obj(A0)->cv); }
-/* std::condition_variable: the argument is a unique_lock<mutex> whose first word is the mutex pointer */
-static void std_cv_wait(Ctx *c) { SleepConditionVariableCS(&obj(A0)->cv, &obj(rd64(A1))->cs, INFINITE); }
-static void std_cv_timedwait(Ctx *c) {                /* deadline: system_clock nanoseconds since 1970 */
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    int64_t now = (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ULL) * 100);
-    SleepConditionVariableCS(&obj(A0)->cv, &obj(rd64(A1))->cs, ns_to_ms((int64_t)A2 - now));
-}
-
-/* ---------------------------------------------------------------- semaphores */
-static void sem_init(Ctx *c) { obj_reset(A0); Obj *o = obj(A0); o->count = (int)A1; o->max = (int)A2; }
-static void sem_acquire(Ctx *c) {
-    Obj *o = obj(A0);
-    EnterCriticalSection(&o->cs);
-    while (o->count <= 0) SleepConditionVariableCS(&o->cv, &o->cs, INFINITE);
-    o->count--;
-    LeaveCriticalSection(&o->cs);
-}
-static void sem_release(Ctx *c) {
-    Obj *o = obj(A0);
-    EnterCriticalSection(&o->cs);
-    if (o->count < o->max) o->count++;               /* nn::os semaphores saturate at their maximum */
-    WakeConditionVariable(&o->cv);
-    LeaveCriticalSection(&o->cs);
-}
 
 /* ---------------------------------------------------------------- message queues (of 64-bit values) */
 static void mq_init(Ctx *c) {                         /* (queue, buffer, count): host-side storage is used */
@@ -657,79 +603,10 @@ static void mq_jam(Ctx *c) { mq_put(obj(A0), A1, 1, INFINITE); }
 static void mq_tryjam(Ctx *c) { RET(mq_put(obj(A0), A1, 1, 0)); }
 static void mq_receive(Ctx *c) { mq_get(obj(A1), A0, INFINITE); }
 static void mq_tryreceive(Ctx *c) { RET(mq_get(obj(A1), A0, 0)); }
-static void mq_timedreceive(Ctx *c) { RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
-/* PeekMessageQueue / TryPeekMessageQueue (out, queue): the oldest message without taking it (sead::MessageQueue::peek). */
-static int mq_peek(Obj *o, uint64_t out, DWORD ms) {
-    int ok = 1;
-    EnterCriticalSection(&o->cs);
-    while (o->len == 0) {
-        if (!SleepConditionVariableCS(&o->cv, &o->cs, ms)) { ok = o->len > 0; break; }
-    }
-    if (ok) wr64(out, o->buf[o->head]);
-    LeaveCriticalSection(&o->cs);
-    return ok;
-}
-static void mq_peek_h(Ctx *c) { mq_peek(obj(A1), A0, INFINITE); }
-static void mq_trypeek(Ctx *c) { RET(mq_peek(obj(A1), A0, 0)); }
 
-/* ---------------------------------------------------------------- multi-wait (polling implementation) */
-static void mw_init(Ctx *c) { obj_reset(A0); }
-static void mw_holder_init(Ctx *c) { Obj *h = obj(A0); h->target = A1; h->user = 0; }
-static void mw_link(Ctx *c) { Obj *m = obj(A0); if (m->holder_count < 64) m->holders[m->holder_count++] = obj(A1); }
-static void mw_unlink(Ctx *c) {
-    Obj *h = obj(A0);
-    AcquireSRWLockExclusive(&g_table_lock);
-    for (int b = 0; b < BUCKETS; b++)
-        for (Obj *m = g_table[b]; m; m = m->next)
-            for (int i = 0; i < m->holder_count; i++)
-                if (m->holders[i] == h) { m->holders[i] = m->holders[--m->holder_count]; i--; }
-    ReleaseSRWLockExclusive(&g_table_lock);
-}
-static void mw_set_user(Ctx *c) { obj(A0)->user = A1; }
-static void mw_get_user(Ctx *c) { RET(obj(A0)->user); }
-static uint64_t mw_poll(Obj *m) {
-    for (int i = 0; i < m->holder_count; i++) {
-        Obj *t = obj(m->holders[i]->target);
-        if (t->signaled || t->finished) return m->holders[i]->key;
-    }
-    return 0;
-}
-static void mw_waitany(Ctx *c) { Obj *m = obj(A0); uint64_t r; while (!(r = mw_poll(m))) Sleep(1); RET(r); }
-static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
-
-/* ---------------------------------------------------------------- fibers */
-static void CALLBACK fiber_main(void *arg) {
-    Obj *o = arg;
-    Ctx *c = new_ctx(o->stack + o->stack_size);
-    VirtualFree((void *)(uintptr_t)c->tpidr, 0, MEM_RELEASE);   /* a fiber has no thread block of its own: it uses the one of the thread running it */
-    for (;;) {
-        c->tpidr = o->tp;
-        c->x[0] = o->arg;
-        hitch_cur_ctx(c);
-        call_guest(c, o->fn);                         /* returns the fiber to switch to next, or null */
-        uint64_t next = c->x[0];
-        if (next) obj(next)->tp = c->tpidr;
-        t_fiber = next;
-        SwitchToFiber(next ? obj(next)->fiber : t_thread_fiber);
-    }
-}
-static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
-    Obj *o = obj(A0);
-    o->fn = A1; o->arg = A2; o->stack = A3; o->stack_size = A4;
-    o->fiber = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o);
-    RET(0);
-}
-static void fib_switch(Ctx *c) {
-    if (!t_thread_fiber) t_thread_fiber = ConvertThreadToFiber(NULL);
-    uint64_t next = A0, self = t_fiber;
-    if (next) obj(next)->tp = c->tpidr;               /* the thread block (errno, ...) belongs to the host thread, not to the fiber */
-    t_fiber = next;
-    SwitchToFiber(next ? obj(next)->fiber : t_thread_fiber);
-    if (self) c->tpidr = obj(self)->tp;               /* resumed, possibly by another thread */
-    hitch_cur_ctx(c);
-}
-static void fib_current(Ctx *c) { RET(t_fiber); }
-static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber) { DeleteFiber(o->fiber); o->fiber = NULL; } }
+/* ---------------------------------------------------------------- fibers: the game makes none (nn::os::InitializeFiber is
+ * not one of its imports), so no fiber is ever running */
+static void fib_current(Ctx *c) { RET(0); }
 
 /* ---------------------------------------------------------------- misc */
 static void os_ConvertToTick(Ctx *c) { RET((uint64_t)((double)(int64_t)A0 * (double)TICK_HZ / 1e9)); }
@@ -770,60 +647,37 @@ static void os_GenerateRandomBytes(Ctx *c) {
 static const ImportDef thread_imports[] = {
     {OS("12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi"), os_CreateThread},
     {OS("12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii"), os_CreateThreadOnCore},
-    {OS("25GetCurrentProcessorNumberEv"), os_GetCurrentCoreNumber}, {OS("20GetCurrentCoreNumberEv"), os_GetCurrentCoreNumber},
+    {OS("20GetCurrentCoreNumberEv"), os_GetCurrentCoreNumber},
     {OS("11StartThreadEPNS0_10ThreadTypeE"), os_StartThread}, {OS("10WaitThreadEPNS0_10ThreadTypeE"), os_WaitThread},
     {OS("13DestroyThreadEPNS0_10ThreadTypeE"), os_DestroyThread}, {OS("13SetThreadNameEPNS0_10ThreadTypeEPKc"), os_SetThreadName},
-    {OS("17SetThreadCoreMaskEPNS0_10ThreadTypeEim"), os_SetThreadCoreMask}, {OS("17GetThreadCoreMaskEPiPmPKNS0_10ThreadTypeE"), os_GetThreadCoreMask},
+    {OS("17SetThreadCoreMaskEPNS0_10ThreadTypeEim"), os_SetThreadCoreMask},
+    {OS("17GetThreadCoreMaskEPiPmPKNS0_10ThreadTypeE"), os_GetThreadCoreMask},   /* not an import of the game: nnosGetThreadCoreMask reaches it (nnmisc.c FWD) */
     {OS("26GetThreadAvailableCoreMaskEv"), os_AvailableCoreMask},
     {OS("16GetCurrentThreadEv"), os_GetCurrentThread}, {OS("17GetThreadPriorityEPKNS0_10ThreadTypeE"), os_GetThreadPriority},
-    {OS("24GetThreadCurrentPriorityEPKNS0_10ThreadTypeE"), os_GetThreadPriority},
     {OS("20ChangeThreadPriorityEPNS0_10ThreadTypeEi"), os_ChangeThreadPriority}, {OS("11GetThreadIdEPKNS0_10ThreadTypeE"), os_GetThreadId},
     {OS("11YieldThreadEv"), os_YieldThread}, {OS("11SleepThreadENS_8TimeSpanE"), os_SleepThread},
     {OS("19GetCurrentStackInfoEPmS1_"), os_GetCurrentStackInfo},
-    {OS("15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE"), os_AllocateTlsSlot}, {OS("18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE"), os_AllocateTlsSlot},
+    {OS("15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE"), os_AllocateTlsSlot},
     {OS("11FreeTlsSlotENS0_7TlsSlotE"), os_FreeTlsSlot}, {OS("11GetTlsValueENS0_7TlsSlotE"), os_GetTlsValue}, {OS("11SetTlsValueENS0_7TlsSlotEm"), os_SetTlsValue},
     {OS("15InitializeMutexEPNS0_9MutexTypeEbi"), mtx_init}, {OS("13FinalizeMutexEPNS0_9MutexTypeE"), nothing},
     {OS("9LockMutexEPNS0_9MutexTypeE"), mtx_lock}, {OS("11UnlockMutexEPNS0_9MutexTypeE"), mtx_unlock}, {OS("12TryLockMutexEPNS0_9MutexTypeE"), mtx_trylock},
-    {"pthread_mutex_init", ret0}, {"pthread_mutex_destroy", ret0}, {"pthread_mutex_lock", pmtx_lock}, {"pthread_mutex_unlock", pmtx_unlock},
-    {"pthread_mutex_trylock", pmtx_trylock},
-    {"_ZNSt3__15mutex4lockEv", mtx_lock}, {"_ZNSt3__15mutex6unlockEv", mtx_unlock}, {"_ZNSt3__15mutex8try_lockEv", mtx_trylock},
-    {"_ZNSt3__115recursive_mutex4lockEv", mtx_lock}, {"_ZNSt3__115recursive_mutex6unlockEv", mtx_unlock},
-    {"_ZNSt3__115recursive_mutex8try_lockEv", mtx_trylock},
     {OS("15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE"), ev_init}, {OS("13FinalizeEventEPNS0_9EventTypeE"), nothing},
     {OS("11SignalEventEPNS0_9EventTypeE"), ev_signal}, {OS("10ClearEventEPNS0_9EventTypeE"), ev_clear}, {OS("9WaitEventEPNS0_9EventTypeE"), ev_wait},
-    {OS("14TimedWaitEventEPNS0_9EventTypeENS_8TimeSpanE"), ev_timedwait},
     {OS("20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE"), ev_init}, {OS("18FinalizeLightEventEPNS0_14LightEventTypeE"), nothing},
     {OS("16SignalLightEventEPNS0_14LightEventTypeE"), ev_signal}, {OS("15ClearLightEventEPNS0_14LightEventTypeE"), ev_clear},
     {OS("14WaitLightEventEPNS0_14LightEventTypeE"), ev_wait},
-    {OS("18DestroySystemEventEPNS0_15SystemEventTypeE"), sev_destroy}, {OS("16ClearSystemEventEPNS0_15SystemEventTypeE"), ev_clear},
+    {OS("18DestroySystemEventEPNS0_15SystemEventTypeE"), sev_destroy},
     {OS("18TryWaitSystemEventEPNS0_15SystemEventTypeE"), sev_trywait_h}, {OS("15WaitSystemEventEPNS0_15SystemEventTypeE"), sev_wait_h},
     {OS("20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE"), sev_timedwait_h},
     {OS("27InitializeConditionVariableEPNS0_21ConditionVariableTypeE"), mtx_init}, {OS("25FinalizeConditionVariableEPNS0_21ConditionVariableTypeE"), nothing},
     {OS("21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeE"), cv_wait},
     {OS("26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE"), cv_timedwait},
     {OS("23SignalConditionVariableEPNS0_21ConditionVariableTypeE"), cv_signal}, {OS("26BroadcastConditionVariableEPNS0_21ConditionVariableTypeE"), cv_broadcast},
-    {"_ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE", std_cv_wait},
-    {"_ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILl1ELl1000000000EEEEEEE", std_cv_timedwait},
-    {"_ZNSt3__118condition_variable10notify_oneEv", cv_signal}, {"_ZNSt3__118condition_variable10notify_allEv", cv_broadcast},
-    {"pthread_cond_broadcast", cv_broadcast}, {"pthread_cond_destroy", ret0},
-    {OS("19InitializeSemaphoreEPNS0_13SemaphoreTypeEii"), sem_init}, {OS("17FinalizeSemaphoreEPNS0_13SemaphoreTypeE"), nothing},
-    {OS("16AcquireSemaphoreEPNS0_13SemaphoreTypeE"), sem_acquire}, {OS("16ReleaseSemaphoreEPNS0_13SemaphoreTypeE"), sem_release},
     {OS("22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm"), mq_init}, {OS("20FinalizeMessageQueueEPNS0_16MessageQueueTypeE"), nothing},
     {OS("16SendMessageQueueEPNS0_16MessageQueueTypeEm"), mq_send}, {OS("19TrySendMessageQueueEPNS0_16MessageQueueTypeEm"), mq_trysend},
     {OS("15JamMessageQueueEPNS0_16MessageQueueTypeEm"), mq_jam}, {OS("18TryJamMessageQueueEPNS0_16MessageQueueTypeEm"), mq_tryjam},
     {OS("19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE"), mq_receive}, {OS("22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE"), mq_tryreceive},
-    {OS("24TimedReceiveMessageQueueEPmPNS0_16MessageQueueTypeENS_8TimeSpanE"), mq_timedreceive},
-    {OS("19InitializeMultiWaitEPNS0_13MultiWaitTypeE"), mw_init}, {OS("17FinalizeMultiWaitEPNS0_13MultiWaitTypeE"), nothing},
-    {OS("25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_10ThreadTypeE"), mw_holder_init},
-    {OS("25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE"), mw_holder_init},
-    {OS("23FinalizeMultiWaitHolderEPNS0_19MultiWaitHolderTypeE"), nothing},
-    {OS("19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE"), mw_link},
-    {OS("21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE"), mw_unlink},
-    {OS("26SetMultiWaitHolderUserDataEPNS0_19MultiWaitHolderTypeEm"), mw_set_user},
-    {OS("26GetMultiWaitHolderUserDataEPKNS0_19MultiWaitHolderTypeE"), mw_get_user},
-    {OS("7WaitAnyEPNS0_13MultiWaitTypeE"), mw_waitany}, {OS("10TryWaitAnyEPNS0_13MultiWaitTypeE"), mw_trywaitany},
-    {OS("15InitializeFiberEPNS0_9FiberTypeEPFS2_PvES3_S3_mi"), fib_init}, {OS("13FinalizeFiberEPNS0_9FiberTypeE"), fib_finalize},
-    {OS("13SwitchToFiberEPNS0_9FiberTypeE"), fib_switch}, {OS("15GetCurrentFiberEv"), fib_current},
+    {OS("15GetCurrentFiberEv"), fib_current},
     {OS("13ConvertToTickENS_8TimeSpanE"), os_ConvertToTick}, {OS("17ConvertToTimeSpanENS0_4TickE"), os_ConvertToTimeSpan},
     {OS("19GenerateRandomBytesEPvm"), os_GenerateRandomBytes},
 };
@@ -845,18 +699,14 @@ static const ImportDef smo_thread_imports[] = {
     /* TryWaitEvent: the movie player (MovieDecoderPlayer::update
      * polls its decoder's buffer events with it) and the sound library's loaders (nn::atk ...Loader::IsInUse, Finalize). */
     {OS("12TryWaitEventEPNS0_9EventTypeE"), ev_trywait},
-    {OS("16PeekMessageQueueEPmPKNS0_16MessageQueueTypeE"), mq_peek_h},
-    {OS("19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE"), mq_trypeek},
     {OS("20GetThreadNamePointerEPKNS0_10ThreadTypeE"), os_GetThreadNamePointer},
 };
-/* the system-event entry points, also for lifted SDK callers (sdklift_rules.txt cuts them) */
+/* the system-event entry points, also for lifted SDK callers (sdklift_rules.txt cuts them; installed below with
+ * sdk_host_override). Create, AttachReadableHandle, Signal, Clear and GetReadableHandle are not imports of the game:
+ * only the lifted SDK code calls them (the audio renderer's events). */
 static const ImportDef sev_all[] = {
     {OS("17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb"), sev_create},
-    {OS("17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE"), sev_attach},
     {OS("33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE"), sev_attach_readable},
-    {OS("33AttachWritableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE"), sev_attach_writable},
-    {OS("33DetachReadableHandleOfSystemEventEPNS0_15SystemEventTypeE"), sev_detach},
-    {OS("33DetachWritableHandleOfSystemEventEPNS0_15SystemEventTypeE"), sev_detach},
     {OS("18DestroySystemEventEPNS0_15SystemEventTypeE"), sev_destroy},
     {OS("15WaitSystemEventEPNS0_15SystemEventTypeE"), sev_wait_h},
     {OS("18TryWaitSystemEventEPNS0_15SystemEventTypeE"), sev_trywait_h},
@@ -864,9 +714,6 @@ static const ImportDef sev_all[] = {
     {OS("17SignalSystemEventEPNS0_15SystemEventTypeE"), ev_signal},
     {OS("16ClearSystemEventEPNS0_15SystemEventTypeE"), ev_clear},
     {OS("30GetReadableHandleOfSystemEventEPKNS0_15SystemEventTypeE"), sev_get_readable},
-    {OS("30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE"), sev_get_writable},
-    {OS("30GetReadableHandleOfSystemEventEPNS0_15SystemEventTypeE"), sev_get_readable},
-    {OS("30GetWritableHandleOfSystemEventEPNS0_15SystemEventTypeE"), sev_get_writable},
 };
 void sdk_host_override(const char *name, void (*fn)(Ctx *));   /* sdklift_rt.c */
 void register_thread_imports(void) {

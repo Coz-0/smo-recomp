@@ -428,7 +428,6 @@ static int keyboard_ours(void) {
     }
     return ours;
 }
-static int key(int vk) { return scripted(vk) || script_key(vk) || seq_key(vk) || (keyboard_ours() && (GetAsyncKeyState(vk) & 0x8000) != 0); }
 
 /* Every session's pad input is recorded, so a path played by hand can be replayed exactly as a test.
  * Recording: always, to the file named by SMO_REC or input_last.rec; one line per change of the pad:
@@ -552,7 +551,7 @@ typedef struct { BYTE type, subtype; WORD flags; XGamepad pad; XVibration vib; }
 static DWORD (WINAPI *x_get_state)(DWORD, XState *);
 static DWORD (WINAPI *x_set_state)(DWORD, XVibration *);
 static DWORD (WINAPI *x_get_caps)(DWORD, DWORD, XCaps *);
-static struct { int present, wireless, dropped; ULONGLONG checked, read; XState st; XVibration sent; } g_x[4];
+static struct { int present, wireless; ULONGLONG checked, read; XState st; XVibration sent; } g_x[4];
 static int g_source[8] = {0, 1, 2, 3, -1, -1, -1, -1};      /* XInput slot of each player, -1 = none */
 static int g_keyboard_player = -1;                           /* 0-based, -1 = nobody */
 static uint32_t g_supported_styles = 0xffffffffu;            /* until SetSupportedNpadStyleSet */
@@ -668,14 +667,12 @@ static int x_present(int slot) {
         if (x_get_state((DWORD)slot, &g_x[slot].st) == 0) {
             XCaps caps;
             memset(&caps, 0, sizeof caps);
-            g_x[slot].present = 1; g_x[slot].read = now; g_x[slot].dropped = 0;
+            g_x[slot].present = 1; g_x[slot].read = now;
             g_x[slot].wireless = x_get_caps && x_get_caps((DWORD)slot, 0, &caps) == 0 && (caps.flags & 0x0002);
             memset(&g_x[slot].sent, 0, sizeof g_x[slot].sent);
             printf("nn::hid: pad %d connected (%s)\n", slot + 1, g_x[slot].wireless ? "wireless" : "wired");
         }
     }
-    /* DisconnectNpad dropped the link: the pad comes back when one of its buttons is pressed, as on the console */
-    if (g_x[slot].present && g_x[slot].dropped) { if (g_x[slot].st.pad.buttons) g_x[slot].dropped = 0; else return 0; }
     return g_x[slot].present;
 }
 
@@ -911,7 +908,6 @@ static void hid_GetNpadStyleSet(Ctx *c) {   /* (const NpadIdType &) */
     RET(r ? STYLE_FULLKEY : 0);
 }
 static void hid_GetNpadState_FullKey(Ctx *c) { fill_pad(A0, rd32(A1), 1); }
-static void hid_GetNpadState_Other(Ctx *c) { fill_pad(A0, rd32(A1), 0); }
 /* (SDK 3.5.1) GetNpadStates(State *out, int count, const NpadIdType &) -> number written, the NEWEST first.
  * [sdk] 0x203a4c detail::GetNpadStates (FullKey; the other styles are the same code): the npad id selects the npad
  * (0..7, 0x20 handheld -> 8, 0x10 other -> 9, anything else aborts); the style's ring in the hid shared memory holds up
@@ -997,21 +993,7 @@ static void hid_GetPlayerLedPattern(Ctx *c) {               /* the console's pat
     uint32_t id = rd32(A0);
     RET(id < 8 && player_connected(id) ? led[id] : 0);
 }
-/* [sdk] 0x2398a0: per npad the service publishes a colour attribute (0 ok, 1 read error -> hid 603, 2 no such
- * controller -> hid 604) and two RGBA colours. A Pro Controller's own colours are body 2D2D2D, buttons E6E6E6. */
-#define HID_COLOR_NO_CONTROLLER 0x4b8caull
-static void hid_ControllerColor1(Ctx *c) {                  /* (NpadControllerColor *out, const NpadIdType &) */
-    if (!player_connected(rd32(A1))) { RET(HID_COLOR_NO_CONTROLLER); return; }
-    wr32(A0, 0xff2d2d2du);
-    wr32(A0 + 4, 0xffe6e6e6u);
-    RET(0);
-}
-static void hid_ControllerColor2(Ctx *c) { RET(HID_COLOR_NO_CONTROLLER); }   /* (left, right, id): Joy-Con colours; no Joy-Con is ever attached */
 static void hid_InitializeTouchScreen(Ctx *c) { (void)c; g_touch_ready = 1; }
-static void hid_GetTouchScreenState(Ctx *c) {               /* docked console: the screen is in the dock, no touch can arrive */
-    memset((void *)(uintptr_t)A0, 0, 0x290);
-    wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
-}
 /* Motion: XInput pads have no sensor. The state written is that of a controller lying still, face up: no rotation,
  * identity attitude, gravity on -z (NOT VERIFIED on a console: the sign convention), attribute "connected". */
 /* The SDK side, read in sdk.elf:
@@ -1065,7 +1047,7 @@ static void hid_StartSixAxisSensor(Ctx *c) {                /* (const SixAxisSen
         guest_trap("nn::hid::StartSixAxisSensor with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x2505f4)", c->x[30] - 4);
     if (id < 8) g_six[id].started = 1;
 }
-int nnhid_selftest_sixaxis_erm(Ctx *c);
+int nnhid_selftest_sixaxis(Ctx *c);
 int nnhid_selftest(Ctx *c) {
     uint8_t st[0x60];
     uint32_t handle = 3 | 6 << 8;                            /* full key, npad 7 (player 7: no pad in a test), device 0 */
@@ -1082,7 +1064,7 @@ int nnhid_selftest(Ctx *c) {
     memset(&g_six[6], 0, sizeof g_six[6]);
     c->x[30] = lr;
     printf("  hid: six-axis state: empty ring copies nothing, last record kept after disconnect, record at rest: %s\n", ok ? "ok" : "FAILED");
-    { int nnhid_selftest_xinput(Ctx *c); return !ok + nnhid_selftest_sixaxis_erm(c) + nnhid_selftest_xinput(c); }
+    { int nnhid_selftest_xinput(Ctx *c); return !ok + nnhid_selftest_sixaxis(c) + nnhid_selftest_xinput(c); }
 }
 /* IsSixAxisSensorAtRest(const SixAxisSensorHandle &) [sdk 0x250b80 -> 0x23beb0]: one request to the hid module (IHidServer
  * slot +0x138 = command 82, [doc] suyu hid_server.cpp) with the handle; a failure aborts (0x250b9c), else the module's bool
@@ -1091,7 +1073,6 @@ int nnhid_selftest(Ctx *c) {
  * is recomputed from the sensor only while it is started and delivers motion.  XInput pads deliver none (see
  * GetSixAxisSensorState above: the record at rest), so the flag keeps its initial value: true. */
 static int g_seven_ready;                                   /* InitializeSevenSixAxisSensor was called */
-static int g_gc_test_mounted;                               /* self-test only: pretend npad 7 holds a GameCube controller */
 static void hid_InitializeSevenSixAxisSensor(Ctx *c);
 static void hid_IsSixAxisSensorAtRest(Ctx *c) {
     uint32_t handle = rd32(A0), id = (handle >> 8) & 0xff, dev = (handle >> 16) & 0xff;
@@ -1157,12 +1138,6 @@ static void hid_IsVibrationDeviceMounted(Ctx *c) {
     uint32_t id, dev;
     RET(vib_slot(rd32(A0), &id, &dev) && player_connected(id));
 }
-static void hid_GetVibrationDeviceInfo(Ctx *c) {            /* (VibrationDeviceInfo *out, handle): { type, position } */
-    uint32_t id, dev;
-    if (!vib_slot(rd32(A1), &id, &dev)) { wr32(A0, 0); wr32(A0 + 4, 0); return; }
-    wr32(A0, 1);                                            /* VibrationDeviceType_LinearResonantActuator */
-    wr32(A0 + 4, dev == 0 ? 1 : 2);                         /* VibrationDevicePosition_Left / _Right */
-}
 static void hid_SendVibrationValue(Ctx *c) {                /* (handle, const VibrationValue &{ampLow, freqLow, ampHigh, freqHigh}) */
     uint32_t id, dev;
     if (!vib_slot(rd32(A0), &id, &dev)) return;
@@ -1179,57 +1154,9 @@ static void hid_SendVibrationValues(Ctx *c) {
     for (int i = 0; i < n; i++) { c->x[0] = h + (uint64_t)i * 4; c->x[1] = v + (uint64_t)i * 16; hid_SendVibrationValue(c); }
     RET(0);
 }
-static void hid_GetActualVibrationValue(Ctx *c) {           /* (VibrationValue *out, handle): what the actuator is playing */
-    uint32_t id, dev;
-    const float *v = g_vib_default;
-    if (vib_slot(rd32(A1), &id, &dev) && g_vib[id][dev].set && player_connected(id)) v = g_vib[id][dev].v;
-    memcpy((void *)(uintptr_t)A0, v, 16);
-}
-/* GameCube controllers: an eccentric motor with the commands 0 Stop, 1 Start, 2 StopHard (u64; [game] 0x710366a4f0 reads
- * 8 bytes and compares with 1).
- * SendVibrationGcErmCommand(handle, command) [sdk 0x2537c0 -> 0x248ca0]: one request (IHidServer slot +0x258 = command 207)
- * with the u32 handle and the u64 command; a failure aborts.  GetActualVibrationGcErmCommand(out, handle) [sdk 0x253810 ->
- * 0x248d30]: slot +0x260 = command 208, the module writes the u64; a failure aborts.
- * The module ([doc] suyu core/hle/service/hid/hid_server.cpp 987 / 1013, hid_core/hid_util.h IsVibrationHandleValid,
- * hid_core/resources/vibration/gc_vibration_device.cpp, hid_core/frontend/emulated_controller.cpp 1236): the handle must
- * be valid (style 3..8, 13, 32, 33; npad id 0..7, 0x10, 0x20; device index < 3), else an error; only a handle of the
- * GameCube style (8) has a GameCube device, and only a mounted one (a GameCube controller on that npad) does anything:
- * Start runs the motor at full amplitude, Stop / StopHard stop it, a command above 2 is ignored.  Without a mounted
- * device Send does nothing and GetActual answers Stop.
- * Here no npad ever holds a GameCube controller (no GameCube adapter support: row "controllers"), so that is always the
- * path taken; the motor code below is what a mounted device would do on the XInput pad of the npad (both motors full). */
-static uint64_t g_gc_erm[8];                                /* the command a mounted device is executing */
-static int gc_handle_check(Ctx *c, uint32_t handle, const char *what) {      /* 1 = the handle names a mounted GameCube device */
-    uint32_t style = handle & 0xff, id = (handle >> 8) & 0xff, dev = (handle >> 16) & 0xff;
-    if (!((style >= 3 && style <= 8) || style == 13 || style == 32 || style == 33) || !(id < 8 || id == 0x10 || id == 0x20) || dev > 2)
-        guest_trap(what, c->x[30] - 4);
-    return style == 8 && id == 7 && g_gc_test_mounted;      /* no GameCube controller exists outside the self-test */
-}
-static void hid_SendVibrationGcErmCommand(Ctx *c) {         /* (const VibrationDeviceHandle &, const VibrationGcErmCommand &) */
-    uint32_t handle = rd32(A0), id = (handle >> 8) & 0xff;
-    uint64_t command = rd64(A1);
-    hid_setup();
-    if (!gc_handle_check(c, handle, "nn::hid::SendVibrationGcErmCommand with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x2537d4)")) return;
-    if (command > 2) return;
-    g_gc_erm[id] = command;
-    int slot = g_source[id];
-    if (x_set_state && x_present(slot)) {
-        XVibration v;
-        v.left = v.right = (WORD)(command == 1 && devices_live() ? 65535 : 0);
-        g_x[slot].sent = v;
-        x_set_state((DWORD)slot, &v);
-    }
-}
-static void hid_GetActualVibrationGcErmCommand(Ctx *c) {    /* (VibrationGcErmCommand *out, const VibrationDeviceHandle &) */
-    uint32_t handle = rd32(A1), id = (handle >> 8) & 0xff;
-    uint64_t out = A0;
-    hid_setup();
-    int mounted = gc_handle_check(c, handle, "nn::hid::GetActualVibrationGcErmCommand with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x253840)");
-    wr64(out, mounted ? g_gc_erm[id] : 0);
-}
-int nnhid_selftest_sixaxis_erm(Ctx *c) {
-    uint32_t pro = 3 | 6 << 8, gc = 8 | 7 << 8, gc_other = 8 | 2 << 8, six = 3 | 6 << 8 | 1 << 16;
-    uint64_t cmd = 1, got = 0x1111111111111111ull, lr = c->x[30];
+int nnhid_selftest_sixaxis(Ctx *c) {
+    uint32_t six = 3 | 6 << 8 | 1 << 16;
+    uint64_t lr = c->x[30];
     int bad = 0, ok, was_ready = g_seven_ready;
     c->x[0] = (uint64_t)(uintptr_t)&six; hid_IsSixAxisSensorAtRest(c);
     ok = c->x[0] == 1;
@@ -1239,30 +1166,6 @@ int nnhid_selftest_sixaxis_erm(Ctx *c) {
     ok = ok && c->x[0] == 1 && g_seven_ready;
     printf("  hid: IsSixAxisSensorAtRest (valid handle) and IsSevenSixAxisSensorAtRest after Initialize: at rest: %s\n", ok ? "ok" : "FAILED");
     bad += !ok;
-    c->x[0] = (uint64_t)(uintptr_t)&pro; c->x[1] = (uint64_t)(uintptr_t)&cmd; hid_SendVibrationGcErmCommand(c);
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&pro; hid_GetActualVibrationGcErmCommand(c);
-    ok = got == 0;
-    got = 0x1111111111111111ull;
-    c->x[0] = (uint64_t)(uintptr_t)&gc_other; c->x[1] = (uint64_t)(uintptr_t)&cmd; hid_SendVibrationGcErmCommand(c);
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&gc_other; hid_GetActualVibrationGcErmCommand(c);
-    ok = ok && got == 0 && g_gc_erm[2] == 0;
-    printf("  hid: GC ERM Start to a Pro Controller handle and to a GameCube handle without controller: nothing, actual command Stop (8 bytes): %s\n", ok ? "ok" : "FAILED");
-    bad += !ok;
-    g_gc_test_mounted = 1;
-    c->x[0] = (uint64_t)(uintptr_t)&gc; c->x[1] = (uint64_t)(uintptr_t)&cmd; hid_SendVibrationGcErmCommand(c);
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&gc; hid_GetActualVibrationGcErmCommand(c);
-    ok = got == 1;
-    cmd = 7; c->x[0] = (uint64_t)(uintptr_t)&gc; c->x[1] = (uint64_t)(uintptr_t)&cmd; hid_SendVibrationGcErmCommand(c);
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&gc; hid_GetActualVibrationGcErmCommand(c);
-    ok = ok && got == 1;
-    cmd = 2; c->x[0] = (uint64_t)(uintptr_t)&gc; c->x[1] = (uint64_t)(uintptr_t)&cmd; hid_SendVibrationGcErmCommand(c);
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&gc; hid_GetActualVibrationGcErmCommand(c);
-    ok = ok && got == 2;
-    g_gc_test_mounted = 0; g_gc_erm[7] = 0;
-    c->x[0] = (uint64_t)(uintptr_t)&got; c->x[1] = (uint64_t)(uintptr_t)&gc; hid_GetActualVibrationGcErmCommand(c);
-    ok = ok && got == 0;
-    printf("  hid: GC ERM on a (test-only) mounted GameCube device: Start kept, command 7 ignored, StopHard kept, unmounted -> Stop: %s\n", ok ? "ok" : "FAILED");
-    bad += !ok;
     g_seven_ready = was_ready;
     c->x[30] = lr;
     return bad;
@@ -1271,34 +1174,13 @@ int nnhid_selftest_sixaxis_erm(Ctx *c) {
 /* ---- Joy-Con management: there are no Joy-Con here, every controller is a Pro Controller, for which the console
  * itself does nothing in these calls (they regroup or split Joy-Con pairs). */
 static void hid_joycon_only(Ctx *c) { hid_setup(); (void)c; }
-static void hid_GetNpadJoyAssignment(Ctx *c) { RET(0); }    /* NpadJoyAssignmentMode_Dual, the value of every non-Joy-Con npad */
 static void hid_MergeSingleJoyAsDualJoy(Ctx *c) { RET(0x4b2caull); }   /* hid 601..602 family: the two npads are not single Joy-Con (NOT VERIFIED: the exact code for "not a Joy-Con") */
-static void hid_SwapNpadAssignment(Ctx *c) {                /* (const NpadIdType &a, const NpadIdType &b): the two players exchange controllers */
-    uint32_t a = rd32(A0), b = rd32(A1);
-    if (a > 7 || b > 7) return;
-    int t = g_source[a]; g_source[a] = g_source[b]; g_source[b] = t;
-    if (sdl_on()) nnpad_swap((int)a, (int)b);
-    if (g_keyboard_player == (int)a) g_keyboard_player = (int)b; else if (g_keyboard_player == (int)b) g_keyboard_player = (int)a;
-    for (int d = 0; d < 2; d++) { float tmp[4]; int ts = g_vib[a][d].set; memcpy(tmp, g_vib[a][d].v, 16); g_vib[a][d] = g_vib[b][d]; memcpy(g_vib[b][d].v, tmp, 16); g_vib[b][d].set = ts; }
-}
-static void hid_DisconnectNpad(Ctx *c) {                    /* drops the wireless link; the pad returns when a button is pressed */
-    uint32_t id = rd32(A0);
-    if (id > 7) return;
-    int slot = g_source[id];
-    if (sdl_on()) { nnpad_disconnect((int)id); return; }
-    if (slot >= 0 && slot < 4 && g_x[slot].present) {
-        XVibration off = {0, 0};
-        if (x_set_state) x_set_state((DWORD)slot, &off);
-        g_x[slot].sent = off;
-        g_x[slot].dropped = 1;
-    }
-}
 static void hid_InitializeSevenSixAxisSensor(Ctx *c) { (void)c; hid_setup(); g_seven_ready = 1; }       /* (void *work, size_t) [sdk 0x232540] */
 static void hid_seven_start_stop(Ctx *c) { (void)c; hid_setup(); }
 
 /* Self-test of the XInput pad path with a synthetic pad on slot 1 = player 2 (see "synthetic XInput pad" above): the
  * state is set here, the three XInput entry points are the synthetic ones, and the handlers the game calls
- * (GetNpadStyleSet, GetNpadState, vibration, DisconnectNpad) are called as the game calls them. The two time gates of
+ * (GetNpadStyleSet, GetNpadState, vibration) are called as the game calls them. The two time gates of
  * x_present (a connected pad is read at most once per millisecond, a missing one probed once per second) are reset
  * between cases; they are caches, not part of the mapping. No physical pad is involved. */
 static uint64_t xt_buttons, xt_attr;
@@ -1387,7 +1269,7 @@ int nnhid_selftest_xinput(Ctx *c) {
 
     /* 6. vibration: low band -> left (heavy) motor, high band -> right (light) motor, the larger of the two handles */
     uint32_t hl = 3 | 1 << 8, hr = 3 | 1 << 8 | 1 << 16;
-    float v1[4] = {0.5f, 160.0f, 0.25f, 320.0f}, v2[4] = {0.1f, 160.0f, 1.5f, 320.0f}, v0[4] = {0.0f, 160.0f, 0.0f, 320.0f}, got[4];
+    float v1[4] = {0.5f, 160.0f, 0.25f, 320.0f}, v2[4] = {0.1f, 160.0f, 1.5f, 320.0f}, v0[4] = {0.0f, 160.0f, 0.0f, 320.0f};
     memset(g, 0, sizeof *g); xt_poll(c);
     c->x[0] = (uint64_t)(uintptr_t)&hl; hid_InitializeVibrationDevice(c);
     c->x[0] = (uint64_t)(uintptr_t)&hr; hid_InitializeVibrationDevice(c);
@@ -1398,21 +1280,10 @@ int nnhid_selftest_xinput(Ctx *c) {
     ok = ok && g_xs[1].sets == sets0 + 1;                                        /* unchanged value: no second call to the device */
     c->x[0] = (uint64_t)(uintptr_t)&hr; c->x[1] = (uint64_t)(uintptr_t)v2; hid_SendVibrationValue(c);
     ok = ok && g_xs[1].sets == sets0 + 2 && g_xs[1].last.left == 32767 && g_xs[1].last.right == 65535;
-    c->x[0] = (uint64_t)(uintptr_t)got; c->x[1] = (uint64_t)(uintptr_t)&hr; hid_GetActualVibrationValue(c);
-    ok = ok && got[0] == 0.1f && got[2] == 1.5f;
     c->x[0] = (uint64_t)(uintptr_t)&hl; c->x[1] = (uint64_t)(uintptr_t)v0; hid_SendVibrationValue(c);
     c->x[0] = (uint64_t)(uintptr_t)&hr; c->x[1] = (uint64_t)(uintptr_t)v0; hid_SendVibrationValue(c);
     ok = ok && g_xs[1].last.left == 0 && g_xs[1].last.right == 0;
     printf("  hid/XInput: vibration values reach XInputSetState (0.5 -> 32767, 0.25 -> 16383, 1.5 -> 65535, larger handle wins, repeat not resent, stop -> 0): %s\n", ok ? "ok" : "FAILED"); bad += !ok;
-
-    /* 7. DisconnectNpad: motors off, the pad is gone until one of its buttons is pressed */
-    c->x[0] = (uint64_t)(uintptr_t)&hl; c->x[1] = (uint64_t)(uintptr_t)v1; hid_SendVibrationValue(c);
-    uint32_t id1 = 1;
-    c->x[0] = (uint64_t)(uintptr_t)&id1; hid_DisconnectNpad(c);
-    ok = g_xs[1].last.left == 0 && g_xs[1].last.right == 0;
-    xt_poll(c); ok = ok && xt_style == 0;
-    g->buttons = 0x1000; xt_poll(c); ok = ok && xt_style == STYLE_FULLKEY && xt_buttons == 1ull << BTN_B;
-    printf("  hid/XInput: DisconnectNpad stops the motors and drops the pad; it returns on a button press: %s\n", ok ? "ok" : "FAILED"); bad += !ok;
 
     memset(&g_xs[1], 0, sizeof g_xs[1]); memset(&g_x[1], 0, sizeof g_x[1]); memset(g_vib[1], 0, sizeof g_vib[1]);
     x_get_state = save_get; x_set_state = save_set; x_get_caps = save_caps;
@@ -1465,34 +1336,18 @@ int nnhid_pad_selftest(void) {
 static const ImportDef hid_imports[] = {
     {H("14InitializeNpadEv"), hid_InitializeNpad}, {H("24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE"), hid_SetSupportedNpadStyleSet},
     {H("22SetSupportedNpadIdTypeEPKjm"), hid_SetSupportedNpadIdType}, {H("18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE"), hid_joycon_only},
-    {H("20GetNpadJoyAssignmentERKj"), hid_GetNpadJoyAssignment}, {H("30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE"), hid_joycon_only},
-    {H("30SetNpadJoyAssignmentModeSingleERKj"), hid_joycon_only}, {H("28SetNpadJoyAssignmentModeDualERKj"), hid_joycon_only},
-    {H("23MergeSingleJoyAsDualJoyERKjS2_"), hid_MergeSingleJoyAsDualJoy}, {H("18SwapNpadAssignmentERKjS2_"), hid_SwapNpadAssignment}, {H("14DisconnectNpadERKj"), hid_DisconnectNpad},
-    {H("19GetPlayerLedPatternERKj"), hid_GetPlayerLedPattern}, {H("15GetNpadStyleSetERKj"), hid_GetNpadStyleSet},
-    {H("12GetNpadStateEPNS0_16NpadFullKeyStateERKj"), hid_GetNpadState_FullKey},
+    {H("28SetNpadJoyAssignmentModeDualERKj"), hid_joycon_only},
+    {H("23MergeSingleJoyAsDualJoyERKjS2_"), hid_MergeSingleJoyAsDualJoy},
+    {H("15GetNpadStyleSetERKj"), hid_GetNpadStyleSet},
     {H("13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj"), hid_GetNpadStates_FullKey}, {H("13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj"), hid_GetNpadStates_Handheld},
     {H("13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj"), hid_GetNpadStates_JoyDual}, {H("13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj"), hid_GetNpadStates_JoyLeft},
     {H("13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj"), hid_GetNpadStates_JoyRight},
     {H("19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE"), hid_GetTouchScreenState1},
     {H("21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE"), hid_ShowControllerSupport},
     {H("22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE"), hid_GetSixAxisSensorStates},
-    {H("12GetNpadStateEPNS0_16NpadJoyDualStateERKj"), hid_GetNpadState_Other},
-    {H("12GetNpadStateEPNS0_16NpadJoyLeftStateERKj"), hid_GetNpadState_Other},
-    {H("12GetNpadStateEPNS0_17NpadJoyRightStateERKj"), hid_GetNpadState_Other},
-    {H("12GetNpadStateEPNS0_11NpadGcStateERKj"), hid_GetNpadState_Other},
-    {H("12GetNpadStateEPNS0_17NpadHandheldStateERKj"), hid_GetNpadState_Other},
-    {H("22GetNpadControllerColorEPNS0_19NpadControllerColorERKj"), hid_ControllerColor1},
-    {H("22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj"), hid_ControllerColor2},
-    {H("21InitializeTouchScreenEv"), hid_InitializeTouchScreen}, {H("19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE"), hid_GetTouchScreenState},
-    {H("21StartLrAssignmentModeEv"), hid_joycon_only}, {H("20StopLrAssignmentModeEv"), hid_joycon_only},
-    {H("21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE"), hid_GetSixAxisSensorState},
-    {H("21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE"), hid_IsSixAxisSensorAtRest},
+    {H("21InitializeTouchScreenEv"), hid_InitializeTouchScreen},
     {H("18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE"), hid_StartSixAxisSensor},
-    {H("22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE"), hid_GetVibrationDeviceInfo},
     {H("18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE"), hid_SendVibrationValue},
-    {H("25SendVibrationGcErmCommandERKNS0_21VibrationDeviceHandleERKNS0_21VibrationGcErmCommandE"), hid_SendVibrationGcErmCommand},
-    {H("23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE"), hid_GetActualVibrationValue},
-    {H("30GetActualVibrationGcErmCommandEPNS0_21VibrationGcErmCommandERKNS0_21VibrationDeviceHandleE"), hid_GetActualVibrationGcErmCommand},
     {H("25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE"), hid_InitializeVibrationDevice},
     {H("23StartSevenSixAxisSensorEv"), hid_seven_start_stop}, {H("22StopSevenSixAxisSensorEv"), hid_seven_start_stop},
     {H("27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi"), hid_GetSevenSixAxisSensorStates},

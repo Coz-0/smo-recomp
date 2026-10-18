@@ -502,7 +502,6 @@ void print_import_summary(FILE *out) {
 void print_devinfo_summary(FILE *out);       /* nvn_stub.c */
 void display_report(FILE *out);              /* display.c */
 
-void audio_report(FILE *out);                /* nnaudio.c: underruns of the run */
 void hid_report(FILE *out);                  /* nnhid.c: synthetic XInput pad (SMO_XINPUT_SYNTH) */
 void os_thread_report(FILE *out);            /* os_threads.c: every thread the game created, with its nn::os arguments */
 
@@ -514,7 +513,6 @@ void report_and_exit(int code) {
     print_devinfo_summary(stdout);
     { void nvn_virtual_pool_report(FILE *out); nvn_virtual_pool_report(stdout); }   /* nvn_stub.c */
     display_report(stdout);
-    audio_report(stdout);
     hid_report(stdout);
     os_thread_report(stdout);
     { void smo_heap_report(FILE *out); smo_heap_report(stdout); }   /* smo_nn.c */
@@ -710,7 +708,8 @@ void runtime_init(const char *elf, const char *trace_path) {
  *                        any function import without a handler, stops the program with a list (exit code 5).
  *   SMO_STRICT=report   same list, without stopping.
  *   SMO_AUDIT_DUMP=<f>  write every import and its binding (handler RVA, trivial kind) to <f> after the
- *                        registrations and exit.
+ *                        registrations and exit; "unimported" rows: handlers registered under names the game
+ *                        does not import (reachable only through handler_by_name).
  *   SMO_AUDIT_COUNTS=<f> at exit, write the call count of every import and run-time host function. */
 
 /* 0 = real code; 1 = empty body; 2 = only stores constants (x0 := *x0 when *sets_x0) */
@@ -797,6 +796,11 @@ static void audit_write(const char *path, int with_counts) {
         int kind = g_hostfn[i].fn ? audit_trivial(g_hostfn[i].fn, &x0, &sets) : -1;
         fprintf(f, "hostfn\t%s\t%lld\t%llx\t%d\t%s%llx\t0\n", g_hostfn[i].name, with_counts ? (long long)g_hostfn[i].calls : 0ll,
                 g_hostfn[i].fn ? (unsigned long long)((uintptr_t)g_hostfn[i].fn - base) : 0ull, kind, sets ? "" : "-", (unsigned long long)x0);
+    }
+    for (int k = 0; k < g_known_count; k++) {      /* a handler registered under a name the game does not import */
+        int imported = 0;
+        for (int i = 0; i < dyn_sym_count && !imported; i++) imported = !dyn_syms[i].defined && !strcmp(dyn_syms[i].name, g_known[k].name);
+        if (!imported) fprintf(f, "unimported\t%s\t0\t%llx\t-1\t-\t0\n", g_known[k].name, (unsigned long long)((uintptr_t)g_known[k].fn - base));
     }
     fclose(f);
 }

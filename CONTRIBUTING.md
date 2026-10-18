@@ -73,7 +73,10 @@ Say in the pull request which of these you ran:
 - **Shader translator changes:** `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of dumped
   stages>` (0 different); stages are dumped with `SMO_SHADERDUMP=<folder>` and `SMO_VK_DUMP_MINBYTES=<n>`. And
   `tests\check_all_shaders.py`: every stage of the game's shader files must still translate and compile.
-- **System call changes:** `scripts\run.py selftest --env SMO_IMPORT_SELFTEST=1` (0 failed checks).
+- **System call changes:** `scripts\run.py selftest --env SMO_IMPORT_SELFTEST=1` (0 failed checks). A handler belongs
+  to a name the game imports: `--env SMO_AUDIT_DUMP=<file>` lists in its `unimported` rows the handlers registered under
+  other names, and each of those has a comment in its table saying how it is reached (the lifted SDK code, a C
+  wrapper); the start log has no `is not an import` line.
 - **Texture layout changes:** `tests\bntx_layout_check.py` (every texture of the RomFS equal).
 - **Changes to the largest-index scan (`runtime/gfx/nvn_vk_draw.c`) or the command-list overwrite index
   (`runtime/gfx/nvn_gl.c`):** `tests\check_fast_paths.py` (`PASS`: both equal to the plain code on random input).
@@ -90,8 +93,9 @@ Say in the pull request which of these you ran:
   lines), and a scripted run that opens the menu and scans an amiibo ([`docs/scripted-runs.md`](docs/scripted-runs.md)):
   the log must show the game reading it (`nfp: the game read the amiibo's model information`).
 
-Known: `SMO_SDK_SELFTEST=1`, the self-test of the service families, stops at `log2f`, a function this game does not
-import; the test, not the runtime, needs adapting.
+Known: `SMO_SDK_SELFTEST=1`, the self-test of the service families, fails two checks (the `errno` location is not in
+the thread block; `NumberLineAllocator` is not lifted) and stops at `nn::image::JpegDecoder`, which the game imports
+but no handler implements.
 
 ## Commits and licence
 

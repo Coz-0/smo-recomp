@@ -9,16 +9,12 @@
  * and, REPLACING do-nothing placeholders of nnsdk.c / nnmisc.c with the SDK's real constructors so that
  * the lifted getters read initialised objects: DeliveryCacheProgress C1 / D1 / Update ([sdk] 0xc4ab0: mutex
  * @0, service pointer @0x20 = null, 0x200 zero bytes @0x58, i.e. status 0 = "none"), DeliveryCacheFile C1,
- * DeliveryCacheDirectory C1, ec::ShopServiceAccessor::AsyncResponse C1 ([sdk] 0x18de00).
+ * DeliveryCacheDirectory C1.
  *
  * Answered here:
- *  - nn::nifm leftovers, nn::socket / nnsocket*, nn::ssl / nnssl*, nn::nsd, nn::ldn, nn::ec::ShopServiceAccessor: see nnsocket.inc.
+ *  - nn::nifm leftovers, nn::socket / nnsocket*, nn::ssl / nnssl*, nn::nsd: see nnsocket.inc.
  *  - nn::bcat::DeliveryCacheFile::Read: [sdk] 0xc47e0 a file that is not open gives 0xe7a (module 122,
  *    description 7); no file can be open because DeliveryCacheFile::Open fails (nnsdk.c).
- *  - nn::ec::ShopServiceAccessor::AsyncResponse: [sdk] 0x18e390 TryWait is true when no request is attached
- *    (pointer @0x18 null); [sdk] 0x18e1f8 Get then returns 0x190a4 (module 164, description 200). A
- *    request can never be attached: ShopServiceAccessor::Request fails first (nnsocket.inc).
- *    nn::ec::ShopServiceAccessor::DefaultTimeout (a data import) gets its real 8 bytes from the SDK image.
  *  - glslc* (8 entry points of the run-time GLSL compiler): WEAK imports of the game that no module of this
  *    dump provides (sdk.elf has no such symbols), so on a console their GOT entries are null.
  *    [game] 0x710003a630 collects the eight pointers and 0x71000382f8 uses them only for a shader whose
@@ -47,11 +43,6 @@
 /* ---------------------------------------------------------------- nn::bcat */
 static void bcat_File_Read(Ctx *c) { if (A1) wr64(A1, 0); RET(0xe7au); }   /* (this, size_t *outSize, int64_t offset, void *buf, size_t size) */
 
-/* ---------------------------------------------------------------- nn::ec */
-#define EC_NO_RESPONSE 0x190a4u
-static void ec_AsyncResponse_TryWait(Ctx *c) { RET(1); }
-static void ec_AsyncResponse_Get(Ctx *c) { RET(EC_NO_RESPONSE); }                            /* (this, void *buf, size_t size) */
-
 /* ---------------------------------------------------------------- glslc */
 static void glslc_absent(Ctx *c) {
     printf("\nglslc: the game called an entry point of the run-time GLSL shader compiler. A retail console has no such library\n"
@@ -61,8 +52,6 @@ static void glslc_absent(Ctx *c) {
 
 static const ImportDef net_imports[] = {
     {"_ZN2nn4bcat17DeliveryCacheFile4ReadEPmlPvm", bcat_File_Read},
-    {"_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7TryWaitEv", ec_AsyncResponse_TryWait},
-    {"_ZN2nn2ec19ShopServiceAccessor13AsyncResponse3GetEPvm", ec_AsyncResponse_Get},
     {"glslcCompile", glslc_absent}, {"glslcCompilePreSpecialized", glslc_absent}, {"glslcCompileSpecialized", glslc_absent},
     {"glslcFinalize", glslc_absent}, {"glslcGetDefaultOptions", glslc_absent}, {"glslcGetVersion", glslc_absent},
     {"glslcInitialize", glslc_absent}, {"glslcSetAllocator", glslc_absent},
@@ -71,7 +60,6 @@ static const ImportDef net_imports[] = {
 static const char *const lifted_replacements[] = {
     "_ZN2nn4bcat21DeliveryCacheProgressC1Ev", "_ZN2nn4bcat21DeliveryCacheProgressD1Ev", "_ZN2nn4bcat21DeliveryCacheProgress6UpdateEv",
     "_ZN2nn4bcat17DeliveryCacheFileC1Ev", "_ZN2nn4bcat22DeliveryCacheDirectoryC1Ev",
-    "_ZN2nn2ec19ShopServiceAccessor13AsyncResponseC1Ev",
 };
 
 void register_nnnet_imports(void) {
@@ -82,92 +70,17 @@ void register_nnnet_imports(void) {
     if (!sdk_image_ready()) return;
     for (int i = 0; i < (int)(sizeof lifted_replacements / sizeof lifted_replacements[0]); i++)
         if (!sdk_install(lifted_replacements[i])) printf("nnnet: %s was not lifted\n", lifted_replacements[i]);
-    /* data import: nn::TimeSpan nn::ec::ShopServiceAccessor::DefaultTimeout ([sdk] 0xa39950, 8 bytes) */
-    void *slot = import_data("_ZN2nn2ec19ShopServiceAccessor14DefaultTimeoutE");
-    uint64_t src = sdk_symbol("_ZN2nn2ec19ShopServiceAccessor14DefaultTimeoutE");
-    if (slot && src) memcpy(slot, (void *)(uintptr_t)src, 8);
 }
 
-/* ---------------------------------------------------------------- nn::friends: the client side as the SDK has it
- * Re-implemented from sdk.elf, instruction by instruction, with the friends system module (not in the dump) answering as
- * a console without friends and without a network (reference: suyu friend/friend.cpp + friend_interface.cpp: the
- * notification service exists and hands out an event; nothing ever signals it offline).
- *   detail::CheckUserStatus(uid) [sdk 0x1e0350]: an invalid Uid {0,0} is 0x479 (friends 121-0002); with the SDK's check flag
- *       set (.data 0xbfba40 = 1) the Uid must be one of the OPEN users (nn::account::ListOpenUsers), else 0x679 (121-0003).
- *   UserPresence::Initialize(uid) [sdk 0x1deff0]: CheckUserStatus; on success the Uid is stored at this+0.
- *   NotificationQueue::Initialize(uid) [sdk 0x1dec40]: CheckUserStatus; lock this (mutex at +0); create the notification
- *       service; its event handle is attached to the SystemEvent at this+0x38 (manual clear); Uid -> this+0x20;
- *       service -> this+0x30; unlock; success.
- *   NotificationQueue::Finalize() [sdk 0x1debf0]: lock; Uid at +0x20 cleared; if a service is held: release it,
- *       this+0x30 = 0, DestroySystemEvent(this+0x38); unlock.
- *   NotificationQueue::GetSystemEvent() [sdk 0x1dedf0]: lock; this+0x30 ? this+0x38 : NULL; unlock.
- * The service object is a token (the game never sees it; the SDK only keeps the pointer). */
-void os_init_event(uint64_t key, int autoclear);          /* os_threads.c */
-static uint8_t g_friends_service_token[16];
+/* ---------------------------------------------------------------- nn::friends AsyncContext: its mutex (+0), as the SDK locks it */
 static void fr_lock(Ctx *c, uint64_t self, int lock) {
     ImportFn f = import_lookup(lock ? "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE" : "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE");
     c->x[0] = self;
     if (f) f(c);
 }
-uint32_t fr_check_user(Ctx *c, uint64_t uid) {       /* also used by nnsdk.c (GetFriendList) */
-    uint64_t lo = rd64(uid), hi = rd64(uid + 8);
-    if (!lo && !hi) return 0x479;
-    uint64_t flag = sdk_symbol("__nnDetailNintendoSdkRuntimeObjectFileRefer") ? SDK_BASE + 0xbfba40 : 0;      /* the SDK image's own flag byte */
-    if (flag && rd8(flag)) {
-        int account_user_is_open(uint64_t lo, uint64_t hi);       /* nnfs.c: the host's account model (ListOpenUsers is not an import of the game) */
-        (void)c;
-        return account_user_is_open(lo, hi) ? 0 : 0x679;
-    }
-    return 0;
-}
-static void friends_UserPresence_Initialize(Ctx *c) {     /* (this, const Uid &) -> Result */
-    uint64_t self = A0, uid = A1;
-    uint32_t r = fr_check_user(c, uid);
-    if (!r) { wr64(self, rd64(uid)); wr64(self + 8, rd64(uid + 8)); }
-    RET(r);
-}
-static void friends_NQ_Initialize(Ctx *c) {               /* (this, const Uid &) -> Result */
-    uint64_t self = A0, uid = A1;
-    uint32_t r = fr_check_user(c, uid);
-    if (r) { RET(r); return; }
-    fr_lock(c, self, 1);
-    if (rd8(self + 0x60)) guest_trap("nn::friends::NotificationQueue::Initialize: [sdk 0x1ded68] abort path (flag at +0x60 set)", c->x[30] - 4);
-    os_init_event(self + 0x38, 0);                         /* the service's event, readable handle attached with manual clear; never signalled offline */
-    wr64(self + 0x20, rd64(uid)); wr64(self + 0x28, rd64(uid + 8));
-    wr64(self + 0x30, P(g_friends_service_token));
-    fr_lock(c, self, 0);
-    RET(0);
-}
-static void friends_NQ_Finalize(Ctx *c) {
-    uint64_t self = A0;
-    fr_lock(c, self, 1);
-    wr64(self + 0x20, 0); wr64(self + 0x28, 0);
-    if (rd64(self + 0x30)) {
-        ImportFn destroy = import_lookup("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
-        wr64(self + 0x30, 0);
-        c->x[0] = self + 0x38;
-        if (destroy) destroy(c);
-    }
-    fr_lock(c, self, 0);
-    c->x[0] = self;
-}
-static void friends_NQ_GetSystemEvent(Ctx *c) {
-    uint64_t self = A0, ev;
-    fr_lock(c, self, 1);
-    ev = rd64(self + 0x30) ? self + 0x38 : 0;
-    fr_lock(c, self, 0);
-    RET(ev);
-}
-static void online_register(void);                           /* nnonline.inc: account, friends, bcat directory / file, ngc, pdm, pl VR */
-static void sock_register(void);                           /* nnsocket.inc: nifm, sockets, ssl, nsd, ldn, ec accessor */
+static void online_register(void);                           /* nnonline.inc: account, friends, bcat directory / file, pl VR */
+static void sock_register(void);                           /* nnsocket.inc: nifm, sockets, ssl, nsd */
 void nnnet_register_final(void) {                          /* after every other table (nnservices.c): replaces the do-nothing versions */
-    static const ImportDef defs[] = {
-        {"_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", friends_UserPresence_Initialize},
-        {"_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", friends_NQ_Initialize},
-        {"_ZN2nn7friends17NotificationQueue8FinalizeEv", friends_NQ_Finalize},
-        {"_ZN2nn7friends17NotificationQueue14GetSystemEventEv", friends_NQ_GetSystemEvent},
-    };
-    register_imports(defs, (int)(sizeof defs / sizeof defs[0]));
     sock_register();
     online_register();
 }
@@ -226,19 +139,6 @@ int nnnet_selftest(Ctx *c) {
     printf("  bcat: DeliveryCacheProgress constructor / Update / getters / destructor (lifted): status 0, sizes 0, 0x258 bytes: %s\n", ok ? "ok" : "FAILED");
     bad += !ok;
     free(progress);
-    /* nn::ec */
-    uint8_t response[0x100];
-    uint64_t size = 123;
-    memset(response, 0xee, sizeof response);
-    c->x[0] = P(response); h("_ZN2nn2ec19ShopServiceAccessor13AsyncResponseC1Ev")(c);
-    ok = rd64(P(response)) == P(response) && rd64(P(response) + 0x18) == 0 && response[0x48] == 0 && response[0x49] == 0xee;
-    c->x[0] = P(response); ec_AsyncResponse_TryWait(c); ok = ok && c->x[0] == 1;
-    c->x[0] = P(response); c->x[1] = P(&size); h("_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7GetSizeEPm")(c); ok = ok && c->x[0] == EC_NO_RESPONSE && size == 123;
-    void *slot = import_data("_ZN2nn2ec19ShopServiceAccessor14DefaultTimeoutE");
-    int64_t timeout = 0;
-    if (slot) memcpy(&timeout, slot, 8);
-    printf("  ec: AsyncResponse constructor (lifted) + no-response answers; DefaultTimeout = %lld ns: %s\n", (long long)timeout, ok && timeout > 0 ? "ok" : "FAILED");
-    bad += !(ok && timeout > 0);
     /* small lifted getters */
     static const uint16_t digits[] = {'a', '1', '2', 0xff13, 'b', 0};   /* U+FF13 = fullwidth digit three */
     c->x[0] = P(digits); h("_ZN2nn3ngc12CountNumbersEPKt")(c);

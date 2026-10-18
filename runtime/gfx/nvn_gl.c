@@ -3970,7 +3970,6 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     glGenFramebuffers(2, g_fbo_tmp);
     glGenProgramPipelines(1, &g_pipeline);
     static const uint8_t black[4] = {0, 0, 0, 255};
-    { void album_movie_frame_source_attach(void); album_movie_frame_source_attach(); }   /* queue_present feeds the movie maker (job_present_movie) */
     glGenTextures(1, &g_dummy_tex);
     glBindTexture(GL_TEXTURE_2D, g_dummy_tex);
     glTexStorage2D(GL_TEXTURE_2D, 1, 0x8058, 1, 1);
@@ -4272,7 +4271,6 @@ static void smpb_wrap(Ctx *c) { SMP->ws = (uint8_t)A1; SMP->wt = (uint8_t)A2; SM
 static void smpb_lodclamp(Ctx *c) { SMP->lodmin = F0; SMP->lodmax = F1; }
 static void smpb_lodbias(Ctx *c) { SMP->bias = F0; }
 static void smpb_compare(Ctx *c) { SMP->cmode = (uint8_t)A1; SMP->cfunc = (uint8_t)A2; }
-static void smpb_border(Ctx *c) { if (A1) memcpy(SMP->border, P(A1), 16); }
 static void smpb_aniso(Ctx *c) { SMP->aniso = F0; }
 static void smpb_reduction(Ctx *c) { SMP->reduction = (uint8_t)A1; }
 static void smp_initialize(Ctx *c) { memcpy(P(A0), P(A1), sizeof(SamplerParams)); RET(1); }
@@ -4786,27 +4784,6 @@ static void win_acquire(Ctx *c) {                       /* (window, sync, int *t
 }
 static void queue_acquire(Ctx *c) { c->x[0] = c->x[1]; c->x[1] = 0; win_acquire(c); }      /* nvnQueueAcquireTexture(queue, window, int *textureIndex) */
 static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop[0] = (int)A1; w->crop[1] = (int)A2; w->crop[2] = (int)A3; w->crop[3] = (int)A4; } }
-/* a window built on the movie maker's native window (nn::album::GetMovieMakerNativeWindow, nnalbum.c) is not the screen:
- * what the game presents to it is one picture of the video being recorded. The picture is read back and handed to the encoder;
- * nothing is shown and the display is not paced by it. */
-uint64_t album_movie_native_window(void);
-int album_movie_push_frame(const uint8_t *rgba, int w, int h, int stride, int bottom_up);
-void album_movie_frame_source_attach(void);
-static void job_present_movie(void *arg) {
-    PresentJob *j = arg;
-    Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
-    if (!t || t->dead || !t->o.gl || t->b.width <= 0 || t->b.height <= 0) return;
-    int w = t->b.width, h = t->b.height;
-    uint8_t *px = malloc((size_t)w * h * 4);
-    if (!px) return;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_read);
-    glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);                /* GL row 0 is the top row of an NVN texture (see save_bmp) */
-    album_movie_push_frame(px, w, h, w * 4, 0);
-    free(px);
-    glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
-}
 /* SMO_PRESENT_ASYNC=1 (off by default): the present does not wait for the render thread either. The game
  * presents from a thread of its own and its main thread waits for that present (sead::Event in
  * al::GameFrameworkNx::procFrame_) before it starts the next frame, so with a waiting present the next frame's game work
@@ -4822,7 +4799,6 @@ static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
-    if (j.win && j.win->native && j.win->native == album_movie_native_window()) { gl_run(g_rb->present_movie, &j); return; }
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();
@@ -5417,7 +5393,7 @@ static void dev_finalize_command_handle(Ctx *c) {       /* (device, handle): the
 void nvn_render_run(void (*fn)(void *), void *arg) { gl_run(fn, arg); }
 /* the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
 static void rb_gl_idle(void) { gl_housekeeping(); }
-const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_present_movie, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,
+const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,
                         job_write_texels, job_read_texels, job_housekeeping, job_reset_status, job_grid, rb_gl_idle};
 
 /* ---- front-end services for the Vulkan back end (nvn_front.h). They are thin doors to

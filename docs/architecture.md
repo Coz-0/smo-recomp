@@ -80,7 +80,7 @@ killed in either phase leaves a whole save.
 
 The game's audio renderer, including its DSP command processing, is lifted SDK code; `smo_audio.c` supplies what lies
 below the SDK on a console (the renderer's clock and the output device, with a 6 to 2 channel downmix). `nnaudio.c`:
-raw PCM output and the Opus decoder.
+the answers to two audio-device imports, for a run in which the lifted SDK code does not replace them.
 
 ### `input/`
 
@@ -90,8 +90,8 @@ raw PCM output and the Opus decoder.
 
 ### `services/`: system services and applets
 
-The offline console: web pages and Help (`nnapplet.c`), the NFC reader that amiibo are held to, screenshots and the
-album (`nnalbum.c`), Mii, sockets on Winsock without TLS (`nnnet.c`, `nnsocket.inc`), the online services answering
+The offline console: web pages and Help (`nnapplet.c`), the NFC reader that amiibo are held to, the Capture button's
+pictures in the album folder (`nnalbum.c`), sockets on Winsock without TLS (`nnnet.c`, `nnsocket.inc`), the online services answering
 as a console without a network (`nnonline.inc`), the shared fonts (`nnpl.c`) and the font engine that draws them
 (`nnfontll.c`), the movie player on Windows Media Foundation (`nnmovie_mf.c`). `nnservices.c` registers these families
 and runs their self-test (`SMO_SDK_SELFTEST=1`).

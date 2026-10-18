@@ -1,9 +1,8 @@
-/* nn::fs directory functions on host folders: OpenDirectory, GetDirectoryEntryCount, ReadDirectory,
- * CloseDirectory, DeleteDirectory.
+/* nn::fs directory functions on host folders: OpenDirectory, ReadDirectory, CloseDirectory.
  *
- * nnfs.c (not edited: another worker owns it) has OpenDirectory as "path not found, not needed yet" and
- * does not have the other four. A directory that is never found is wrong for save data the game has
- * written itself, so OpenDirectory is REPLACED here (this file registers after nnfs.c) and the rest added.
+ * nnfs.c has OpenDirectory as "path not found" and not the other two. A directory that is never found is wrong for
+ * save data the game has written itself, so OpenDirectory is REPLACED here (this file registers after nnfs.c) and
+ * the rest added.
  * The mount-name mapping is the one documented at the top of nnfs.c and must stay identical to it:
  *   rom   -> %SMO_ROMFS% or ..\romfs,   any other mount -> ..\userdata\<mount name>
  *
@@ -12,9 +11,8 @@
  * 8-byte value passed in a register and sizeof(DirectoryEntry) = 0x310.
  * [doc] nnheaders nn/fs: DirectoryEntry { char name[0x301]; char pad[3]; s8 type @0x304 (0 directory,
  * 1 file); s64 fileSize @0x308 }; OpenDirectoryMode 1 = directories, 2 = files, 3 = all.
- * Results (module 2): [doc] switchbrew: PathNotFound 2002-0001 (0x202), DirectoryNotEmpty... the SDK code
- * for a non-empty directory is NOT ESTABLISHED here; 0x202 is returned when the folder is missing and the
- * same generic failure nnfs.c uses (0x3e802) when Windows refuses to remove it. */
+ * Results (module 2): [doc] switchbrew: PathNotFound 2002-0001 (0x202) when the folder is missing; the generic
+ * failure nnfs.c uses (0x3e802) for a handle that is not an open directory. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,21 +36,6 @@ typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 
 int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
 int fs_dir_hidden(const char *guest_dir, const char *name);
-uint32_t fs_delete_directory(const char *guest);
-static int dir_host_path(const char *guest, char *out) {  /* superseded by fs_dir_roots (kept for the self-test's scratch folder) */
-    const char *env = getenv("SMO_ROMFS");
-    const char *colon = guest ? strchr(guest, ':') : NULL;
-    if (!colon) return 0;
-    size_t n = (size_t)(colon - guest);
-    const char *rest = colon + 1;
-    while (*rest == '/' || *rest == '\\') rest++;
-    if (n == 3 && strncmp(guest, "rom", 3) == 0) snprintf(out, MAX_PATH, "%s\\%s", env && env[0] ? env : "..\\romfs", rest);
-    else snprintf(out, MAX_PATH, "..\\userdata\\%.*s\\%s", (int)n, guest, rest);
-    for (char *p = out; *p; p++) if (*p == '/') *p = '\\';
-    size_t len = strlen(out);
-    while (len > 1 && out[len - 1] == '\\') out[--len] = 0;
-    return 1;
-}
 
 static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *out, const char *path, int mode) -> Result */
     uint64_t out = A0;
@@ -113,11 +96,6 @@ static HostDir *dir_of(uint64_t handle) {
     HostDir *d = (HostDir *)(uintptr_t)handle;
     return handle > 0x10000 && d->magic == DIR_MAGIC ? d : NULL;
 }
-static void fs_GetDirectoryEntryCount(Ctx *c) {           /* (int64_t *out, DirectoryHandle) -> Result */
-    HostDir *d = dir_of(A1);
-    if (A0) wr64(A0, d ? (uint64_t)d->count : 0);
-    RET(d ? 0 : RESULT_GENERIC_FAILURE);
-}
 static void fs_ReadDirectory(Ctx *c) {                    /* (int64_t *outCount, DirectoryEntry *entries, DirectoryHandle, int64_t max) -> Result */
     HostDir *d = dir_of(A2);
     uint64_t out = A1;
@@ -139,17 +117,12 @@ static void fs_CloseDirectory(Ctx *c) {                   /* (DirectoryHandle) *
     HostDir *d = dir_of(A0);
     if (d) { d->magic = 0; free(d->entries); free(d); }
 }
-static void fs_DeleteDirectory(Ctx *c) {                  /* (const char *path) -> Result; the directory must be empty */
-    RET(fs_delete_directory((const char *)(uintptr_t)A0));
-}
 
 #define FS(n) "_ZN2nn2fs" n
 static const ImportDef fsdir_imports[] = {
     {FS("13OpenDirectoryEPNS0_15DirectoryHandleEPKci"), fs_OpenDirectory},
-    {FS("22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE"), fs_GetDirectoryEntryCount},
     {FS("13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl"), fs_ReadDirectory},
     {FS("14CloseDirectoryENS0_15DirectoryHandleE"), fs_CloseDirectory},
-    {FS("15DeleteDirectoryEPKc"), fs_DeleteDirectory},
 };
 void register_nnfsdir_imports(void) {
     int n = (int)(sizeof fsdir_imports / sizeof fsdir_imports[0]);
@@ -176,13 +149,11 @@ int nnfsdir_selftest(Ctx *c) {
     static const int expect[4] = {0, 1, 2, 3};
     for (int mode = 1; mode <= 3; mode++) {
         uint64_t handle = 0;
-        int64_t count = -1, got = -1;
+        int64_t got = -1;
         uint8_t *entries = malloc(4 * ENTRY_SIZE + 16);
         memset(entries, 0xee, 4 * ENTRY_SIZE + 16);
         c->x[0] = P(&handle); c->x[1] = P("sdkselftest:/d"); c->x[2] = (uint64_t)mode; fs_OpenDirectory(c);
         ok = ok && c->x[0] == 0 && handle;
-        c->x[0] = P(&count); c->x[1] = handle; fs_GetDirectoryEntryCount(c);
-        ok = ok && c->x[0] == 0 && count == expect[mode];
         c->x[0] = P(&got); c->x[1] = P(entries); c->x[2] = handle; c->x[3] = 4; fs_ReadDirectory(c);
         ok = ok && c->x[0] == 0 && got == expect[mode];
         for (int i = 0; i < got && ok; i++) {
@@ -204,15 +175,11 @@ int nnfsdir_selftest(Ctx *c) {
     uint64_t handle = 1;
     c->x[0] = P(&handle); c->x[1] = P("sdkselftest:/missing"); c->x[2] = 3; fs_OpenDirectory(c);
     ok = ok && c->x[0] == RESULT_PATH_NOT_FOUND && handle == 0;
-    c->x[0] = P("sdkselftest:/d"); fs_DeleteDirectory(c);
-    ok = ok && c->x[0] != 0;                               /* not empty */
     snprintf(p, sizeof p, "%s\\d\\a.bin", base); DeleteFileA(p);
     snprintf(p, sizeof p, "%s\\d\\b.bin", base); DeleteFileA(p);
-    c->x[0] = P("sdkselftest:/d/sub"); fs_DeleteDirectory(c);
-    ok = ok && c->x[0] == 0;
-    c->x[0] = P("sdkselftest:/d"); fs_DeleteDirectory(c);
-    ok = ok && c->x[0] == 0;
+    snprintf(p, sizeof p, "%s\\d\\sub", base); RemoveDirectoryA(p);
+    snprintf(p, sizeof p, "%s\\d", base); RemoveDirectoryA(p);
     RemoveDirectoryA(base);
-    printf("  fs: OpenDirectory / GetDirectoryEntryCount / ReadDirectory (modes 1, 2, 3; 0x310-byte entries) / DeleteDirectory: %s\n", ok ? "ok" : "FAILED");
+    printf("  fs: OpenDirectory / ReadDirectory (modes 1, 2, 3; 0x310-byte entries): %s\n", ok ? "ok" : "FAILED");
     return !ok;
 }

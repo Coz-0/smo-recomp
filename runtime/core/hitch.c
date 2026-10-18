@@ -39,8 +39,6 @@ static HRec *rec_get(void) {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_rec[i].h, 0, FALSE, DUPLICATE_SAME_ACCESS);
     return t_rec = &g_rec[i];
 }
-/* The register context now running on this host thread (thread start, fiber switches). */
-void hitch_cur_ctx(Ctx *c) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) r->ctx = c; } }
 void hitch_set_main(Ctx *c) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) { r->ctx = c; g_main_rec = r; } } }
 void hitch_set_render(void) { if (g_hitch_ms) g_render_rec = rec_get(); }
 /* A detail for what this thread is doing inside an import (file name, module name); NULL clears it. */

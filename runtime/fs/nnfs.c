@@ -48,7 +48,6 @@
  * 7 DirectoryNotEmpty, 6400 PermissionDenied (suyu file_sys/errors.h; write to the read-only rom). */
 #define RESULT_PATH_NOT_FOUND 0x202u
 #define RESULT_PATH_ALREADY_EXISTS 0x402u
-#define RESULT_DIRECTORY_NOT_EMPTY 0xe02u
 #define RESULT_MOUNT_NAME_EXISTS 0x7802u
 #define RESULT_TARGET_NOT_FOUND 0x7d402u
 #define RESULT_OUT_OF_RANGE 0x177a02u
@@ -134,10 +133,6 @@ static void tomb_add(Mount *m, const char *rel) {
     m->tomb = realloc(m->tomb, sizeof(char *) * (size_t)(m->tomb_n + 1));
     m->tomb[m->tomb_n++] = _strdup(rel);
 }
-static void tomb_remove(Mount *m, const char *rel) {
-    int i = tomb_find(m, rel);
-    if (i >= 0) { free(m->tomb[i]); m->tomb[i] = m->tomb[--m->tomb_n]; }
-}
 static void tomb_clear(Mount *m) { for (int i = 0; i < m->tomb_n; i++) free(m->tomb[i]); free(m->tomb); m->tomb = NULL; m->tomb_n = 0; }
 
 /* ---- path resolution */
@@ -213,42 +208,6 @@ int fs_dir_hidden(const char *guest_dir, const char *name) {      /* 1 = this en
     if (!split_path(guest_dir, &m, rel) && m->work[0]) { join(full, rel, name); hidden = tomb_hides(m, rel[0] ? full : name); }
     fs_unlock();
     return hidden;
-}
-uint32_t fs_delete_directory(const char *guest) {
-    Mount *m; char rel[MAX_PATH], host[MAX_PATH], roots[2][MAX_PATH];
-    uint32_t r;
-    fs_lock();
-    r = split_path(guest, &m, rel);
-    if (!r && m->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
-    if (!r && (!view_path(m, rel, host) || !is_dir(host))) r = RESULT_PATH_NOT_FOUND;
-    fs_unlock();
-    if (r) return r;
-    uint32_t r2;                                          /* empty in the view? */
-    int n = fs_dir_roots(guest, roots, &r2);
-    for (int i = 0; i < n; i++) {
-        char pat[MAX_PATH + 4];
-        WIN32_FIND_DATAA fd;
-        snprintf(pat, sizeof pat, "%s\\*", roots[i]);
-        HANDLE h = FindFirstFileA(pat, &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            int from_committed = !m->work[0] || _strnicmp(roots[i], m->work, strlen(m->work)) != 0;
-            if (from_committed && m->work[0] && fs_dir_hidden(guest, fd.cFileName)) continue;       /* deleted in the working state */
-            FindClose(h);
-            return RESULT_DIRECTORY_NOT_EMPTY;
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
-    fs_lock();
-    if (m->work[0]) {
-        char w[MAX_PATH], cm[MAX_PATH];
-        join(w, m->work, rel); join(cm, m->root, rel);
-        if (is_dir(w)) RemoveDirectoryA(w);
-        if (is_dir(cm)) tomb_add(m, rel);
-    } else r = RemoveDirectoryA(host) ? 0 : RESULT_GENERIC_FAILURE;
-    fs_unlock();
-    return r;
 }
 
 /* Open files: nn::fs::FileHandle is the Windows handle itself; the open mode (1 read, 2 write, 4 allow append) and the
@@ -400,15 +359,6 @@ static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, c
     trace_printf("     fs mount save data \"%s\" -> %s, journal working folder %s.work.%lu (%x)\n", STR(0), dir, dir, (unsigned long)GetCurrentProcessId(), r);
     RET(r);
 }
-static void fs_MountCacheStorage(Ctx *c) {               /* (const char *name): the application's cache storage, created on first use */
-    char dir[MAX_PATH];
-    save_dir(dir, "cache");
-    CreateDirectoryA(dir, NULL);
-    journal_recover(dir);
-    uint32_t r = mount_add(STR(0), MK_CACHE, dir);
-    trace_printf("     fs mount cache storage \"%s\" -> %s (%x)\n", STR(0), dir, r);
-    RET(r);
-}
 static void fs_Unmount(Ctx *c) {                         /* (const char *name): uncommitted changes are dropped */
     const char *name = STR(0);
     fs_lock();
@@ -427,7 +377,6 @@ static void fs_EnsureSaveData(Ctx *c) {                  /* (const Uid &): creat
     save_dir(dir, "save");
     RET(CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
 }
-static void fs_IsSaveDataExisting(Ctx *c) { RET(save_exists()); }
 static void fs_Commit(Ctx *c) {                          /* (const char *mount name) */
     const char *name = STR(0);
     char journal[MAX_PATH], marker[MAX_PATH];
@@ -553,15 +502,6 @@ static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     if (g_hitch_ms) hitch_note(NULL);
     return total;
 }
-static volatile LONG g_read_log;
-static void fs_ReadFile(Ctx *c) {                     /* (handle, offset, buffer, size) */
-    uint64_t got = read_at((HANDLE)A0, (int64_t)A1, (void *)(uintptr_t)A2, A3);
-    if (InterlockedIncrement(&g_read_log) <= 60)
-        trace_printf("     fs read offset %llx size %llx -> %llx bytes  from=%llx\n", (unsigned long long)A1,
-                     (unsigned long long)A3, (unsigned long long)got, (unsigned long long)c->x[30] - 4);
-    if (got != A3 && getenv("SMO_FSLOG")) printf("fslog: ReadFile SHORT handle %llx offset %llx size %llx got %llx from=%llx\n", (unsigned long long)A0, (unsigned long long)A1, (unsigned long long)A3, (unsigned long long)got, (unsigned long long)c->x[30] - 4);   /* D2 debug */
-    RET(got == A3 ? 0 : RESULT_OUT_OF_RANGE);            /* this overload must read exactly `size` bytes */
-}
 static void fs_ReadFileCount(Ctx *c) {                /* (size_t *outRead, handle, offset, buffer, size) */
     uint64_t got = read_at((HANDLE)A1, (int64_t)A2, (void *)(uintptr_t)A3, A4);
     wr64(A0, got);
@@ -669,7 +609,6 @@ static void fs_GetEntryType(Ctx *c) {                 /* (DirectoryEntryType *ou
     RET(0);
 }
 static void fs_OpenDirectory(Ctx *c) { wr64(A0, 0); RET(RESULT_PATH_NOT_FOUND); }   /* replaced by nnfsdir.c */
-static void fs_false(Ctx *c) { RET(0); }
 
 /* ---- self-test of the mount table and of the save data journal, in a scratch folder under %TEMP% (SMO_SDK_SELFTEST) */
 uint32_t fs_mount_plain(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_PLAIN, host_dir); }
@@ -785,21 +724,12 @@ int nnfs_selftest(Ctx *c) {
 }
 
 /* ---- nn::account: one local user with a fixed id */
-static void acc_ListAllUsers(Ctx *c) { wr32(A0, 1); if ((int)A2 > 0) { wr64(A1, 1); wr64(A1 + 8, 0); } RET(0); }
-static volatile LONG g_acc_user_open;                    /* the one local user {1, 0} has been opened (there is no CloseUser import) */
-int account_user_is_open(uint64_t lo, uint64_t hi) { return g_acc_user_open && lo == 1 && hi == 0; }
-static void acc_TryOpenPreselectedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(1); }
 static void acc_GetUserId(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0); }
-/* SDK 3.5.1 forms the game imports. [doc] OpenPreselectedUser(UserHandle*): the user chosen at start-up,
- * opened (the SDK aborts if there is none; here there always is the one local user {1, 0}). OpenUser(UserHandle*, Uid&):
- * opens that user; any other uid is not a user of this console (account 124-0006... is NOT VERIFIED, so it stops).
- * CloseUser(UserHandle&) closes it. GetLastOpenedUser(Uid*): the user opened most recently on the console = {1, 0}. */
-static void acc_OpenPreselectedUser(Ctx *c) { acc_TryOpenPreselectedUser(c); }
-static void acc_OpenUser(Ctx *c) {
-    if (rd64(A1) != 1 || rd64(A1 + 8) != 0) guest_trap("nn::account::OpenUser: not the console's user", c->x[30] - 4);
-    wr64(A0, 1); wr64(A0 + 8, 0); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(0);
-}
-static void acc_CloseUser(Ctx *c) { (void)c; InterlockedExchange(&g_acc_user_open, 0); }
+/* [doc] OpenPreselectedUser(UserHandle*): the user chosen at start-up, opened (the SDK aborts if there is none; here
+ * there always is the one local user {1, 0}). CloseUser(UserHandle&) closes it. GetLastOpenedUser(Uid*): the user
+ * opened most recently on the console = {1, 0}. */
+static void acc_OpenPreselectedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); wr64(A0 + 16, 0); RET(1); }
+static void acc_CloseUser(Ctx *c) { (void)c; }
 static void acc_GetLastOpenedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0); }
 /* The nickname of the console user is the name of the Windows user (SMO_NICKNAME overrides): UTF-8, at most 32
  * bytes, NUL-terminated, in the 33-byte Nickname. */
@@ -844,28 +774,25 @@ static void nifm_false(Ctx *c) { RET(0); }
 #define AC(n) "_ZN2nn7account" n
 #define NI(n) "_ZN2nn4nifm" n
 static const ImportDef fs_imports[] = {
-    {FS("8MountRomEPKcPvm"), fs_MountRom}, {FS("13MountSaveDataEPKcRKNS_7account3UidE"), fs_MountSaveData}, {FS("17MountCacheStorageEPKc"), fs_MountCacheStorage},
-    {FS("7UnmountEPKc"), fs_Unmount}, {FS("22QueryMountRomCacheSizeEPm"), fs_QueryMountRomCacheSize}, {FS("6CommitEPKc"), fs_Commit}, {FS("14CommitSaveDataEPKc"), fs_Commit} /* the 3.5.1 name; [sdk 0x4e72c] detail::Find + FileSystemAccessor::Commit, as Commit */, {FS("14EnsureSaveDataERKNS_7account3UidE"), fs_EnsureSaveData},
-    {FS("18IsSaveDataExistingERKNS_7account3UidE"), fs_IsSaveDataExisting},
+    {FS("8MountRomEPKcPvm"), fs_MountRom}, {FS("13MountSaveDataEPKcRKNS_7account3UidE"), fs_MountSaveData},
+    {FS("7UnmountEPKc"), fs_Unmount}, {FS("22QueryMountRomCacheSizeEPm"), fs_QueryMountRomCacheSize}, {FS("14CommitSaveDataEPKc"), fs_Commit} /* the 3.5.1 name; [sdk 0x4e72c] detail::Find + FileSystemAccessor::Commit, as Commit */, {FS("14EnsureSaveDataERKNS_7account3UidE"), fs_EnsureSaveData},
     {FS("8OpenFileEPNS0_10FileHandleEPKci"), fs_OpenFile}, {FS("9CloseFileENS0_10FileHandleE"), fs_CloseFile},
-    {FS("8ReadFileENS0_10FileHandleElPvm"), fs_ReadFile}, {FS("8ReadFileEPmNS0_10FileHandleElPvm"), fs_ReadFileCount},
+    {FS("8ReadFileEPmNS0_10FileHandleElPvm"), fs_ReadFileCount},
     {FS("9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE"), fs_WriteFile}, {FS("11GetFileSizeEPlNS0_10FileHandleE"), fs_GetFileSize},
     {FS("11SetFileSizeENS0_10FileHandleEl"), fs_SetFileSize}, {FS("9FlushFileENS0_10FileHandleE"), fs_FlushFile},
     {FS("10CreateFileEPKcl"), fs_CreateFile}, {FS("10DeleteFileEPKc"), fs_DeleteFile}, {FS("15CreateDirectoryEPKc"), fs_CreateDirectory},
     {FS("12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc"), fs_GetEntryType}, {FS("13OpenDirectoryEPNS0_15DirectoryHandleEPKci"), fs_OpenDirectory},
-    {AC("10InitializeEv"), fs_ok}, {AC("12ListAllUsersEPiPNS0_3UidEi"), acc_ListAllUsers},
-    {AC("22TryOpenPreselectedUserEPNS0_10UserHandleE"), acc_TryOpenPreselectedUser},
-    {AC("19OpenPreselectedUserEPNS0_10UserHandleE"), acc_OpenPreselectedUser}, {AC("8OpenUserEPNS0_10UserHandleERKNS0_3UidE"), acc_OpenUser},
+    {AC("10InitializeEv"), fs_ok},
+    {AC("19OpenPreselectedUserEPNS0_10UserHandleE"), acc_OpenPreselectedUser},
     {AC("9CloseUserERKNS0_10UserHandleE"), acc_CloseUser}, {AC("17GetLastOpenedUserEPNS0_3UidE"), acc_GetLastOpenedUser},
     {FS("8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE"), fs_ReadFileCount},   /* ReadOption (x5) has no flags in this SDK */
     {AC("9GetUserIdEPNS0_3UidERKNS0_10UserHandleE"), acc_GetUserId}, {AC("11GetNicknameEPNS0_8NicknameERKNS0_3UidE"), acc_GetNickname},
-    {AC("16GetUserExistenceEPbRKNS0_3UidE"), acc_out_true},
     {AC("32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE"), acc_out_false},
     {AC("36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE"), acc_unavailable},
-    {AC("25CachedNintendoAccountInfoC1Ev"), keep}, {AC("12AsyncContextC1Ev"), keep}, {AC("12AsyncContextD1Ev"), keep},
+    {AC("12AsyncContextC1Ev"), keep}, {AC("12AsyncContextD1Ev"), keep},
     {AC("12AsyncContext7HasDoneEPb"), acc_out_true}, {AC("12AsyncContext9GetResultEv"), acc_unavailable},
     {NI("10InitializeEv"), fs_ok}, {NI("18IsNetworkAvailableEv"), nifm_false}, {NI("22IsNetworkRequestOnHoldEv"), nifm_false},
-    {NI("20SubmitNetworkRequestEv"), keep}, {NI("27SubmitNetworkRequestAndWaitEv"), keep}, {NI("20CancelNetworkRequestEv"), keep},
+    {NI("20SubmitNetworkRequestEv"), keep}, {NI("27SubmitNetworkRequestAndWaitEv"), keep},
 };
 
 void register_fs_imports(void) {

@@ -14,20 +14,10 @@
 #define A0 (c->x[0])
 #define A1 (c->x[1])
 #define A2 (c->x[2])
-#define A3 (c->x[3])
 #define RET(v) (c->x[0] = (uint64_t)(v))
 
 static int64_t now_posix(void) { return (int64_t)_time64(NULL); }
 
-static void write_calendar(uint64_t out, const struct tm *t) {
-    wr16(out, (uint16_t)(t->tm_year + 1900));
-    wr8(out + 2, (uint8_t)(t->tm_mon + 1));
-    wr8(out + 3, (uint8_t)t->tm_mday);
-    wr8(out + 4, (uint8_t)t->tm_hour);
-    wr8(out + 5, (uint8_t)t->tm_min);
-    wr8(out + 6, (uint8_t)t->tm_sec);
-    wr8(out + 7, 0);
-}
 static void read_calendar(uint64_t in, struct tm *t) {
     memset(t, 0, sizeof *t);
     t->tm_year = (int16_t)rd16(in) - 1900;
@@ -43,9 +33,8 @@ void host_clock_caller(const char *what, uint64_t lr);       /* nnsdk.c: SMO_TIC
 static void time_GetCurrentTime(Ctx *c) { host_clock_caller("GetCurrentTime", c->x[30]); wr64(A0, (uint64_t)now_posix()); RET(0); }
 /* ------------------------------------------------------------------------------------------------------------------
  * Time zone rule.
- * On the console: [sdk 0x391820] ToCalendarTime(out, info, posix) = ITimeZoneService slot +0x60 (ToCalendarTimeWithMyRule),
- * [0x391760] the form with a rule = slot +0x58, [0x391970] ToPosixTime = slot +0x70 with min(count, 2) results,
- * [0x391700] LoadTimeZoneRule = slot +0x40; each answers 0x74 when nn::time is not initialised. The time module (not in
+ * On the console: [sdk 0x391820] ToCalendarTime(out, info, posix) = ITimeZoneService slot +0x60 (ToCalendarTimeWithMyRule);
+ * it answers 0x74 when nn::time is not initialised. The time module (not in
  * the dump) keeps "my rule": the TZif file of the device's location, from the TimeZoneBinary system archive, parsed into
  * the 0x4000-byte rule below (suyu externals/tz/tz/tz.h Rule; glue/time/time_zone.cpp; psc/time/time_zone.cpp), and
  * converts with the public tz code (localsub). The archive is not in ..\sysdata, so the rule is BUILT here, in the same
@@ -68,7 +57,6 @@ typedef struct { LONG Bias, StandardBias, DaylightBias; SYSTEMTIME StandardDate,
 typedef struct { RegTzi base; int first, last; RegTzi dyn[160]; uint8_t have[160]; } WinZone;
 #define TZ_OVERFLOW 0x19274u            /* module 116, description 201 */
 #define TZ_OUT_OF_RANGE 0x70c74u        /* 902 */
-#define TZ_NOT_FOUND 0x7ba74u           /* 989 */
 
 static int64_t days_from_civil(int64_t y, int m, int d) {
     y -= m <= 2;
@@ -359,29 +347,6 @@ static TzRule *my_rule(void) {                                              /* t
     while (ready != 2) SwitchToThread();
     return &rule;
 }
-static int tzrule_for_location(TzRule *out, const char *iana) {            /* LoadTimeZoneRule: any location Windows has a zone for */
-    char mine[0x24];
-    location_name(mine);
-    if (!strcmp(mine, iana)) { memcpy(out, my_rule(), sizeof *out); return 0; }
-    HMODULE icu = LoadLibraryA("icu.dll");
-    typedef int (__cdecl *ToWin)(const unsigned short *, int, unsigned short *, int, int *);
-    ToWin to_win = icu ? (ToWin)GetProcAddress(icu, "ucal_getWindowsTimeZoneID") : NULL;
-    unsigned short id[0x24], win[128];
-    int err = 0, n = 0;
-    static WinZone z;                                                       /* callers are serialised by the service's lock on the console; here by this lock */
-    static SRWLOCK lock = SRWLOCK_INIT;
-    if (!to_win) return -1;
-    for (; iana[n] && n < 0x23; n++) id[n] = (unsigned char)iana[n];
-    id[n] = 0;
-    n = to_win(id, n, win, 127, &err);
-    if (err > 0 || n <= 0) return -1;
-    win[n] = 0;
-    AcquireSRWLockExclusive(&lock);
-    int bad = winzone_load((const wchar_t *)win, &z);
-    if (!bad) tzrule_build(out, &z, iana, 0, 0);
-    ReleaseSRWLockExclusive(&lock);
-    return bad;
-}
 static void calendar_out(Ctx *c, const TzRule *r) {
     TzTm t;
     if (tz_validate(r)) { RET(TZ_OUT_OF_RANGE); return; }
@@ -402,106 +367,8 @@ static void calendar_out(Ctx *c, const TzRule *r) {
     RET(0);
 }
 static void time_ToCalendarTime(Ctx *c) { calendar_out(c, my_rule()); }    /* (CalendarTime *out, CalendarAdditionalInfo *info, const PosixTime &t) */
-static void time_ToCalendarTimeRule(Ctx *c) { calendar_out(c, (const TzRule *)(uintptr_t)A3); }   /* ... , const TimeZoneRule &) */
-static void time_LoadTimeZoneRule(Ctx *c) {                                 /* (TimeZoneRule *out, const LocationName &) */
-    char name[0x25];
-    memcpy(name, (void *)(uintptr_t)A1, 0x24); name[0x24] = 0;
-    RET(tzrule_for_location((TzRule *)(uintptr_t)A0, name) ? TZ_NOT_FOUND : 0);
-}
-/* All instants whose local time is the calendar time: none inside a spring-forward gap, two in a fall-back hour (ascending). */
-static int tz_to_posix(const TzRule *r, int year, int mon, int mday, int hour, int min, int sec, int64_t out[2]) {
-    int n = 0;
-    if (mon < 1 || mon > 12) return 0;
-    int64_t utc = days_from_civil(year, mon, mday) * 86400 + hour * 3600 + min * 60 + sec;
-    for (int i = 0; i < r->typecnt && n < 2; i++) {
-        int64_t t = utc - r->ttis[i].utoff;
-        TzTm b;
-        if (n && out[0] == t) continue;
-        if (tz_local(r, t, &b) || b.year != year || b.mon != mon || b.mday != mday || b.hour != hour || b.min != min || b.sec != sec) continue;
-        out[n++] = t;
-    }
-    if (n == 2 && out[0] > out[1]) { int64_t s = out[0]; out[0] = out[1]; out[1] = s; }
-    return n;
-}
-static void time_ToCalendarTimeInUtc(Ctx *c) {            /* returns CalendarTime (8 bytes) in x0 */
-    __time64_t t = (__time64_t)rd64(A0);
-    struct tm utc;
-    uint64_t packed = 0;
-    if (!_gmtime64_s(&utc, &t)) write_calendar((uint64_t)(uintptr_t)&packed, &utc);
-    RET(packed);
-}
 static void time_ToPosixTimeFromUtc(Ctx *c) { struct tm t; read_calendar(A0, &t); t.tm_isdst = 0; RET((int64_t)_mkgmtime64(&t)); }
-static void time_ToPosixTime(Ctx *c) {                    /* (int *outCount, PosixTime *out, int count, const CalendarTime &) */
-    int64_t v[2];                                         /* [sdk 0x391970]: at most min(count, 2) results; the module answers 0 for a time that does not exist */
-    const TzRule *r = my_rule();
-    int max = (int32_t)A2 < 2 ? (int32_t)A2 : 2;
-    int n = tz_to_posix(r, (int16_t)rd16(A3), (int8_t)rd8(A3 + 2), (int8_t)rd8(A3 + 3), (int8_t)rd8(A3 + 4), (int8_t)rd8(A3 + 5), (int8_t)rd8(A3 + 6), v);
-    if (n > max) n = max < 0 ? 0 : max;
-    for (int i = 0; i < n; i++) wr64(A1 + (uint64_t)i * 8, (uint64_t)v[i]);
-    if (A0) wr32(A0, (uint32_t)n);
-    RET(0);
-}
-static int days_in_month(int y, int m) {
-    static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
-    return d[m - 1];
-}
-static void time_IsValidDate(Ctx *c) {
-    int y = (int32_t)A0, m = (int32_t)A1, d = (int32_t)A2;
-    RET(y >= 1 && m >= 1 && m <= 12 && d >= 1 && d <= days_in_month(y, m));
-}
-static void time_GetDayOfWeek(Ctx *c) {                   /* Sakamoto's method; 0 = Sunday */
-    static const int t[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    int y = (int32_t)A0, m = (int32_t)A1, d = (int32_t)A2;
-    if (m < 1 || m > 12) { RET(0); return; }
-    if (m < 3) y -= 1;
-    RET((uint64_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7));
-}
-static void time_CalendarGreater(Ctx *c) {                /* operator>(const CalendarTime &, const CalendarTime &) */
-    struct tm a, b;
-    read_calendar(A0, &a);
-    read_calendar(A1, &b);
-    int ka[6] = {a.tm_year, a.tm_mon, a.tm_mday, a.tm_hour, a.tm_min, a.tm_sec};
-    int kb[6] = {b.tm_year, b.tm_mon, b.tm_mday, b.tm_hour, b.tm_min, b.tm_sec};
-    for (int i = 0; i < 6; i++) if (ka[i] != kb[i]) { RET(ka[i] > kb[i]); return; }
-    RET(0);
-}
-static void time_SteadyNow(Ctx *c) {                      /* nanoseconds on a monotonic clock */
-    LARGE_INTEGER now, freq;
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&freq);
-    RET((uint64_t)((double)now.QuadPart * 1e9 / (double)freq.QuadPart));
-}
-/* nn::time::ClockSnapshot (0xd0 bytes). The constructor is the SDK's own code (lifted, [sdk 0x38fc00]). The contents are
- * produced by the time system module ([sdk 0x38fce0] CreateWithStandardSystemClock = IStaticService::GetClockSnapshot(out,
- * type 1); [sdk 0x38f030] CalculateSpanBetween = IStaticService::CalculateSpanBetween), which is not in the dump: both are
- * re-implemented here after the reference implementation (suyu psc/time/static.cpp GetClockSnapshotImpl / CalculateSpanBetween,
- * layout psc/time/common.h, which agrees with the offsets the SDK constructor writes):
- *   +0x00 user SystemClockContext { s64 offset; SteadyClockTimePoint { s64 seconds; u8 sourceId[16] } }   +0x20 network context
- *   +0x40 user time (posix)   +0x48 network time   +0x50 user CalendarTime   +0x58 network CalendarTime
- *   +0x60 user CalendarAdditionalInfo (0x18)   +0x78 network CalendarAdditionalInfo
- *   +0x90 SteadyClockTimePoint now   +0xa8 LocationName (0x24)   +0xcc automatic correction enabled   +0xcd type
- * Host sources: the steady clock is the time since Windows started (GetTickCount64) with a source id made from the boot
- * time, so two snapshots of one Windows session compare by the steady clock, as on the console between RTC resets; the
- * system clocks are the Windows clock; the location name is the IANA name of the Windows time zone (ICU, Windows 10 1903+;
- * "UTC" if ICU is absent); automatic correction = Windows time synchronisation is on (W32Time Type != NoSync).
- * NOT VERIFIED against a console: the time point stored inside the two contexts (the moment the clock was last set; 0 here). */
-static void steady_now(int64_t *seconds, uint8_t id[16]) {
-    static uint8_t source[16];
-    static volatile LONG ready;
-    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        uint64_t boot = ((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10000 - GetTickCount64()) / 60000;   /* boot time, to the minute */
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (int i = 0; i < 16; i++) { h = (h ^ ((boot >> ((i & 7) * 8)) & 0xff) ^ (uint64_t)i) * 0x100000001b3ull; source[i] = (uint8_t)(h >> 32); }
-        source[6] = (uint8_t)((source[6] & 0x0f) | 0x40); source[8] = (uint8_t)((source[8] & 0x3f) | 0x80);          /* a version 4 UUID */
-        ready = 2;
-    }
-    while (ready != 2) SwitchToThread();
-    *seconds = (int64_t)(GetTickCount64() / 1000);
-    memcpy(id, source, 16);
-}
+/* The location name: the IANA name of the Windows time zone (ICU, Windows 10 1903+; "UTC" if ICU is absent). */
 static void location_name(char out[0x24]) {
     static char name[0x24];
     static volatile LONG ready;
@@ -521,44 +388,7 @@ static void location_name(char out[0x24]) {
     memset(out, 0, 0x24);
     strcpy(out, name);
 }
-static int auto_correction(void) {
-    char type[32] = "";
-    DWORD size = sizeof type;
-    if (SHGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\W32Time\\Parameters", "Type", NULL, type, &size) != ERROR_SUCCESS) return 1;
-    return _stricmp(type, "NoSync") != 0;
-}
 static void time_ToCalendarTime(Ctx *c);
-static void time_Snapshot_create(Ctx *c) {                /* (ClockSnapshot *out) */
-    uint64_t s = A0;
-    int64_t now = now_posix(), tp;
-    uint8_t id[16];
-    steady_now(&tp, id);
-    memset((void *)(uintptr_t)s, 0, 0xd0);
-    for (int k = 0; k < 2; k++) {                          /* user and network clock: both are the Windows clock */
-        uint64_t ctx = s + (uint64_t)k * 0x20;
-        wr64(ctx, (uint64_t)(now - tp));
-        wr64(ctx + 8, 0);
-        memcpy((void *)(uintptr_t)(ctx + 0x10), id, 16);
-        wr64(s + 0x40 + (uint64_t)k * 8, (uint64_t)now);
-        c->x[0] = s + 0x50 + (uint64_t)k * 8; c->x[1] = s + 0x60 + (uint64_t)k * 0x18; c->x[2] = s + 0x40 + (uint64_t)k * 8;
-        time_ToCalendarTime(c);
-    }
-    wr64(s + 0x90, (uint64_t)tp);
-    memcpy((void *)(uintptr_t)(s + 0x98), id, 16);
-    location_name((char *)(uintptr_t)(s + 0xa8));
-    wr8(s + 0xcc, (uint8_t)auto_correction());
-    wr8(s + 0xcd, 1);                                      /* ClockSnapshotType of this call ([sdk 0x38fd24] w2 = 1) */
-    c->x[0] = s;
-}
-static void time_CalculateSpanBetween(Ctx *c) {           /* (TimeSpan *out, const ClockSnapshot &a, const ClockSnapshot &b) -> bool */
-    uint64_t out = A0, a = A1, b = A2;
-    int64_t seconds;
-    if (memcmp((void *)(uintptr_t)(a + 0x98), (void *)(uintptr_t)(b + 0x98), 16) == 0) seconds = (int64_t)rd64(b + 0x90) - (int64_t)rd64(a + 0x90);
-    else if (rd64(a + 0x48) && rd64(b + 0x48)) seconds = (int64_t)rd64(b + 0x48) - (int64_t)rd64(a + 0x48);      /* different steady clock sources: the network clocks */
-    else { RET(0); return; }
-    wr64(out, (uint64_t)(seconds * 1000000000LL));
-    RET(1);
-}
 static void ret0(Ctx *c) { RET(0); }
 static void ret1(Ctx *c) { RET(1); }
 
@@ -566,18 +396,8 @@ static void ret1(Ctx *c) { RET(1); }
 static const ImportDef time_imports[] = {
     {T("13IsInitializedEv"), ret1}, {T("10InitializeEv"), ret0}, {T("8FinalizeEv"), ret0},
     {T("23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE"), time_GetCurrentTime},
-    {T("26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE"), time_GetCurrentTime},
     {T("14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE"), time_ToCalendarTime},
-    {T("14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeERKNS0_12TimeZoneRuleE"), time_ToCalendarTimeRule},
-    {T("19ToCalendarTimeInUtcERKNS0_9PosixTimeE"), time_ToCalendarTimeInUtc},
     {T("18ToPosixTimeFromUtcERKNS0_12CalendarTimeE"), time_ToPosixTimeFromUtc},
-    {T("11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE"), time_ToPosixTime},
-    {T("11IsValidDateEiii"), time_IsValidDate}, {T("12GetDayOfWeekEiii"), time_GetDayOfWeek},
-    {T("gtERKNS0_12CalendarTimeES3_"), time_CalendarGreater},
-    {T("19StandardSteadyClock3nowEv"), time_SteadyNow},
-    {T("13ClockSnapshot29CreateWithStandardSystemClockEPS1_"), time_Snapshot_create},
-    {T("20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_"), time_CalculateSpanBetween},
-    {T("16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE"), time_LoadTimeZoneRule},
 };
 
 void register_time_imports(void) {
@@ -595,9 +415,8 @@ int nntime_selftest(Ctx *c) {
     EnumTz enum_tz = (EnumTz)GetProcAddress(LoadLibraryA("advapi32.dll"), "EnumDynamicTimeZoneInformation");
     static TzRule r;
     static WinZone z;
-    static uint8_t cal[8], info[0x18], cal2[8];
-    static int64_t posix, back[2];
-    static int32_t count;
+    static uint8_t cal[8], info[0x18];
+    static int64_t posix;
     static char loc[0x24];
     int bad = 0, zones = 0, zones_now = 0, zones_other = 0;
     long long cases = 0, diff_now = 0, diff_other = 0, edge = 0;
@@ -643,7 +462,7 @@ int nntime_selftest(Ctx *c) {
     #define TCHECK(cond, text) do { if (!(cond)) { bad++; printf("  FAIL time zone: %s\n", text); } } while (0)
     /* the PC's own zone through the import handlers */
     const TzRule *mine = my_rule();
-    long long own = 0, own_bad = 0, two = 0, none = 0;
+    long long own = 0, own_bad = 0;
     location_name(loc);
     if (getenv("SMO_TZ_DUMP")) {                                   /* the transitions as text, to compare with the tz database */
         FILE *f = fopen(getenv("SMO_TZ_DUMP"), "w");
@@ -662,28 +481,8 @@ int nntime_selftest(Ctx *c) {
         own++;
         if (c->x[0] || _localtime64_s(&lt, &tt) || rd16(GP(cal)) != lt.tm_year + 1900 || cal[2] != lt.tm_mon + 1 || cal[3] != lt.tm_mday || cal[4] != lt.tm_hour || cal[5] != lt.tm_min || cal[6] != lt.tm_sec
             || (int)rd32(GP(info)) != lt.tm_wday || (int)rd32(GP(info) + 4) != lt.tm_yday || info[16] != (lt.tm_isdst > 0)) own_bad++;
-        c->x[0] = GP(&count); c->x[1] = GP(back); c->x[2] = 2; c->x[3] = GP(cal);
-        time_ToPosixTime(c);
-        if (c->x[0] || count < 1 || (back[0] != t && !(count == 2 && back[1] == t))) own_bad++;
-        if (count == 2) two++;
     }
-    for (int k = 0; k < mine->timecnt; k++) {                       /* one minute after each spring-forward of the year: a time that does not exist */
-        int before = k ? mine->types[k - 1] : mine->defaulttype;
-        TzTm g;
-        if (mine->ats[k] < y0 || mine->ats[k] >= y1 || mine->ttis[mine->types[k]].utoff <= mine->ttis[before].utoff) continue;
-        tz_split(mine->ats[k] + 60, mine->ttis[before].utoff, &g);
-        wr16(GP(cal2), (uint16_t)g.year); cal2[2] = (uint8_t)g.mon; cal2[3] = (uint8_t)g.mday; cal2[4] = (uint8_t)g.hour; cal2[5] = (uint8_t)g.min; cal2[6] = (uint8_t)g.sec;
-        c->x[0] = GP(&count); c->x[1] = GP(back); c->x[2] = 2; c->x[3] = GP(cal2);
-        time_ToPosixTime(c);
-        TCHECK(c->x[0] == 0 && count == 0, "a calendar time inside the spring-forward gap must give 0 results");
-        none++;
-    }
-    TCHECK(own_bad == 0, "ToCalendarTime / ToPosixTime of the PC's zone differ from the C runtime's localtime");
-    {
-        int changes = 0;
-        for (int k = 0; k < mine->timecnt; k++) if (mine->ats[k] >= y0 && mine->ats[k] < y1) changes++;
-        TCHECK(changes == 0 ? two == 0 && none == 0 : two > 0 && none > 0, "fall-back hour (2 results) / gap (0 results) not found where the zone has transitions");
-    }
+    TCHECK(own_bad == 0, "ToCalendarTime of the PC's zone differs from the C runtime's localtime");
     posix = (int64_t)_time64(NULL);
     c->x[0] = GP(cal); c->x[1] = GP(info); c->x[2] = GP(&posix);
     time_ToCalendarTime(c);
@@ -691,25 +490,7 @@ int nntime_selftest(Ctx *c) {
     printf("  time zone: location %s, now %04d-%02d-%02d %02d:%02d:%02d %s (UTC%+d s, dst %d); rule: %d transitions, %d types, names", loc,
            rd16(GP(cal)), cal[2], cal[3], cal[4], cal[5], cal[6], (char *)info + 8, (int)rd32(GP(info) + 20), info[16], mine->timecnt, mine->typecnt);
     for (int p = 0; p < mine->charcnt; p += (int)strlen(mine->chars + p) + 1) printf(" %s", mine->chars + p);
-    printf("; %lld half hours of %d equal to localtime, %lld with two instants, %lld gap checks\n", own, this_year, two, none);
-    /* LoadTimeZoneRule + the form with a rule */
-    memset(loc, 0, sizeof loc); strcpy(loc, "Asia/Tokyo");
-    c->x[0] = GP(&r); c->x[1] = GP(loc);
-    time_LoadTimeZoneRule(c);
-    TCHECK(c->x[0] == 0, "LoadTimeZoneRule(Asia/Tokyo)");
-    posix = 1700000000;                                             /* 2023-11-14 22:13:20 UTC = 2023-11-15 07:13:20 in Tokyo, a Wednesday */
-    c->x[0] = GP(cal); c->x[1] = GP(info); c->x[2] = GP(&posix); c->x[3] = GP(&r);
-    time_ToCalendarTimeRule(c);
-    TCHECK(c->x[0] == 0 && rd16(GP(cal)) == 2023 && cal[2] == 11 && cal[3] == 15 && cal[4] == 7 && cal[5] == 13 && cal[6] == 20 && (int)rd32(GP(info) + 20) == 32400 && info[16] == 0 && rd32(GP(info)) == 3, "Tokyo conversion with a loaded rule");
-    printf("  time zone: Asia/Tokyo rule: abbreviation %s\n", (char *)info + 8);
-    r.typecnt = 200;
-    c->x[0] = GP(cal); c->x[1] = GP(info); c->x[2] = GP(&posix); c->x[3] = GP(&r);
-    time_ToCalendarTimeRule(c);
-    TCHECK(c->x[0] == TZ_OUT_OF_RANGE, "a rule with too many types must be refused (0x70c74)");
-    memset(loc, 0, sizeof loc); strcpy(loc, "Mars/Phobos");
-    c->x[0] = GP(&r); c->x[1] = GP(loc);
-    time_LoadTimeZoneRule(c);
-    TCHECK(c->x[0] == TZ_NOT_FOUND, "LoadTimeZoneRule of an unknown location must give 0x7ba74");
+    printf("; %lld half hours of %d equal to localtime\n", own, this_year);
     #undef TCHECK
     return bad;
 }
