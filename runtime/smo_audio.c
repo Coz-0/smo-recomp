@@ -179,7 +179,21 @@ static void sink_open(void) {
     MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
     g_wopen = r == MMSYSERR_NOERROR;
     printf("smo_audio: sound output: %s\n", g_wopen ? "waveOut, 48000 Hz, 16-bit stereo, 40 ms blocks" : "waveOutOpen FAILED: no sound");
-    if (g_wopen) waveOutPause(g_wo);
+    if (g_wopen) {
+        waveOutPause(g_wo);
+        /* Test copies are silent, as nnaudio.c's AudioOut: only the copies a person plays (smo_native.exe, smo_user.exe)
+         * are audible. The device stays open and is fed as with sound, so the timing, the dropped-sample and underrun
+         * counts and an SMO_AUDIO_WAV capture are the same. SMO_VOLUME=<0..100> overrides either way. */
+        char exe[MAX_PATH] = "";
+        GetModuleFileNameA(NULL, exe, sizeof exe);
+        const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SMO_VOLUME");
+        int percent = vol ? atoi(vol) : (!_stricmp(base, "smo_native.exe") || !_stricmp(base, "smo_user.exe")) ? 100 : 0;
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        DWORD level = (DWORD)(0xffff * percent / 100);
+        waveOutSetVolume(g_wo, level | level << 16);
+        printf("smo_audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SMO_VOLUME=<0..100> to change)");
+    }
 }
 static void sink_submit(void) {                   /* the block g_wcur is full */
     WAVEHDR *h = &g_wh[g_wcur];
@@ -384,6 +398,10 @@ static void dev_event_switch(Ctx *c) { dev_event(c, 0); }
 static void dev_event_input(Ctx *c) { dev_event(c, 1); }
 static void dev_event_output(Ctx *c) { dev_event(c, 2); }
 static void dev_channels(Ctx *c) { c->x[0] = 2; }
+
+void smo_audio_counts(long long *frames, long long *dropped, long long *underruns) {      /* smo_nerve.c (SMO_STAGE_LIST): the device sink so far */
+    *frames = g_sink_frames; *dropped = g_sink_dropped; *underruns = g_sink_underruns;
+}
 
 void smo_audio_report(FILE *out) {
     if (g_wav) { wav_header(); fclose(g_wav); g_wav = NULL; fprintf(out, "audio: %u frames (%.1f s) written to %s\n", g_wav_frames, g_wav_frames / 48000.0, getenv("SMO_AUDIO_WAV")); }

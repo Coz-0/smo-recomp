@@ -132,8 +132,16 @@ static void sleep_ns(int64_t ns) {
  *   - three host processors stand for the console's cores 0..2 and every guest thread's affinity is its nn::os core mask
  *     mapped onto them (set at StartThread and at every SetThreadCoreMask), so two threads the console keeps on one core
  *     never run at the same time here either;
- *   - six priority levels instead of five (<= 4, 5..8, 9..15, 16, 17..27, 28..31), Windows' dynamic priority boost off:
- *     the order of the seven values the game uses is kept except 9 against 15;
+ *   - six priority levels instead of five (<= 4, 5..8, 9..15, 16, 17, 18..31), Windows' dynamic priority boost off:
+ *     the order of the seven values ssbu uses is kept except 9 against 15. SMO uses 0, 7, 8, 15, 16, 17, 18, 19, 20 and
+ *     22; what must stay apart is 17 against 18 on core 2: the model draw buffer update (描画バッファ更新, 17) that every
+ *     scene starts at the end of a frame and waits for at the start of the next, and the archive decompression
+ *     (DecompThread, 18) busy while a stage loads. At one level the update waited behind the decompression for a whole
+ *     time slice, long enough for the scene being left to be deleted under it (HakoniwaStateDeleteScene runs a frame or
+ *     two after the scene's last frame): "pure virtual function called" in the update's list of actors on entering a
+ *     stage from the title menu, 2 times in 91 runs of the stage stress test (tests/stress_stages.py, two games on the
+ *     same three processors); with 18..31 a level lower, 0 times in 276 runs of it. 17 is the last level above
+ *     Windows' lowest;
  *   - GetCurrentCoreNumber / GetCurrentProcessorNumber answer the core the thread is really on.
  * NOT the console's scheduler all the same: Windows time-slices equal priorities, other processes of the PC take the
  * three processors too, and host-side threads (graphics driver, audio device, movie decoding) are not part of it.
@@ -141,16 +149,44 @@ static void sleep_ns(int64_t ns) {
  * SMO port: ON BY DEFAULT (SMO_OS_CONSOLE_CORES=0 turns it off). Measured 2026-10-15, 20 s boots, 6 runs each: with free
  * scheduling 4 of 6 runs failed in sead heap code on the loading path (sead::ExpHeap::tryAlloc failing inside
  * ParallelSZSDecompressor, or a sead::Heap destructor reading address -1); with the console core model 0 of 6 failed.
- * SMO depends on its threads being scheduled the console's way, so that is the default. */
+ * SMO depends on its threads being scheduled the console's way, so that is the default.
+ * The three processors are taken from the top of a slot of six (three cores with their second hardware threads): every
+ * game running at once on the PC takes the first slot no other game holds (a named mutex per slot, held while the
+ * process lives), so games side by side (tests, or a test beside the copy being played) do not share processors. One
+ * game alone takes slot 0, the top of the affinity mask: the processors it always had. Before the slots, four test
+ * games at once all ran their console cores on the same three processors. SMO_OS_HOST_CPUS=<hexadecimal mask> chooses
+ * from those processors instead (and takes no slot). */
 static int g_cc = -1;
 static DWORD_PTR g_cc_core[3];
+static DWORD_PTR core_slot(DWORD_PTR proc) {           /* the first free slot of six processors from the top of proc */
+    int bits[64], nb = 0;
+    for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0; b--) if (proc >> b & 1) bits[nb++] = b;
+    for (int k = 0; k < nb / 6; k++) {
+        char name[64];
+        snprintf(name, sizeof name, "Local\\smo_console_cores_%d", k);
+        HANDLE m = CreateMutexA(NULL, FALSE, name);     /* kept open: the slot is this process's until it ends */
+        if (!m) break;
+        if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(m); continue; }
+        DWORD_PTR mask = 0;
+        for (int i = 6 * k; i < 6 * k + 6; i++) mask |= (DWORD_PTR)1 << bits[i];
+        printf("nn::os: console cores in processor slot %d of %d (mask %llx; other games running at once take other slots)\n", k, nb / 6, (unsigned long long)mask);
+        return mask;
+    }
+    printf("nn::os: every processor slot is held by other games: sharing the top of the mask\n");
+    return proc;
+}
 static int console_cores(void) {
     if (g_cc < 0) {
         int n = 0, on = 0;
-        const char *cc = getenv("SMO_OS_CONSOLE_CORES");
+        const char *cc = getenv("SMO_OS_CONSOLE_CORES"), *cpus = getenv("SMO_OS_HOST_CPUS");
         if (!cc || atoi(cc) != 0) {
             DWORD_PTR proc = 0, sys = 0;
             GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+            if (cpus && cpus[0]) {
+                DWORD_PTR want = (DWORD_PTR)_strtoui64(cpus, NULL, 16);
+                printf("nn::os: SMO_OS_HOST_CPUS=%s: the console's cores on these processors only (%llx of %llx)\n", cpus, (unsigned long long)(want & proc), (unsigned long long)proc);
+                if (want & proc) proc &= want;
+            } else proc = core_slot(proc);
             for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0 && n < 3; b--)      /* from the top, every second processor: not two hardware threads of one core */
                 if (proc >> b & 1) { g_cc_core[n++] = (DWORD_PTR)1 << b; b--; }
             on = n == 3;
@@ -169,9 +205,12 @@ static void apply_sched(HANDLE h, uint64_t core_mask) {
     SetThreadPriorityBoost(h, TRUE);
 }
 static int host_priority(int prio) {
+    static int split = -1;                                     /* TEST ONLY, SMO_OS_PRIO17=0: 17 shares its level with 18..27 again */
+    if (split < 0) { const char *e = getenv("SMO_OS_PRIO17"); split = !e || atoi(e) != 0; }
     if (console_cores()) {
         if (prio <= 4) return THREAD_PRIORITY_TIME_CRITICAL;
         if (prio <= 8) return THREAD_PRIORITY_HIGHEST;
+        if (prio >= 18 && (split || prio >= 28)) return THREAD_PRIORITY_LOWEST;     /* below the draw buffer update (17), see above */
     }
     if (prio <= 4) return THREAD_PRIORITY_HIGHEST;
     if (prio <= 15) return THREAD_PRIORITY_ABOVE_NORMAL;
