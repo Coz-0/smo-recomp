@@ -32,7 +32,8 @@ static LARGE_INTEGER g_freq;
  * (0x710593a440) by the number of refreshes counted since the previous present. So the refresh count IS the game's
  * time. Before this, the event came from a Sleep() loop and presentation was held by a second, independent 60 Hz
  * clock that restarted its phase after every late frame: between two presents the game counted 0, 1 or 2 refreshes,
- * and "0" counts as one step while "2" counts as two, so the match clock gained (10.77 s per 600 frames).
+ * and "0" counts as one step while "2" counts as two, so the game's clock gained (10.77 s per 600 frames; measured by
+ * ssbu-recomp in Super Smash Bros. Ultimate, whose main the addresses above are in).
  * Now: refresh n happens at t0 + n/60 s; at each one the vsync event is signalled and then the frames waiting to be
  * shown are released. A frame queued between refresh n and n+1 is shown at n+1, and no sooner than `interval`
  * refreshes after the frame before it (nvnWindowSetPresentInterval); the game is held in its wait for the window
@@ -310,7 +311,7 @@ static void clock_stat(LONG64 n, LARGE_INTEGER now) {
     static LARGE_INTEGER t_last; static LONG64 sig_last, late_last, steps_last, h_last[4];
     if (!g_clockstat || n % 600) return;
     LONG64 sig = g_vsync_signals, late = g_vsync_late;
-    if (t_last.QuadPart) printf("clock: frames %lld-%lld real %.3f s, vsync signals %lld (%.2f Hz), game steps %lld = %.2f s of match time, refreshes counted between presents 0:%lld 1:%lld 2:%lld 3+:%lld, slept through by the vsync thread %lld%c", (long long)(n - 600), (long long)n,
+    if (t_last.QuadPart) printf("clock: frames %lld-%lld real %.3f s, vsync signals %lld (%.2f Hz), game steps %lld = %.2f s of game time, refreshes counted between presents 0:%lld 1:%lld 2:%lld 3+:%lld, slept through by the vsync thread %lld%c", (long long)(n - 600), (long long)n,
         (double)(now.QuadPart - t_last.QuadPart) / (double)g_freq.QuadPart, (long long)(sig - sig_last), (double)(sig - sig_last) * (double)g_freq.QuadPart / (double)(now.QuadPart - t_last.QuadPart), (long long)(g_cs_steps - steps_last), (double)(g_cs_steps - steps_last) / 60.0,
         (long long)(g_cs_hist[0] - h_last[0]), (long long)(g_cs_hist[1] - h_last[1]), (long long)(g_cs_hist[2] - h_last[2]), (long long)(g_cs_hist[3] - h_last[3]), (long long)(late - late_last), 10);
     t_last = now; sig_last = sig; late_last = late; steps_last = g_cs_steps; memcpy(h_last, g_cs_hist, sizeof h_last);

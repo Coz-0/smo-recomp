@@ -120,9 +120,8 @@ typedef struct RBackend {
 } RBackend;
 extern const RBackend rb_gl, rb_vk;
 extern const RBackend *g_rb;
-void nvn_vk_container_seen(uint64_t control, uint64_t prog);      /* Vulkan, GUEST thread, from nvnProgramSetShaders: the "BNSH" container around this control section / variation program is scanned when new (nvn_vk_pipelines.c) */
 /* where one nvnProgramSetShaders call spent its time, in performance-counter ticks, per calling thread:
- * 0 gl_barrier, 1 container_seen (all), 2 container search, 3 container copy / walk, 4 program_set (all), 5 hashing + job copy,
+ * 0 gl_barrier, 4 program_set (all), 5 hashing + job copy,
  * 6 waiting for the shader lock, 7 caller held for the workers. Printed by nvn_gl.c prog_set_shaders ("nvn_setsh:"). */
 extern __declspec(thread) long long nvn_setsh_part[8];
 void nvn_vk_program_set(void *prog);        /* Vulkan, GUEST thread, from nvnProgramSetShaders: the program's stages go to the workers (nvn_vk_pipelines.c) */

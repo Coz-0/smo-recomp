@@ -1,10 +1,9 @@
-/* movie:: (the SDK's video player library): no video decoding yet.
+/* movie:: (the SDK's video player library): the placeholder used with SMO_MOVIE=0 (nnmovie_mf.c plays the movies).
  *
  * Extractor and Decoder are C++ objects the game drives through their virtual tables. Here they get
  * a table whose every entry reports failure, so the game's movie player gives up on the film instead
- * of jumping through an uninitialised pointer. The opening movie is therefore skipped.
- * Every virtual call is logged once with its slot number, which is what a real implementation
- * (for example on top of Media Foundation) will need. */
+ * of jumping through an uninitialised pointer: the movies are skipped.
+ * Every virtual call is logged once with its slot number. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

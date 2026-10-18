@@ -21,6 +21,8 @@ The end of every log has the counts that tell whether a run was healthy:
 
 - `SMO_SHOT=<n>` saves frame n; `SMO_SHOT_EVERY=<k>` saves every k-th frame from `SMO_SHOT_FROM=<frame>` on (up to
   `SMO_SHOT_TO=<frame>` when given), as `frame_<n>.bmp` in `SMO_SHOT_DIR=<folder>` (the folder must exist).
+  `SMO_SHOT_PLAY=<n>` saves the n-th play frame (a frame with compute dispatches and more than 120 draws) as
+  `play_<n>.bmp`: the same moment of play whatever the loading took.
 - `SMO_VK_PASSSHOT=<frame>` saves colour target 0 at the end of every render pass of that frame
   (`pass_<n>_<format>.bmp`) and logs every draw of it: programs, blend and depth state, viewport, vertex attributes and
   the texture behind every binding. `SMO_VK_PASSSHOT=<first>-<last>/<step>` does it for several frames
@@ -85,6 +87,10 @@ The end of every log has the counts that tell whether a run was healthy:
 - Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
   ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
   the GPU, present). `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why.
+- `nvn_vk_frames:` at exit counts the frames that drew a scene, i.e. had compute dispatches (in the Cap Kingdom run 40,164
+  of 42,589; the others are boot and loading frames). Within 600 frames of such a frame the renderer does not hold the
+  game's threads for its workers and makes only cheap textures ahead of their use; in a frame that draws a scene its
+  workers run below normal priority.
 - `SMO_HOSTPROF=<start s>,<seconds>[,<threads>][;<start s>,<seconds>[,<threads>] ...]` samples the stacks of the
   busiest threads (default 4) about every millisecond in each window and prints the functions met most often, what
   each thread was blocked in, and under which function of the game. `tools\dev\profnames.py build\run\<name>.log` adds

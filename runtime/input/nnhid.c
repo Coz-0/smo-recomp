@@ -94,8 +94,7 @@ static int script_key(int vk) {
 }
 /* Test aid: SMO_SEQ is an input sequence counted in pad polls (the game polls player 1 once per frame),
  * so it does not depend on how long this run took to start. Space-separated steps, executed in order:
- *   @movie            wait until the opening movie is created (input_mark("movie") from nnmovie_mf.c)
- *   @module:<name>    wait until nn::ro has loaded that script module (input_mark("module:lua2cpp_mario") from nnro.c)
+ *   @movie            wait until the game creates a movie (input_mark("movie") from nnmovie_mf.c)
  *   @nerve:<name>     SMO: wait until the game runs that nerve state, e.g. @nerve:OpeningStageStartDemoNrvWaitStandUp
  *                     (smo_nerve.c; SMO_NERVELOG=* prints the names as they change)
  *   @goto:<x>,<z>[,<r>][/<n>]  SMO: steer the left stick (analog) toward the world point (x, z) until the player is
@@ -117,7 +116,7 @@ static int script_key(int vk) {
  *                     row (default 20): a screen is recognised by its draw count (nvn_gl.c reports it per frame),
  *                     whatever the loading time was
  *   @until:<lo>-<hi>[/<n>]:<keys>/<period>  press the keys (8 polls) every <period> polls until the draw count has
- *                     been in lo..hi for n polls in a row (default 20), e.g. to skip the opening movie, which
+ *                     been in lo..hi for n polls in a row (default 20), e.g. to leave a screen that
  *                     ignores A for a while; period must exceed the transition time plus n
  *   <n>               wait n polls
  *   <n>:<keys>[/<h>]  wait n polls, then hold the keys for h polls (default 8); keys as in SMO_SCRIPT
@@ -438,9 +437,8 @@ static int key(int vk) { return scripted(vk) || script_key(vk) || seq_key(vk) ||
  *
  * Anchors make the clock independent of loading times. Poll counts alone are not: the time between two screens
  * depends on how long this run took to load them. The run is divided by SCREEN CHANGES, recognised from the number
- * of draw calls per frame (reported by nvn_gl.c), in four classes: black (<= 12 draws: every fade between screens),
- * low (13..60: movie, title logo, loading icon), mid (61..240: character select), high (> 240: menus, stage select,
- * battle). Anchor 0 is the creation of the opening movie; each later anchor is the first poll of a class that then
+ * of draw calls per frame (reported by nvn_gl.c), in four classes: black (<= 12 draws: fades between screens),
+ * low (13..60), mid (61..240), high (> 240). Anchor 0 is the first movie the game creates; each later anchor is the first poll of a class that then
  * lasted 30 polls (shorter blips while a screen builds up are ignored). An input is replayed when the same anchor
  * has been reached and the same number of polls has passed since it.
  * The older format "<poll> <buttons hex> <lx> <ly>" (polls counted from the movie only) is still read. */
@@ -459,7 +457,7 @@ static void anchor_tick(void) {                           /* once per poll */
     if (g_anchor < 0) {
         if (!mark_seen("movie")) return;
         g_anchor = 0; g_anchor_poll = g_rec_poll; g_anchor_class = -1; g_anchor_cand = -1;
-        printf("input anchor 0 at poll %lld: opening movie created\n", g_rec_poll);
+        printf("input anchor 0 at poll %lld: the first movie created\n", g_rec_poll);
         return;
     }
     int cls = draw_class(g_frame_draws_seen);

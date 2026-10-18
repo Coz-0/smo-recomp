@@ -195,7 +195,6 @@ static void dump_unregistered(void) {
     for (int i = 0; i < dyn_sym_count; i++) {
         const char *n = dyn_syms[i].name;
         if (dyn_syms[i].defined || !n[0] || import_lookup(n)) continue;
-        if (strstr(n, "lua2cpp") || strstr(n, "L2C")) continue;
         if (strncmp(n, "_ZN2nn", 6) && strncmp(n, "_ZNK2nn", 7) && strncmp(n, "nn", 2) && strncmp(n, "glslc", 5)) continue;
         int is_data = 0;
         for (int k = 0; k < sdk_data_count; k++) if (strcmp(sdk_data[k].name, n) == 0) is_data = 1;

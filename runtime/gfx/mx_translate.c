@@ -1554,9 +1554,9 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         /* A table entry may point at a scheduling word (every 4th word of the code is one, not an instruction): execution
          * then starts at the word after it. brx_targets() above makes the case LABEL of such a target t + 1; the value
          * computed here at run time must get the same step, or the branch finds no case and the stage ends with its
-         * outputs at their defaults. Found: the layout shader's "window frame" texture
-         * coordinate table (13 entries) has entries on scheduling words; frame kind 12 = the body of the header pill of the
-         * stage select screen left the stage with texture coordinate (0,0) = a transparent texel. */
+         * outputs at their defaults. Found by ssbu-recomp in Super Smash Bros. Ultimate: a layout shader's texture coordinate table
+         * (13 entries) has entries on scheduling words, and one of them left its stage with texture coordinate (0,0) = a
+         * transparent texel. */
         emit(e, "if (%s) { pc = (%uu + %s + 0x%08xu) >> 3; if ((pc & 3u) == 0u) pc++; continue; }", FLOW(e, MXB(i, 0, 5)), pc * 8 + 8, A8, (uint32_t)off);
         break;
     }

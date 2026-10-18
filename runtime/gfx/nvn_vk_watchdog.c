@@ -3,7 +3,7 @@
  * THE FREEZE WATCHDOG. On by default in the Vulkan renderer (SMO_VK_WATCHDOG=0 off, =<seconds> another limit; default 5).
  * A thread looks twice a second at the time of the last frame that reached the window. When no frame was presented for the
  * limit while the process is alive, a report is printed and appended to <exe name>_freeze.txt next to the exe:
- *   - what the renderer was doing (frames, present attempts, failures, queues of the workers, the preparation's state);
+ *   - what the renderer was doing (frames, present attempts, failures, queues of the workers);
  *   - our locks (g_sh_lock, g_gpl_lock): the thread that owns each;
  *   - every wait of ours that was entered through WD_SLEEP (function, line, how long);
  *   - EVERY thread of the process: its name (guest thread name / render / main), whether it used CPU in the last 300 ms,
@@ -116,7 +116,6 @@ static const char *wd_tname(DWORD tid, char *buf, size_t n) {
     const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: waits for the game)" : guest_thread_name_of(tid);
     if (g) return g;
     for (int i = 0; i < g_pw_nthread; i++) if (g_pw_thread[i] && GetThreadId(g_pw_thread[i]) == tid) { snprintf(buf, n, "shader worker %d (host)", i); return buf; }
-    if (g_prep_thread && GetThreadId(g_prep_thread) == tid) return "preparation (host)";
     return "host thread";
 }
 static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
@@ -137,10 +136,10 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
         (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, IsIconic((HWND)nvn_front_hwnd()) ? "MINIMISED" : "not minimised");
-    wdp("  render thread %lu, place in its present: %s; %s; fight near: %s\n", (unsigned long)g_render_tid, g_wd_where == 1 ? "the loading barrier (waits for the workers, at most 20 s)" : g_wd_where == 2 ? "vkAcquireNextImageKHR" : g_wd_where == 3 ? "blit and submit" : g_wd_where == 4 ? "vkQueuePresentKHR" : "not in a present",
-        g_in_fight ? "the last frame was a FIGHT frame" : "the last frame was not a fight frame", fight_recent() ? "yes" : "no");
-    wdp("  workers: %d threads; foreground jobs %lld queued / %lld done, background %lld / %lld, preparation %lld / %lld (%lld running); preparation state %d (0 not started, 1 running, 2 finished, 3 no containers, 5 store being built)%s, %d of %d containers read; loading-barrier holds %lld (time-outs %lld)\n",
-        g_pw_nthread, (long long)g_jq_queued, (long long)g_jq_done, (long long)g_bq_queued, (long long)g_bq_done, (long long)g_pq_queued, (long long)g_pq_done, (long long)g_pq_running, g_prep_state, g_prep_marked ? ", marked start" : "", g_prep_read, g_prep_nfiles,
+    wdp("  render thread %lu, place in its present: %s; %s; scene near: %s\n", (unsigned long)g_render_tid, g_wd_where == 1 ? "the loading barrier (waits for the workers, at most 20 s)" : g_wd_where == 2 ? "vkAcquireNextImageKHR" : g_wd_where == 3 ? "blit and submit" : g_wd_where == 4 ? "vkQueuePresentKHR" : "not in a present",
+        g_in_scene ? "the last frame drew a scene (compute dispatches)" : "the last frame drew no scene", scene_recent() ? "yes" : "no");
+    wdp("  workers: %d threads; foreground jobs %lld queued / %lld done, background %lld / %lld; loading-barrier holds %lld (time-outs %lld)\n",
+        g_pw_nthread, (long long)g_jq_queued, (long long)g_jq_done, (long long)g_bq_queued, (long long)g_bq_done,
         (long long)g_bar_n, (long long)g_bar_timeout);
     wd_owner("g_sh_lock (stage, pipeline and job tables)", &g_sh_lock);
     wd_owner("g_gpl_lock (vertex-input / fragment-output libraries, universal layout)", &g_gpl_lock);
@@ -411,7 +410,7 @@ static void wd_start(void) {
     hp_start();
     const char *e = getenv("SMO_VK_WATCHDOG");
     if (e) limit = atof(e);
-    if (limit <= 0 || g_offline) { printf("nvn_vk_watchdog: off (SMO_VK_WATCHDOG=0)\n"); return; }
+    if (limit <= 0) { printf("nvn_vk_watchdog: off (SMO_VK_WATCHDOG=0)\n"); return; }
     if (limit < 1) limit = 1;
     g_wd_thread = CreateThread(NULL, 0, wd_main, &limit, 0, NULL);
     if (g_wd_thread) SetThreadPriority(g_wd_thread, THREAD_PRIORITY_ABOVE_NORMAL);

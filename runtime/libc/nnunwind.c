@@ -1,7 +1,5 @@
-/* C++ exception unwinding for lifted code (the lua2cpp script modules need it: a script coroutine is ended by
- * throwing lua2cpp::L2CExceptionShutdown from its yield function and catching it in the coroutine's top
- * function - [module lua2cpp_common: throw at +0x52dd20 when the agent's byte +0xc0 is set after a fiber switch,
- * catch in the function at +0x52e2f0]; without unwinding the game stopped at the start of every battle).
+/* C++ exception unwinding for lifted code: a throw finds its handler through the game's own unwind tables, as on the
+ * console.
  *
  * How it works
  *   - nncxxrt.c (eh_runtime.h) owns the exception objects, the ABI entry points and the personality (LSDA lookup and

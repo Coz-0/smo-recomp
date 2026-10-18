@@ -284,9 +284,6 @@ int main(int argc, char **argv) {
         if (getenv("SMO_PAD_SELFTEST")) return nnhid_pad_selftest() != 0;
         if ((tool = nnpad_tool(argc, argv)) >= 0) return tool;
     }
-    /* `--prepare-shaders [folder]` translates every stage of the shader containers in the folder (default
-     * ..\cache\vk_containers) into ..\cache\vk; no game, no window, no GPU (nvn_vk_pipelines.c) */
-    if (argc > 1 && !strcmp(argv[1], "--prepare-shaders")) { int nvn_vk_prepare_shaders(const char *); return nvn_vk_prepare_shaders(argc > 2 ? argv[2] : NULL); }
     /* data symbols the game imports from the SDK module get their real values (build/gen/sdkdata.c, written by gen_tables.py) */
     for (int i = 0; i < sdk_data_count; i++) {
         void *copy = _aligned_malloc(sdk_data[i].size, 16);

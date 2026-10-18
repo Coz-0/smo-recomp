@@ -490,7 +490,7 @@ static void present_colour(const float rgba[4]) {
     InterlockedIncrement64(&g_vk_frames);
 }
 
-/* nvnQueuePresentTexture while this back end holds no texture of the game (M1): the window is cleared to black, as the
+/* nvnQueuePresentTexture while this back end holds no texture of the game: the window is cleared to black, as the
  * OpenGL path does for a window texture nothing was drawn into. */
 void nvn_vk_present_black(void) {
     static const float black[4] = {0, 0, 0, 1};

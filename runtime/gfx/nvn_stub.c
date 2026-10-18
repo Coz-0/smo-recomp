@@ -112,14 +112,12 @@ static void buffer_finalize(Ctx *c) { nvn_label_drop(A0); nobj_drop(A0); }
 static void obj_debug_id(Ctx *c) { RET(A0); }
 static void pool_builder_storage(Ctx *c) { log_call(c); NvnObj *b = nobj(A0); b->memory = A1; b->size = A2; }   /* (builder, memory, size) */
 static void pool_builder_flags(Ctx *c) { nobj(A0)->flags = A1; }                                               /* (builder, flags) */
-void nvn_front_pool_made(uint64_t memory, uint64_t size);      /* nvn_gl.c: a pool laid over the code section of a shader container announces the container */
 static void pool_virtual_init(Ctx *c, NvnObj *p);            /* below */
 static void pool_initialize(Ctx *c) {
     log_call(c);
     NvnObj *p = nobj(A0), *b = nobj(A1);
     p->memory = b->memory; p->size = b->size; p->flags = b->flags;
     if (p->flags & 0x200) { pool_virtual_init(c, p); RET(1); return; }   /* NVN_MEMORY_POOL_FLAGS_VIRTUAL */
-    nvn_front_pool_made((uint64_t)p->memory, (uint64_t)p->size);
     RET(1);
 }
 static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }

@@ -273,7 +273,7 @@ enum { PF_WAIT_SUBMIT_ = 13, PF_WAIT_PRESENT_ = 14, PF_WAIT_OTHER_ = 15 };
 extern int g_hitch_ms;
 extern volatile const char *g_hitch_rt;
 extern volatile uint64_t g_hitch_rt_arg;
-void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int battle); void hitch_report(FILE *out); void hitch_set_render(void);
+void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int scene); void hitch_report(FILE *out); void hitch_set_render(void);
 #define HS_IN(name, arg) const char *hs_p_ = (const char *)g_hitch_rt; uint64_t hs_a_ = g_hitch_rt_arg; g_hitch_rt_arg = (uint64_t)(arg); g_hitch_rt = (name)
 #define HS_OUT() (g_hitch_rt = hs_p_, g_hitch_rt_arg = hs_a_)
 
@@ -4159,10 +4159,6 @@ static int pw_queue_prog(Prog *p) {
     }
     return 1;
 }
-/* nvnMemoryPoolInitialize (nvn_stub.c), guest thread. The game lays a pool over the code section of each "BNSH" shader
- * container when it sets the container up (loading), long before it makes the first program of it: the Vulkan back end
- * scans the container then (nvn_vk_pipelines.c). */
-void nvn_front_pool_made(uint64_t memory, uint64_t size) { if (g_rb == &rb_vk && memory && size >= 0x40 && (memory >> 28) != 0x710 && rd32(memory) == 0x12345678u) nvn_vk_container_seen(memory, memory); }      /* such a pool begins with the code section of a stage (its magic); a search below every other pool cost 0.2 s each (measured) */
 /* nvnProgramSetShaders(program, count, const NVNshaderData *): { u64 data (GPU address), const void *control }.
  * control: magic 0x98761234, offset of the NV_gpu_program5 text at +0x14, its length at +0x18. */
 __declspec(thread) long long nvn_setsh_part[8];
@@ -4179,8 +4175,8 @@ static void prog_set_shaders(Ctx *c) {             /* the call timed part by par
     if (t * 1000 > (LONG64)lim * fq && (InterlockedIncrement(&nl) <= 400 || (t * 1000 > 20 * fq && nl <= 4000))) {      /* a call over 20 ms is logged after the first 400 lines too (Intel: the lines were used up at loading) */
         long long *q = nvn_setsh_part;
 #define SETSH_MS(x) ((double)(x) * 1000.0 / (double)fq)
-        printf("nvn_setsh: frame %lld, program object %llx (called from %llx): %.1f ms | barrier %.1f | container %.1f (search %.1f, copy or walk %.1f) | program_set %.1f (hash + job copy %.1f, lock %.1f, HELD %.1f) | rest %.1f\n",
-               nvn_front_frame_next(), (unsigned long long)guest, (unsigned long long)ra, SETSH_MS(t), SETSH_MS(q[0]), SETSH_MS(q[1]), SETSH_MS(q[2]), SETSH_MS(q[3]), SETSH_MS(q[4]), SETSH_MS(q[5]), SETSH_MS(q[6]), SETSH_MS(q[7]), SETSH_MS(t - q[0] - q[1] - q[4]));
+        printf("nvn_setsh: frame %lld, program object %llx (called from %llx): %.1f ms | barrier %.1f | program_set %.1f (hash + job copy %.1f, lock %.1f, HELD %.1f) | rest %.1f\n",
+               nvn_front_frame_next(), (unsigned long long)guest, (unsigned long long)ra, SETSH_MS(t), SETSH_MS(q[0]), SETSH_MS(q[4]), SETSH_MS(q[5]), SETSH_MS(q[6]), SETSH_MS(q[7]), SETSH_MS(t - q[0] - q[4]));
         fflush(stdout);
     }
 }

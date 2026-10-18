@@ -71,7 +71,7 @@ static void vkd_fail(const char *fmt, ...) {
 }
 #define DBG_ASSERT(c, ...) do { if (D.debug && !(c)) vkd_fail(__VA_ARGS__); } while (0)
 /* the pipeline-library mode. SMO_VK_GPL wins (0 = whole pipelines, without libraries; 1 = a library per
- * stage pair, a measurement mode; 2 = a library per stage + preparation + barrier); without it VK_GPL_DEFAULT. */
+ * stage pair, a measurement mode; 2 = a library per stage + loading barrier); without it VK_GPL_DEFAULT. */
 #ifndef VK_GPL_DEFAULT
 #define VK_GPL_DEFAULT 2                           /* on by default where the driver has the extension; -DVK_GPL_DEFAULT=0 or SMO_VK_GPL=0 for the old path */
 #endif
@@ -119,7 +119,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     {   const char *e = getenv("SMO_VK_GPL");
         int m = vk_gpl_mode();
         printf("nvn_vk_path: %s: %s (SMO_VK_GPL %s; default %d; SMO_VK_GPL=0 is the switch back to whole pipelines)\n",
-               D.has_gpl && m >= 2 ? "STAGE LIBRARIES + preparation + loading barrier (a draw links, nothing is compiled in a fight)" : D.has_gpl ? "PAIR LIBRARIES (SMO_VK_GPL=1, a measurement mode)" : "WHOLE PIPELINES (made by the workers from the list of earlier runs; a first use can hold a frame)",
+               D.has_gpl && m >= 2 ? "STAGE LIBRARIES + loading barrier (a draw links, nothing is compiled near a scene)" : D.has_gpl ? "PAIR LIBRARIES (SMO_VK_GPL=1, a measurement mode)" : "WHOLE PIPELINES (made by the workers from the list of earlier runs; a first use can hold a frame)",
                !m ? (e ? "turned off by SMO_VK_GPL=0" : "off by default in this build") : D.has_gpl ? (e ? "asked for by SMO_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
                !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
     }
@@ -310,11 +310,11 @@ static VkQueryPool g_ts_pool;
 static double g_ts_ns;
 static LONG64 g_ts_n;
 /* the same per FRAME (the frame a buffer was recorded for), with the time between two presents and whether the frame
- * was a battle frame (compute dispatches and more than 120 draws): median / p99 of the battle frames at exit ("nvn_vk_gpu_fight:"). */
+ * was a play frame (compute dispatches and more than 120 draws): median / p99 of the play frames at exit ("nvn_vk_gpu_play:"). */
 #define FRSTAT_N 40000
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
-static uint8_t g_fr_fight[FRSTAT_N];
-static LONG64 g_cur_frame, g_battle_frames;
+static uint8_t g_fr_play[FRSTAT_N];
+static LONG64 g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
 void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
@@ -887,9 +887,9 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 }
 /* The image of a texture: made at first use, and holding what the guest memory holds (unless the GPU wrote it). */
 /* textures made and read AHEAD of their first draw (tex_ahead, below), and what is still made at a draw. */
-static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_fight_n, g_late_fight_tk, g_up_fr_tk, g_up_fr_bytes;
+static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
-static volatile LONG g_in_fight;                   /* nvn_vk_pipelines.c (included further down) */
+static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -974,22 +974,22 @@ static VTex *vt_get2(Tex *t, int sync) {
         LONG64 d = tk() - tu0;
         g_up_fr_tk += d; g_up_fr_n++; g_up_fr_bytes += R.upload_bytes - ub0;
         g_late_n++; g_late_tk += d;
-        if (g_in_fight) { g_late_fight_n++; g_late_fight_tk += d; }
+        if (g_in_scene) { g_late_scene_n++; g_late_scene_tk += d; }
     }
     return vt;
 }
 static VTex *vt_get(Tex *t) { return vt_get2(t, 1); }
 /* render thread, after every present. A texture used to get its image, and its texels read out of the game's
- * memory (hash, de-swizzle, copy into the stream ring), at the first draw that sampled it: the first frame of a fight paid
- * 37-50 ms for the stage's and the fighters' textures (measured). Here every block-compressed
+ * memory (hash, de-swizzle, copy into the stream ring), at the first draw that sampled it: the first frame of a scene paid
+ * 37-50 ms for its textures (measured by ssbu-recomp in Super Smash Bros. Ultimate). Here every block-compressed
  * texture the game has made (nvnTextureInitialize) and not yet drawn with is given its image two frames after the render
- * thread first saw it, under a time budget per frame (4 ms outside a fight, 1 ms in one; one texture is always taken, so a
+ * thread first saw it, under a time budget per frame (4 ms far from a scene, 1 ms near one; one texture is always taken, so a
  * very large one can exceed it): the loading screen absorbs the work. Only compressed formats: they cannot be render
  * targets, so nothing the GPU is about to write is touched; if the game fills the memory later, the draw sees the change
  * (nvn_front_tex_changed) and reads it again, as before. SMO_VK_TEXAHEAD=0 = as before (everything at the first draw). */
-static int fight_recent(void);                     /* nvn_vk_pipelines.c */
+static int scene_recent(void);                     /* nvn_vk_pipelines.c */
 static void present_progress(float frac);          /* the held loading screen presented again with the progress bar (defined above vk_present) */
-static LONG64 g_ovl_presents, g_ovl_frames;        /* extra presents of a held loading screen; normal frames drawn with the thin bar */
+static LONG64 g_ovl_presents;                      /* extra presents of a held loading screen */
 static int holdlog_on(void);
 static void tex_ahead(LONG64 frame) {
     static int on = -1;
@@ -999,7 +999,7 @@ static void tex_ahead(LONG64 frame) {
     if (!on) return;
     Tex *head = nvn_front_tex_first();
     if (head == done_head) return;
-    int fr = fight_recent();
+    int fr = scene_recent();
     LONG64 t0 = tk(), budget = fq * (fr ? 1 : 4) / 1000;
     int pending = 0, taken = 0;
     Tex *oldest = NULL;                            /* the oldest texture still pending: the next walk ends after it */
@@ -1013,12 +1013,12 @@ static void tex_ahead(LONG64 frame) {
         if (t->gpu_written || (!t->mem && !t->b.packaged) || t->b.samples > 1 || t->b.width <= 0 || t->b.height <= 0 || !nvn_front_fmt(t->b.format, &f) || f.kind != 4) { t->ahead_seen = -1; continue; }
         if (taken && tk() - t0 > budget) { pending++; oldest = t; continue; }
         if (fr) {
-            /* in and around a fight (a frame of the last 600 had fighters) only what is certainly cheap: at most 512 KB, no
-             * decoding on the CPU, no wrap of the stream ring (a wrap waits for the GPU). Measured without this rule
-             * (the result screen's textures arriving while the fight ends, in frames without
-             * a dispatch): 15-22 ms after one present and a frame of 34-35 ms. The others wait for a frame far from a fight,
-             * or are made at their use as before. This game dispatches compute in every frame, so for it every frame is
-             * "in a fight": a texture over 512 KB or decoded on the CPU is made at its use (it stayed pending for ever, and the
+            /* near a scene (a frame of the last 600 had compute dispatches) only what is certainly cheap: at most 512 KB, no
+             * decoding on the CPU, no wrap of the stream ring (a wrap waits for the GPU). Measured without this rule by
+             * ssbu-recomp in Super Smash Bros. Ultimate (textures arriving in frames without a dispatch right after a scene): 15-22 ms
+             * after one present and a frame of 34-35 ms. The others wait for a frame far from a scene, or are made at their
+             * use as before. While the game is played every frame is near a scene: a texture over 512 KB or decoded on the
+             * CPU is then made at its use (it stayed pending for ever, and the
              * walk above, which ends after the oldest pending texture, went over every texture made since the start in every
              * frame: 24% of the render thread after two minutes in Cascade Kingdom). */
             VTex probe;
@@ -1035,7 +1035,7 @@ static void tex_ahead(LONG64 frame) {
     g_ta_inside = 0;
     LONG64 d = tk() - t0;
     g_ta_tk += d; if (d > g_ta_max_tk) g_ta_max_tk = d;
-    if (d * 1000 > 6 * fq && holdlog_on()) { static int nl; if (nl++ < 100) printf("nvn_vk_tex: frame %lld (%s): %d textures made ahead after the present in %.1f ms\n", (long long)frame, fr ? "in or near a fight" : "far from a fight", taken, (double)d * 1000.0 / (double)fq); }
+    if (d * 1000 > 6 * fq && holdlog_on()) { static int nl; if (nl++ < 100) printf("nvn_vk_tex: frame %lld (%s): %d textures made ahead after the present in %.1f ms\n", (long long)frame, fr ? "near a scene" : "far from a scene", taken, (double)d * 1000.0 / (double)fq); }
     done_head = pending ? oldest->all_next : head;     /* everything older than the oldest pending texture is done (before: only when nothing was
                                                     * pending, and the game makes textures every frame, so every frame walked all of them) */
 }
@@ -1208,11 +1208,11 @@ static int pass_begin(void) {
         }
     }
     if (!w) return 0;
-    {   /* SMO_VK_UILOG=<n>: every pass begun in the n-th battle frame ("nvn_vk_ui:" lines): its targets, whether the
+    {   /* SMO_VK_UILOG=<n>: every pass begun in the n-th play frame ("nvn_vk_ui:" lines): its targets, whether the
          * colour target is a texture of the window, and the draws of the frame so far (the next line's number minus this one = its draws) */
         static int uil = -2, np;
         if (uil == -2) uil = getenv("SMO_VK_UILOG") ? atoi(getenv("SMO_VK_UILOG")) : -1;
-        if (uil > 0 && g_battle_frames == uil) {
+        if (uil > 0 && g_play_frames == uil) {
             Tex *c0 = R.ncol ? R.col[0].tex : NULL, *dt = R.depth.tex && !R.depth.tex->dead ? R.depth.tex : NULL;
             printf("nvn_vk_ui: pass %d: %d colour, first %dx%d format 0x%x level %d%s%s | depth %dx%d format 0x%x%s | image size of the pass %dx%d | %lld draws so far, %lld dispatches so far\n", np++, R.ncol,
                    c0 ? c0->b.width : 0, c0 ? c0->b.height : 0, c0 ? (int)c0->b.format : 0, c0 ? target_level(&R.col[0]) : 0, c0 && wintex_is(c0) ? " WINDOW TEXTURE" : "", c0 && c0->vk && ((VTex *)c0->vk)->rs ? " (scaled)" : "",
@@ -1227,7 +1227,7 @@ static int pass_begin(void) {
             int cf = R.ncol && R.col[0].tex ? (int)R.col[0].tex->b.format : 0, df = R.depth.tex ? (int)R.depth.tex->b.format : 0, lv = R.ncol && R.col[0].tex ? target_level(&R.col[0]) : R.depth.tex ? target_level(&R.depth) : 0, i;
             for (i = 0; i < g_rtlog_n; i++) if (g_rtlog[i].w == w && g_rtlog[i].h == h && g_rtlog[i].ncol == R.ncol && g_rtlog[i].cf == cf && g_rtlog[i].df == df && g_rtlog[i].lv == lv) break;
             if (i == g_rtlog_n && g_rtlog_n < 256) { g_rtlog[i].w = w; g_rtlog[i].h = h; g_rtlog[i].ncol = R.ncol; g_rtlog[i].cf = cf; g_rtlog[i].df = df; g_rtlog[i].lv = lv; g_rtlog[i].first = nvn_front_frame_next(); g_rtlog_n++; }
-            if (i < 256) { g_rtlog[i].n++; if (g_in_fight) g_rtlog[i].fight++; }
+            if (i < 256) { g_rtlog[i].n++; if (g_in_scene) g_rtlog[i].scene++; }
         }
     }
     cmd_begin();                                   /* vt_get may have submitted (ring wrap) */
@@ -1429,10 +1429,10 @@ static void set_dynamic_state3(int samples) {
     R.dyn3_samples = samples;
 }
 
-/* ---------------------------------------------------------------- compute (M3; design section 3, "DispatchCompute" and "Storage buffers written by compute")
+/* ---------------------------------------------------------------- compute
  * A storage buffer a compute stage may write gets a Vulkan buffer of its own (CB: host-visible memory, filled from guest
  * memory at its first dispatch of the batch). Later commands of the SAME batch whose range lies inside it bind that buffer
- * (the fighter's vertex buffers: no round trip). At the end of the batch the command buffer is submitted and the CBs become
+ * (vertex buffers a dispatch wrote: no round trip). At the end of the batch the command buffer is submitted and the CBs become
  * "pending"; when that submission has finished the ranges a dispatch REALLY wrote (mx_wm, one word per dispatch in the
  * stream ring) are copied back to guest memory (cb_land): at the latest before the next batch reads guest memory, earlier
  * when the render thread is idle or a sync is waited for. The OpenGL path copies back before the next draw; what guest
@@ -2150,7 +2150,7 @@ static int draw_prepare(unsigned prim) {
         static VkWriteDescriptorSet w[320];
         static VkDescriptorBufferInfo bi[120];
         static VkDescriptorImageInfo ii[200];
-        /* M4: buffers change with every draw: pushed into the command buffer (no set, no pool) when the device can; the
+        /* buffers change with every draw: pushed into the command buffer (no set, no pool) when the device can; the
          * textures of a draw repeat: one set per distinct list (layout, views, samplers, image layouts) per command buffer */
         VkDescriptorSet sets[2] = {NULL, NULL};
         int nw = 0, ib = 0, it = 0;
@@ -3063,9 +3063,7 @@ static int g_isem;
 /* the PROGRESS BAR: our own overlay, drawn over the swapchain image after the blit of the game's picture (never
  * into the game's textures, so pictures saved by SMO_SHOT* do not have it). A bar at the bottom of the window:
  *   - while the loading barrier holds a loading screen: the same picture is presented again about ten times a second with
- *     the bar growing (jobs done of jobs queued when the hold began), so the screen is not a still picture;
- *   - while the container store is read from data.arc (first start) and while the preparation runs: a thinner bar on every
- *     presented frame, NOT near a fight.
+ *     the bar growing (jobs done of jobs queued when the hold began), so the screen is not a still picture.
  * SMO_VK_PROGRESS=0 turns it off. The image: 8x8, two layers (bar colour, track colour), cleared once; drawn by two blits. */
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
@@ -3082,7 +3080,6 @@ static void overlay_draw(uint32_t index) {
     }
     if (g_ovl.on < 0) g_ovl.on = !(getenv("SMO_VK_PROGRESS") && !atoi(getenv("SMO_VK_PROGRESS")));
     if (!g_ovl.on || g_ovl.thick <= 0) return;
-    if (g_ovl.thick < 8) g_ovl_frames++;
     VkImageSubresourceRange sr2 = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (!g_ovl.made) {
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3142,7 +3139,7 @@ static void capture_vk(VTex *vt) {
     free(px);
 }
 static void vk_present2(void *arg, int progress);
-/* nvn_vk_pipelines.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
+/* nvn_vk_pipelines.c loading_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
 static void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
 /* the amiibo menu (smo_amiibo.c), render thread. READ: the frame the PresentJob presented (its window texture),
  * read back like a Capture-button picture. SHOW: the menu's picture, copied when it changed into an image of the swapchain's
@@ -3246,17 +3243,12 @@ static void vk_present2(void *arg, int progress) {
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
     g_ovl.bar_arg = arg;
     g_wd_where = 1;
-    m4_barrier(frame, R.frame_draws);
+    loading_barrier(frame, R.frame_draws);
     g_wd_where = 0;
     g_ovl.bar_arg = NULL;
-    /* the thin bar of a normal frame: the store being read, or the preparation running, and no fight near */
     g_ovl.thick = 0;
-    if ((g_prep_state == 5 || g_prep_state == 1) && !fight_recent()) {
-        g_ovl.thick = 4;
-        g_ovl.frac = g_prep_state == 5 ? (float)g_store_pct / 100.0f : g_prep_nfiles ? (float)g_pq_done / (float)(g_pq_queued > 0 ? g_pq_queued + (LONG64)(g_prep_nfiles - g_prep_read) * 90 : 1) : 0;      /* about 90 variations a file */
-    }
     g_render_tid = GetCurrentThreadId();
-    if (g_skip_fr_n) { g_skip_frames++; printf("nvn_vk_skipf: frame %lld (%s): %lld draws left out (shader_wait = skip)\n", (long long)frame, g_in_fight ? "fight" : "no fight", (long long)g_skip_fr_n); g_skip_fr_n = 0; }
+    if (g_skip_fr_n) { g_skip_frames++; printf("nvn_vk_skipf: frame %lld (%s): %lld draws left out (shader_wait = skip)\n", (long long)frame, g_in_scene ? "scene" : "no scene", (long long)g_skip_fr_n); g_skip_fr_n = 0; }
     if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
     pass_end();
     { int step = nvn_front_take_step_shot(); if (step && vt) { char path[300]; const char *dir = getenv("SMO_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp_vk(path, vt); } }
@@ -3282,16 +3274,16 @@ static void vk_present2(void *arg, int progress) {
     }
     gsq_poll();
     if (vt && g_capture_req && InterlockedExchange(&g_capture_req, 0)) capture_vk(vt);       /* the Capture button */
-    {   /* SMO_SHOT_BATTLE=<n>: one picture at the n-th battle frame (dispatches and more than 120 draws), i.e. at the
-         * same moment of the fight whatever the loading took: battle_<n>.bmp in SMO_SHOT_DIR */
+    {   /* SMO_SHOT_PLAY=<n>: one picture at the n-th play frame (dispatches and more than 120 draws), i.e. at the
+         * same moment of play whatever the loading took: play_<n>.bmp in SMO_SHOT_DIR */
         static int bshot = -2;
-        if (bshot == -2) bshot = getenv("SMO_SHOT_BATTLE") ? atoi(getenv("SMO_SHOT_BATTLE")) : -1;
-        if (vt && bshot > 0 && g_battle_frames == bshot) {
+        if (bshot == -2) bshot = getenv("SMO_SHOT_PLAY") ? atoi(getenv("SMO_SHOT_PLAY")) : -1;
+        if (vt && bshot > 0 && g_play_frames == bshot) {
             char path[300];
             const char *dir = getenv("SMO_SHOT_DIR");
-            snprintf(path, sizeof path, "%s%sbattle_%d.bmp", dir ? dir : "", dir ? "/" : "", bshot);
+            snprintf(path, sizeof path, "%s%splay_%d.bmp", dir ? dir : "", dir ? "/" : "", bshot);
             save_bmp_vk(path, vt);
-            printf("nvn_vk: picture of battle frame %d saved at frame %lld: %s\n", bshot, (long long)frame, path);
+            printf("nvn_vk: picture of play frame %d saved at frame %lld: %s\n", bshot, (long long)frame, path);
             bshot = -1;
         }
     }
@@ -3365,7 +3357,7 @@ swap: ;
         r = vkQueuePresentKHR(V.queue, &pr);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
         else vk_ok("vkQueuePresentKHR", r);
-        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { LONG64 nowt = tk(); if (g_gap_prev && nowt - g_gap_prev > g_gap_max) g_gap_max = nowt - g_gap_prev; g_gap_prev = nowt; g_wd_beat = nowt; }      /* the watchdog's heartbeat = a frame reached the window */
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { g_wd_beat = tk(); }      /* the watchdog's heartbeat = a frame reached the window */
         if (!progress) InterlockedIncrement64(&g_vk_frames);
     }
     g_wd_where = 0;
@@ -3373,22 +3365,22 @@ swap: ;
     if (g_occ_qn) { LONG64 w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
-    { static LONG64 disp_prev; g_in_fight = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_fight) { g_fight_last = frame; if (g_prep_state == 1) g_prep_fight_frames++; } }      /* a frame with compute dispatches (skinning): fighters are on screen */
-    {   /* per-frame record for the "nvn_vk_gpu_fight:" line */
+    { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
+    {   /* per-frame record for the "nvn_vk_gpu_play:" line */
         static LONG64 t_prev;
         LONG64 t_now = tk();
-        int battle = g_in_fight && R.frame_draws > 120;      /* the fight draws 126..450 a frame (entrance over 205), loading screens 38..45 */
-        if (battle) g_battle_frames++;
-        {   /* how long the way to the fight took (menus are scripted by polls, so two runs differ by their loading) */
+        int play = g_in_scene && R.frame_draws > 120;        /* a play frame: a scene with more than 120 draws (the loading barrier takes a frame of at most 60 for a loading screen) */
+        if (play) g_play_frames++;
+        {   /* how long the way to the first play frame took (menus are scripted by polls, so two runs differ by their loading) */
             static LONG64 t_first, t_load; static int said;
             LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
             if (!t_first) t_first = t_now;
-            if (!battle && R.frame_draws <= 60 && frame > 600) { if (!t_load) t_load = t_now; } else if (!battle && R.frame_draws > 60) t_load = 0;      /* t_load: the start of the run of loading-screen frames before the battle */
-            if (battle && !said) { said = 1; printf("nvn_vk: first battle frame is frame %lld, %.1f s after the first present; the loading screen before it lasted %.1f s\n", (long long)frame, (double)(t_now - t_first) / (double)fq.QuadPart, t_load ? (double)(t_now - t_load) / (double)fq.QuadPart : 0.0); }
+            if (!play && R.frame_draws <= 60 && frame > 600) { if (!t_load) t_load = t_now; } else if (!play && R.frame_draws > 60) t_load = 0;      /* t_load: the start of the run of loading-screen frames before the first play frame */
+            if (play && !said) { said = 1; printf("nvn_vk: first play frame is frame %lld, %.1f s after the first present; the loading screen before it lasted %.1f s\n", (long long)frame, (double)(t_now - t_first) / (double)fq.QuadPart, t_load ? (double)(t_now - t_load) / (double)fq.QuadPart : 0.0); }
         }
         if (frame >= 0 && frame < FRSTAT_N) {
             LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-            g_fr_fight[frame] = (uint8_t)battle;
+            g_fr_play[frame] = (uint8_t)play;
             g_fr_wall[frame] = t_prev ? (float)((double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
         }
         t_prev = t_now;
@@ -3396,7 +3388,7 @@ swap: ;
     }
     {   /* what this frame paid for textures made or read at their use (hold log), then the textures made ahead */
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-        if (holdlog_on() && g_up_fr_tk * 1000 > 3 * fq.QuadPart) { static int nl; if (nl++ < 300) printf("nvn_vk_upl: frame %lld (%s): %d textures made or read at their use, %.1f MB, %.1f ms\n", (long long)frame, g_in_fight ? "fight" : "no fight", g_up_fr_n, (double)g_up_fr_bytes / 1048576.0, (double)g_up_fr_tk * 1000.0 / (double)fq.QuadPart); }
+        if (holdlog_on() && g_up_fr_tk * 1000 > 3 * fq.QuadPart) { static int nl; if (nl++ < 300) printf("nvn_vk_upl: frame %lld (%s): %d textures made or read at their use, %.1f MB, %.1f ms\n", (long long)frame, g_in_scene ? "scene" : "no scene", g_up_fr_n, (double)g_up_fr_bytes / 1048576.0, (double)g_up_fr_tk * 1000.0 / (double)fq.QuadPart); }
         g_up_fr_tk = g_up_fr_bytes = 0; g_up_fr_n = 0;
         tex_ahead(frame);
     }
@@ -3420,7 +3412,7 @@ swap: ;
                    g[GEN_BATCH], g[GEN_WRAP], g[GEN_TEXBUF], g[GEN_LOGFULL], g[GEN_INDEXW], w[GEN_CB], w[GEN_OCC], w[GEN_UBO], w[GEN_REPORT], w[GEN_BUF]);
             memcpy(lg, g_gen_why, sizeof lg); memcpy(lw, g_wlog_why, sizeof lw); lcalls = g_rput_calls; lhits = g_rput_hits; lagain = g_rput_again; lagain_b = g_rput_again_bytes; lbytes = g_ring_bytes;
         }
-        if (frame % 3000 == 0) m4_report();
+        if (frame % 3000 == 0) pipelines_report();
         mem_report(frame);
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }
@@ -3476,7 +3468,7 @@ static VkImageView dummy_view(VTex *vt, VkImageViewType type, uint32_t layers) {
     n->vtype = 100 + (int)type; n->next = vt->views; vt->views = n;
     return n->view;
 }
-/* ---------------------------------------------------------------- M4: pipelines made before they are needed (design section 5, step 1)
+/* ---------------------------------------------------------------- pipelines made before they are needed
  * At start the worker threads read ..\cache\vk\pipes.bin and make every pipeline listed there (stages from their records and
  * SPIR-V files, pipelines through the driver's pipeline cache kept in ..\cache\vk\pipelines_<gpu>.bin). The render thread
  * waits for them before it replays its first batch, so the tables are never shared with a running worker. */
@@ -3531,19 +3523,21 @@ static void vkd_init(void) {
     fflush(stdout);
 }
 static int frstat_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
-/* battle frames only (dispatches and more than 120 draws: the fight and the result screen's fighters); the first 30 are left out (their buffers were recorded
+/* play frames only (dispatches and more than 120 draws); the first 30 are left out (their buffers were recorded
  * while the stage was still being set up). GPU ms = sum of the spans of the frame's command buffers (SMO_VK_GPUTIME=1). */
 static void frstat_report(void) {
     static float g[FRSTAT_N], w[FRSTAT_N];
     int n = 0, seen = 0, slow = 0;
     double wsum = 0, gsum = 0;
+    printf("nvn_vk_frames: %lld frames, %lld of them drew a scene (compute dispatches), %lld play frames (a scene with more than 120 draws)\n",
+           (long long)g_frames_counted, (long long)g_scene_frames, (long long)g_play_frames);
     for (int f = 0; f < FRSTAT_N; f++) {
-        if (!g_fr_fight[f] || seen++ < 30) continue;
+        if (!g_fr_play[f] || seen++ < 30) continue;
         g[n] = g_fr_gpu[f]; w[n] = g_fr_wall[f]; wsum += w[n]; gsum += g[n]; if (w[n] > 33.4f) slow++; n++;
     }
     if (n < 100) return;
     qsort(g, (size_t)n, sizeof g[0], frstat_cmp); qsort(w, (size_t)n, sizeof w[0], frstat_cmp);
-    printf("nvn_vk_gpu_fight: %d battle frames: GPU ms per frame median %.2f, p99 %.2f, max %.2f, mean %.2f%s | time between presents: median %.2f ms, p99 %.2f, max %.2f, %d frames over 33.4 ms | %.1f frames per second over the battle\n",
+    printf("nvn_vk_gpu_play: %d play frames: GPU ms per frame median %.2f, p99 %.2f, max %.2f, mean %.2f%s | time between presents: median %.2f ms, p99 %.2f, max %.2f, %d frames over 33.4 ms | %.1f frames per second over them\n",
            n, (double)g[n / 2], (double)g[n * 99 / 100], (double)g[n - 1], gsum / n, g_ts_on > 0 ? "" : " (SMO_VK_GPUTIME not set: no GPU times)",
            (double)w[n / 2], (double)w[n * 99 / 100], (double)w[n - 1], slow, wsum > 0 ? 1000.0 * n / wsum : 0.0);
 }
@@ -3552,14 +3546,14 @@ static void vkd_shutdown(void) {
     if (!R.ring) return;
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double k = 1000.0 / (double)fq.QuadPart;
-        printf("nvn_vk_tex: textures made ahead of their first use: %lld (%.0f MB, %.0f ms in all, at most %.1f ms after one present); made or read at their use: %lld times, %.0f ms (of them in fight frames: %lld, %.0f ms)\n",
-               (long long)g_ta_n, (double)g_ta_bytes / 1048576.0, (double)g_ta_tk * k, (double)g_ta_max_tk * k, (long long)g_late_n, (double)g_late_tk * k, (long long)g_late_fight_n, (double)g_late_fight_tk * k);
+        printf("nvn_vk_tex: textures made ahead of their first use: %lld (%.0f MB, %.0f ms in all, at most %.1f ms after one present); made or read at their use: %lld times, %.0f ms (of them in scene frames: %lld, %.0f ms)\n",
+               (long long)g_ta_n, (double)g_ta_bytes / 1048576.0, (double)g_ta_tk * k, (double)g_ta_max_tk * k, (long long)g_late_n, (double)g_late_tk * k, (long long)g_late_scene_n, (double)g_late_scene_tk * k);
     }
     frstat_report();
     if (RS_ON && rs_ui_native()) printf("nvn_vk_scale: SMO_VK_UI_NATIVE=1: the window's textures are kept at the game's size; passes with such a colour target and a SCALED depth target (drawn without depth): %lld\n", (long long)g_rs_mixed);
     if (RS_ON) printf("nvn_vk_scale: resolution scale %.3f: %lld images made scaled, %lld fragment stages translated in this run for it (%lld of them read the pixel position, %lld fetch texels by integer position), %lld uploads into and %lld read-backs from a scaled image, %lld copies / blits touching one\n",
                       (double)rs_scale(), (long long)g_rs_images, (long long)g_rs_stages, (long long)g_rs_fcs, (long long)g_rs_tf, (long long)g_rs_up, (long long)g_rs_down, (long long)g_rs_blits);
-    m4_stop();
+    workers_stop();
     pcache_save();
     if (g_pcache) { vkDestroyPipelineCache(V.device, g_pcache, NULL); g_pcache = NULL; }
     for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]);

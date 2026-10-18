@@ -52,9 +52,8 @@
  *   alloc(size, align, user) and the destructor frees owned memory.
  * movie::MediaData is one pointer to a key/value store [subsdk 0x23d70]; here that is a host structure.
  * movie::SetAllocator(alloc(size, align, user), free(p, user), realloc(p, size, user), user) [game 0x71036e66b4].
- * The opening movie is stream:/movie/... in data.arc: WebM, VP9 1280x720, two Vorbis 48 kHz stereo tracks, 420 s
- * (extracted copy in movie_samples\, decoded offline by mftest.exe).  Media Foundation on this PC decodes VP9
- * (VP9VideoExtensionDecoder), Vorbis (FFmpegAudioDecoder MFT) and Opus; the MKV/WebM source is mfmkvsrcsnk.dll.
+ * The game's movies are the 44 MP4 files of its RomFS's MovieData folder (the Help's play guides): H.264 video, 41 of
+ * them with AAC sound, which Media Foundation decodes on every Windows PC.
  *
  * How this file maps the protocol onto IMFSourceReader: the extractor reads the whole file through the game's
  * ClientStreamReader into memory and opens it as an MF byte stream.  ReadSample(ANY_STREAM) demuxes AND decodes, so

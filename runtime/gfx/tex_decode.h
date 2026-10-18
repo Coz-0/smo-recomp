@@ -14,7 +14,8 @@
  *     every NVN target (1D, 2D, 3D, arrays, cubemaps, cube arrays, multisample, rectangle) and for
  *     linear (pitch) textures. tex_deswizzle_level() turns one level of Tegra block-linear
  *     ("GOB tiled") memory into tightly packed rows; tex_swizzle_level() is the inverse.
- *     Rules (verified against the game's packaged nutexb textures, see tex_test.c):
+ *     Rules (verified by ssbu-recomp against Super Smash Bros. Ultimate's packaged textures, and against every texture of
+ *     this game by tests/bntx_layout_check.py):
  *       - 2D / arrays / cubes: block height of level 0 = 16, 8, 4, 2 or 1 GOBs, the largest with
  *         8 * bh <= 1.5 * height_in_blocks; block depth 1.
  *       - 3D: block height 1 GOB, block depth = 16, 8, 4, 2 or 1 slices by the same 1.5 rule on depth.
@@ -106,7 +107,6 @@ typedef struct TexFormat {
     uint8_t is_int;          /* 1: integer (UI/I) texels */
     uint8_t ncomp;           /* colour components stored (1..4) */
     uint8_t swz[4];          /* default component mapping as TEX_SWZ_* (what a sampler sees for channels the format lacks: G,B = 0, A = 1) */
-    uint8_t game_uses;       /* 1: a format of k_game_formats (tex_decode.c) */
 } TexFormat;
 
 /* Format description, or NULL if the value is not a known NVN format. */
@@ -133,8 +133,8 @@ typedef struct TexLayout {
     size_t layer_stride;           /* distance between layers (cube faces, array slices): layer_size padded to a whole level-0 block */
     size_t size;                   /* storage to reserve: layer_stride * layers (always padded; use for GetStorageSize) */
     size_t data_size;              /* bytes that actually hold texels: layer_size when layers == 1, else layer_stride * layers.
-                                      This is the size of the data in the game's packaged textures (verified on 4,165 nutexb
-                                      files); use it for bounds checks against a memory pool, `size` may exceed it by < 1 block. */
+                                      This is the size of the data in packaged textures (verified by ssbu-recomp on 4,165
+                                      Super Smash Bros. Ultimate textures); use it for bounds checks against a memory pool, `size` may exceed it by < 1 block. */
     size_t alignment;              /* storage alignment the layout implies (one block of level 0: 512 << (bh_log2 + bd_log2); 32 for linear) */
 } TexLayout;
 

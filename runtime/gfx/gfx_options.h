@@ -13,7 +13,7 @@ typedef struct {
     int handheld;            /* 1: the game is told it runs handheld = it makes its own 1280x720 render targets instead of 1920x1080 */
     int aniso;               /* 0 = the game's own value; 2, 4, 8, 16 = at least that on samplers that filter between mip levels */
     int overlay;             /* 1: frame time in the title bar and a "frame-time:" log line every second */
-    int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (during play the draw is left out until they are ready; nvn_vk_pipelines.c skip_on; env SMO_VK_NOHOLD wins) */
+    int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a scene the draw is left out until they are ready; nvn_vk_pipelines.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */

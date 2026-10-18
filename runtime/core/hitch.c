@@ -178,8 +178,8 @@ static DWORD WINAPI watchdog(LPVOID arg) {
 static int cmp_bucket(const void *a, const void *b) { double x = ((const Bucket *)a)->ms, y = ((const Bucket *)b)->ms; return x > y ? -1 : x < y; }
 static int cmp_sum(const void *a, const void *b) { double x = ((const Sum *)a)->ms, y = ((const Sum *)b)->ms; return x > y ? -1 : x < y; }
 
-/* Render thread, at every present: `ms` = time since the previous present; `battle` = the frame had compute dispatches. */
-void hitch_frame(long long frame, double ms, int battle) {
+/* Render thread, at every present: `ms` = time since the previous present; `scene` = the frame had compute dispatches. */
+void hitch_frame(long long frame, double ms, int scene) {
     static FILETIME idle0, kern0, user0, pk0, pu0;
     static DWORD faults0;
     static int said;
@@ -208,7 +208,7 @@ void hitch_frame(long long frame, double ms, int battle) {
     g_hitch_frames++; g_hitch_total_ms += ms;
     if (said < 4000) {
         said++;
-        printf("hitch: frame %lld%s %.1f ms | system CPU %.0f%% busy, this process %.0f%% of it | %lu page faults |", frame, battle ? " (battle)" : "", ms,
+        printf("hitch: frame %lld%s %.1f ms | system CPU %.0f%% busy, this process %.0f%% of it | %lu page faults |", frame, scene ? " (scene)" : "", ms,
                d_all > 0 ? 100.0 * (d_all - d_idle) / d_all : 0.0, d_all - d_idle > 0 ? 100.0 * d_us / (d_all - d_idle) : 0.0, (unsigned long)d_faults);
         for (int i = 0, shown = 0; i < n && shown < 7; i++) { if (b[i].ms < 1.5 && shown) continue; printf(" [%.1f ms %s]", b[i].ms, b[i].key); shown++; }
         printf("\n");
@@ -218,7 +218,7 @@ void hitch_frame(long long frame, double ms, int battle) {
         Sum *s = sum_get(g_sum, &g_nsum, 2048, b[i].key);
         s->ms += b[i].ms; s->frames++; if (b[i].ms > s->worst) s->worst = b[i].ms; if (i == top) s->top++;
         char cat[200];
-        snprintf(cat, sizeof cat, "%s%s", battle ? "battle | " : "other  | ", b[i].key);
+        snprintf(cat, sizeof cat, "%s%s", scene ? "scene  | " : "other  | ", b[i].key);
         char *bar = strchr(cat + 9, '|');
         if (bar) *bar = 0;
         if (!strncmp(cat + 9, "main: ", 6) && strstr(cat + 15, ": ")) { char *q = strstr(cat + 15, ": "); const char *blk = strstr(q, " (blocked)"); if (blk) memmove(q, blk, strlen(blk) + 1); else *q = 0; }   /* class only */

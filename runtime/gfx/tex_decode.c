@@ -44,11 +44,6 @@ enum {
 static TexFormat g_fmt[TEX_FMT_COUNT];
 static int g_fmt_ready;
 
-/* Formats the game has been seen to use: from the backend logs (NVN texture builder formats at the
- * title screen) and from a scan of 4,165 of its 104,186 .nutexb files (see tex_test.c nutexb mode). */
-static const uint8_t k_game_formats[] = {
-    0x11, 0x16, 0x22, 0x25, 0x2E, 0x35, 0x38, 0x3D, 0x42, 0x44, 0x46, 0x48, 0x49, 0x4B, 0x4D, 0x4E, 0x50, 0x9A
-};
 
 static void fmt_set_default_swz(TexFormat *f) {
     f->swz[0] = TEX_SWZ_R;
@@ -157,7 +152,6 @@ static void fmt_build(void) {
 #undef BCF
         if (f->name) fmt_set_default_swz(f);
     }
-    for (i = 0; i < (int)sizeof k_game_formats; i++) g_fmt[k_game_formats[i]].game_uses = 1;
     g_fmt_ready = 1;
 }
 
