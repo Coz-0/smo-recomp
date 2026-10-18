@@ -48,9 +48,13 @@ typedef struct Tex {
     VNode *views;
     void *vk;                              /* the Vulkan back end's record of this texture (nvn_vk_draw.c: VTex), NULL until first used */
     long long ahead_seen;                  /* session 8 (nvn_vk_draw.c tex_ahead): 1 + the frame the render thread first saw this record; -1 = looked at, not taken */
+    int nslots, nregs;                     /* texture pool entries naming it that agl has not released, and registrations in all (nvn_gl.c, above pool_ent_release) */
+    volatile LONG reclaim;                 /* 1 while the Vulkan back end holds it on its list of textures nothing names (nvn_front_take_unref) */
+    long long last_use;                    /* Vulkan back end: the frame it was last used in (vt_get2) */
+    int image_freed;                       /* Vulkan back end: its image was freed because nothing named it (a later use makes the image again) */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
-typedef struct { Tex *tex; View view; } TexPoolEnt;
+typedef struct { Tex *tex; View view; int held; } TexPoolEnt;      /* held: the entry counts in tex->nslots (agl has not released the slot) */
 typedef struct { int count; TexPoolEnt *e; uint64_t mempool, offset; } TexPool;
 typedef struct { int count; SamplerParams *e; uint8_t *used; uint64_t mempool, offset; } SamplerPool;
 typedef struct { char *text; int len, state, nbuf; GLuint gl; uint8_t map[16]; uint32_t storage, storage_w, glsl_ssbo_w, local[3], smem_bytes, lmem_bytes, glsl_images, glsl_images_w, glsl_images_r; uint16_t glsl_img_key[8], glsl_img_fmt[8]; const uint8_t *code; int code_len, dumped, glsl_state, glsl_alpha; GLuint glsl; uint32_t glsl_cbufs, glsl_ssbos, glsl_dep, glsl_tex, glsl_key[4], ctl[8]; void *vk; } Stage;   /* state: 0 none, 1 text ready, 2 compiled, 3 rejected, 4 machine code only; vk: the Vulkan back end's last variant of this stage */
@@ -149,6 +153,11 @@ long long nvn_front_frame_next(void);                                       /* n
 void nvn_front_ccmp_dispatch(const Range *ubo, const Range *ssbo, uint32_t written, const uint8_t *code, int code_len, unsigned gx, unsigned gy, unsigned gz);
 void nvn_front_ccmp_landed(void);
 void nvn_front_take_dead(void (*drop)(int kind, void *host));               /* deferred deletion list: drop(K_TEX | K_PROG, host struct) */
+/* Textures that nothing in the game can name any more, though the object that made them never finalized them (nvn_gl.c,
+ * above pool_ent_release): each comes once (Tex.reclaim = 1) and is handed to take(); nvn_front_tex_unref(t) checks it
+ * again (0 = something names it again). */
+void nvn_front_take_unref(void (*take)(Tex *t));
+int nvn_front_tex_unref(Tex *t);
 void nvn_front_count(int what, long long n);                                /* 0 draws, 1 skipped draws, 2 clears, 3 submits, 4 texture uploads, 5 textures created */
 int nvn_front_clip_modes(void);                                             /* origin mode | depth mode << 8 (1 | 1 << 8 = upper left, 0..1) */
 const char *nvn_front_op_name(unsigned op);

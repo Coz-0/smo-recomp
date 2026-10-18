@@ -612,6 +612,47 @@ static void tp_remove(Tex *t) {
     }
     ReleaseSRWLockExclusive(&g_tp_lock);
 }
+/* ---- textures nothing names any more. agl (agl::TextureData) makes a texture in a temporary NVNtexture on the stack,
+ * registers it in a texture pool slot through agl::driver::NVNtexture_::registerTexture, which copies the object (our
+ * host pointer with it) into the TextureData's NVNtexture_, and zeroes and initialises the same temporary for the next
+ * texture. Nothing finalizes the texture's own object: the host texture lives on in the pool slot and in NVNtexture_
+ * copies, and where the game makes its render targets again every few frames (boss rematches, the Odyssey's inside,
+ * Metro Kingdom) graphics memory grew without end (12.9 GB after 25 s in RevengeBossMagmaStage). agl counts the copies
+ * of each slot (NVNMgr::countupTexture / releaseTexture); when a slot's count drops to 0 the copy that owns the texture
+ * (NVNtexture_ +0xc4 bit 0) is finalized while its +0xc0 still holds the slot number: that is agl giving the slot up
+ * (tex_finalize). So a texture is named by the object that made it, while that object still holds it, and by every pool
+ * entry agl has not given up (registered and neither released nor registered over); the copies agl counts are behind
+ * those entries. When the last entry goes, the texture is handed to the Vulkan back end (nvn_front_take_unref), which
+ * frees its image once nothing names it and it stays unused (nvn_vk_draw.c tex_reclaim). The record stays (recorded
+ * command lists may still name it) and a later use makes a new image (counted). A texture never registered is left
+ * alone. */
+static Tex **g_unref;                       /* handed to the back end at its next nvn_front_take_unref; under g_pool_lock */
+static int g_unref_n, g_unref_cap;
+static TexPool *g_tpools[16];
+static int g_ntpools;
+static LONG64 g_slot_releases, g_slot_unknown;     /* agl releases seen; finalizes of owning copies whose +0xc0 names no entry of the texture */
+/* The object that made the texture still names it. Its address may be stale (a stack temporary, memory the game gave
+ * back), hence the guarded read (VirtualQuery is slow in this process: tens of milliseconds a call while loading). */
+static int tex_held_by_maker(const Tex *t) {
+    if (!t->guest) return 0;
+    __try { return rd32(t->guest + 8) == K_TEX && rd64(t->guest) == (uint64_t)(uintptr_t)t; } __except (1) { return 0; }
+}
+static void pool_ent_release(TexPoolEnt *e) {       /* g_pool_lock held exclusively: the entry no longer names its texture for agl */
+    Tex *t = e->tex;
+    if (!e->held) return;
+    e->held = 0;
+    if (!t || --t->nslots > 0 || t->dead || !g_vk || InterlockedCompareExchange(&t->reclaim, 1, 0) != 0) return;      /* (the OpenGL path frees nothing early) */
+    if (g_unref_n == g_unref_cap) { g_unref_cap = g_unref_cap ? g_unref_cap * 2 : 256; g_unref = realloc(g_unref, sizeof *g_unref * (size_t)g_unref_cap); }
+    g_unref[g_unref_n++] = t;
+}
+void nvn_front_take_unref(void (*take)(Tex *t)) {
+    if (!g_unref_n) return;
+    AcquireSRWLockExclusive(&g_pool_lock);
+    for (int i = 0; i < g_unref_n; i++) take(g_unref[i]);
+    g_unref_n = 0;
+    ReleaseSRWLockExclusive(&g_pool_lock);
+}
+int nvn_front_tex_unref(Tex *t) { return !t->dead && t->nregs && t->nslots <= 0 && !tex_held_by_maker(t); }
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
 void nvn_label_drop(uint64_t obj);
@@ -3980,6 +4021,8 @@ void nvn_gl_report(FILE *out) {
             (long long)g_list_final_drops, (long long)g_list_reuse_drops, (long long)g_list_reuse_events, (long long)g_list_budget_drops, g_list_bytes_max >> 20, g_list_bytes >> 20);
     fprintf(out, "nvn_gl: textures %lld (uploads %lld, %lld MB, views %lld, bindless handles %lld, unmapped formats %lld), framebuffers %lld (%lld incomplete)\n", (long long)g_st.tex_created,
             (long long)g_st.tex_uploads, (long long)(g_st.tex_bytes >> 20), (long long)g_st.views, (long long)g_st.handles, (long long)g_st.unknown_fmt, (long long)g_st.fbo_made, (long long)g_st.fbo_bad);
+    fprintf(out, "nvn: texture pool slots agl gave up (an owning NVNtexture_ finalized with its slot at +0xc0): %lld; owning copies finalized whose +0xc0 names no pool entry of their texture: %lld\n",
+            (long long)g_slot_releases, (long long)g_slot_unknown);
     fprintf(out, "nvn_gl: nvnProgramSetShaders calls %ld, stages compiled %lld, rejected %lld, GL errors %lld, streamed %lld MB\n", (long)g_setshaders_calls, (long long)g_st.prog_ok,
             (long long)g_st.prog_fail, (long long)g_st.gl_errors, (long long)(g_st.arena_bytes >> 20));
     fprintf(out, "nvn_gl: shader cache: %lld stages compiled by the driver, %lld taken from the cache by machine code, %lld by identical GLSL text; texture memory checks: %lld unwritten (write watch), %lld written and hashed, %lld not watched (hashed)\n",
@@ -4337,7 +4380,8 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     t->guest = A0;
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
     tp_add(t);
-    if (texlog_on()) printf("texlog: init %llx host %p %dx%d fmt 0x%x target %d mem %p\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, t->b.target, (void *)t->mem);
+    if (texlog_on()) printf("texlog: init %llx host %p %dx%d fmt 0x%x target %d mem %p levels %d depth %d samples %d flags 0x%x storage 0x%llx frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height,
+                            t->b.format, t->b.target, (void *)t->mem, t->b.levels, t->b.depth, t->b.samples, t->b.flags, (unsigned long long)t->storage, (long long)g_st.frames, (unsigned long long)c->x[30]);
     RET(1);
 }
 static void tex_finalize(Ctx *c) {
@@ -4350,7 +4394,22 @@ static void tex_finalize(Ctx *c) {
      * texture (t->guest) ends it; a copy is just cleared. (boot81: the 1600x900 scene buffer of the final composite was
      * killed this way, pool slot 282, and every 3D frame came out blue.) */
     if (A0 != t->guest) {
-        if (texlog_on()) printf("texlog: finalize of a copy %llx (host %p belongs to %llx): copy cleared only\n", (unsigned long long)A0, (void *)t, (unsigned long long)t->guest);
+        /* agl giving up a pool slot (the note above pool_ent_release): an owning NVNtexture_ (+0xc4 bit 0) whose +0xc0
+         * is a slot that names this texture */
+        int32_t id = -1;
+        int released = 0, own = 0;
+        __try { id = (int32_t)rd32(A0 + 0xc0); own = rd8(A0 + 0xc4) & 1; } __except (1) { own = 0; }     /* past the 0xc0 bytes of an NVNtexture: an object of another kind may end there */
+        if (own && id >= 0) {
+            AcquireSRWLockExclusive(&g_pool_lock);
+            for (int i = 0; i < g_ntpools && !released; i++) {
+                TexPool *tp = g_tpools[i];
+                if ((uint32_t)id < (uint32_t)tp->count && tp->e[id].tex == t && tp->e[id].held) { pool_ent_release(&tp->e[id]); released = 1; }
+            }
+            ReleaseSRWLockExclusive(&g_pool_lock);
+            InterlockedIncrement64(released ? &g_slot_releases : &g_slot_unknown);
+        }
+        if (texlog_on()) printf("texlog: finalize of a copy %llx (host %p belongs to %llx): copy cleared only; slot %d %s, %d entries left, frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, (unsigned long long)t->guest,
+                                (int)id, released ? "released" : "not an entry of it", t->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
         wr32(A0 + 8, 0);
         return;
     }
@@ -4422,6 +4481,9 @@ static void tpool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     TexPool *tp = hnew(A0, K_TPOOL, sizeof *tp);
     tp->count = (int)A3 > 0 ? (int)A3 : 0; tp->mempool = A1; tp->offset = A2;
     tp->e = calloc((size_t)tp->count + 1, sizeof *tp->e);
+    AcquireSRWLockExclusive(&g_pool_lock);
+    if (g_ntpools < 16) g_tpools[g_ntpools++] = tp;     /* where an agl release (tex_finalize) looks for its slot; SMO makes 1 */
+    ReleaseSRWLockExclusive(&g_pool_lock);
     RET(1);
 }
 static void tpool_register(Ctx *c) {                   /* (pool, id, texture, view) */
@@ -4432,10 +4494,13 @@ static void tpool_register(Ctx *c) {                   /* (pool, id, texture, vi
     memset(&e, 0, sizeof e);
     e.tex = hobj(A2, K_TEX);
     if (A3) memcpy(&e.view, P(A3), sizeof e.view);
-    if (texlog_on() && e.tex && e.tex->b.width >= 256) printf("texlog: register pool %llx slot %u <- %llx host %p %dx%d fmt 0x%x\n", (unsigned long long)A0, (unsigned)A1, (unsigned long long)A2, (void *)e.tex, e.tex->b.width, e.tex->b.height, e.tex->b.format);
     AcquireSRWLockExclusive(&g_pool_lock);
+    pool_ent_release(&tp->e[(uint32_t)A1]);             /* registered over: the texture there before loses this entry */
+    if (e.tex) { e.held = 1; e.tex->nslots++; e.tex->nregs++; }
     tp->e[(uint32_t)A1] = e;
     ReleaseSRWLockExclusive(&g_pool_lock);
+    if (texlog_on() && e.tex) printf("texlog: register pool %llx slot %u <- %llx host %p %dx%d fmt 0x%x entries %d frame %lld (caller %llx)\n", (unsigned long long)A0, (unsigned)A1, (unsigned long long)A2, (void *)e.tex,
+                                     e.tex->b.width, e.tex->b.height, e.tex->b.format, e.tex->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
 }
 
 /* ---- small state objects: contents live in the guest object */
@@ -5194,6 +5259,7 @@ static void tpool_finalize(Ctx *c) {
     TexPool *tp = hobj(A0, K_TPOOL);
     if (!tp) return;
     AcquireSRWLockExclusive(&g_pool_lock);
+    for (int i = 0; i < tp->count; i++) pool_ent_release(&tp->e[i]);
     tp->count = 0;                                      /* the record itself stays: recorded SetTexturePool commands may still name it */
     ReleaseSRWLockExclusive(&g_pool_lock);
     wr32(A0 + 8, 0);

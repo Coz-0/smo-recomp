@@ -13,6 +13,7 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#include <psapi.h>
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -25,6 +26,7 @@ typedef struct VStage {
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SMO_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
+    uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
 #define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
@@ -138,7 +140,7 @@ static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; 
     free(words); fclose(fp);
     return mod;
 }
-static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash) {      /* any thread */
+static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash, int *on_disk) {      /* any thread; *on_disk (may be NULL): the SPIR-V file is there to be read again */
     {   /* SMO port, debug aid SMO_VK_GLSLDUMP=<folder>: every freshly translated stage as <what>.glsl (stages found in the
          * stage cache are not translated again: clear build/cache/vk/stage and spv to dump everything) */
         const char *dir = getenv("SMO_VK_GLSLDUMP");
@@ -156,11 +158,12 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
     VkShaderModule mod = NULL;
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)stage ^ 0x5601, glsl, strlen(glsl));
     *spv_hash = h;
-    if ((mod = module_from_spv(h)) != NULL) { InterlockedIncrement64(&R.modules); return mod; }
+    if (on_disk) *on_disk = 0;
+    if ((mod = module_from_spv(h)) != NULL) { InterlockedIncrement64(&R.modules); if (on_disk) *on_disk = 1; return mod; }
     if (!g_glsl_to_spirv(stage, glsl, &words, &count, log, sizeof log)) { printf("nvn_vk: %s: glslang rejected the translated text: %s\n", what, log); fflush(stdout); return NULL; }
     snprintf(path, sizeof path, "%s/spv/%016llx.spv", vkc_dir(), (unsigned long long)h);
     FILE *fp = fopen(path, "wb");
-    if (fp) { fwrite(words, 4, count, fp); fclose(fp); }
+    if (fp) { int ok = fwrite(words, 4, count, fp) == count; if (fclose(fp) == 0 && ok && on_disk) *on_disk = 1; }
     if (g_offline) { g_spirv_free(words); InterlockedIncrement64(&R.modules); return (VkShaderModule)(uintptr_t)1; }
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = count * 4; ci.pCode = words;
@@ -178,8 +181,41 @@ static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
     fclose(fp);
     return got == sizeof *r && r->magic == STAGEREC_MAGIC && r->stage == s && r->nsmp >= 0 && r->nsmp <= 64;
 }
+/* A stage's module once its library (or compute pipeline) is made: the driver keeps a copy of each module's SPIR-V (58 KB
+ * on average, 15,800 modules after the game hands its programs over at start: about 0.9 GB per game) although nothing
+ * needs the module again unless a pipeline of another kind is made from the stage (a pair library, a whole pipeline, a
+ * vertex stage drawn alone). So the module is destroyed when no thread uses it, and made again from the SPIR-V file of the
+ * stage cache when it is needed: the same words, so the same pipelines. SMO_VK_MODREL=0 keeps every module (as before). */
+static LONG64 g_mod_released, g_mod_again, g_mod_destroy_tk;
+static int modrel_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_MODREL") ? atoi(getenv("SMO_VK_MODREL")) : 1; return on; }      /* 2 (measurement): released as soon as the stage is made */
+static VkShaderModule module_from_spv(uint64_t h);
+static VkShaderModule stage_mod_get(VStage *v) {   /* any thread, no lock held; stage_mod_put when the module is no longer used */
+    EnterCriticalSection(&g_sh_lock);
+    v->mod_users++;
+    if (!v->mod && v->spv) {
+        v->mod = module_from_spv(v->spv);
+        if (!v->mod) { LeaveCriticalSection(&g_sh_lock); vkd_fail("the SPIR-V file %016llx of a stage whose module was released cannot be read again (was the stage cache folder removed while the game ran?)", (unsigned long long)v->spv); }
+        g_mod_again++;
+    }
+    VkShaderModule m = v->mod;
+    LeaveCriticalSection(&g_sh_lock);
+    return m;
+}
+static void stage_mod_put(VStage *v) {
+    VkShaderModule m = NULL;
+    EnterCriticalSection(&g_sh_lock);
+    if (--v->mod_users == 0 && v->mod_rel && v->spv && !v->temp && !g_offline && modrel_on()) { m = v->mod; v->mod = NULL; if (m) g_mod_released++; }
+    LeaveCriticalSection(&g_sh_lock);
+    if (m) { LONG64 t0 = tk(); vkDestroyShaderModule(V.device, m, NULL); InterlockedAdd64(&g_mod_destroy_tk, tk() - t0); }
+}
+static void stage_mod_releasable(VStage *v) {      /* its library or compute pipeline is made: the module goes when its last user is done */
+    if (v->temp || !v->spv) return;                /* spv 0: no SPIR-V file to make it again from, the module is kept */
+    EnterCriticalSection(&g_sh_lock);
+    v->mod_rel = 1;
+    LeaveCriticalSection(&g_sh_lock);
+}
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
-    v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo;
+    v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo; v->spv = r->spv;
     v->cbufs = r->cbufs; v->ssbos = r->ssbos; v->ssbo_w = r->ssbo_w; v->images = r->images; v->dep = r->dep; v->tex_units = r->tex_units; v->in_attr = r->in_attr; v->out_attr = r->out_attr;
     v->uses_alpha = r->uses_alpha; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp);
     v->mod = mod; v->ok = 1;
@@ -252,7 +288,9 @@ static void vstage_build(VStage *v, const SSrc *src) {
         else {
             uint64_t spv_hash = 0;
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
-            v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
+            int on_disk;
+            v->mod = module_from_glsl(s, out.glsl, what, &spv_hash, &on_disk);
+            v->spv = on_disk ? spv_hash : 0;       /* no SPIR-V file: the module is kept (stage_mod_releasable) */
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->images_w = out.images_written; memcpy(v->img_fmt, out.image_gl_format, sizeof v->img_fmt); memcpy(v->img_type, out.image_type, sizeof v->img_type);
             v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
@@ -283,6 +321,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             }
         }
     }
+    if (v->ok && v->mod && modrel_on() == 2) { stage_mod_get(v); stage_mod_releasable(v); stage_mod_put(v); }
     EnterCriticalSection(&g_sh_lock);
     if (v->ok && !v->temp) { v->next_h = g_vh[v->h & 4095]; g_vh[v->h & 4095] = v; }      /* temp (session 10): a stage of the preparation that is in no table */
     v->state = 2;
@@ -461,8 +500,8 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     VkPipelineShaderStageCreateInfo st[2];
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs->mod; st[0].pName = "main";
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? fs->mod : NULL; st[1].pName = "main";
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = stage_mod_get(vs); st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? stage_mod_get(fs) : NULL; st[1].pName = "main";
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1; vp.pNext = vk_vp_next();
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -484,6 +523,7 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     gi.pNext = &gl; gi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pDynamicState = &dy; gi.layout = l->layout;
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &l->lib);
+    stage_mod_put(vs); if (fs) stage_mod_put(fs);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, pair library (vertex stage %u, fragment stage %u): %s", vs->id, fs ? fs->id : 0, vk_result_name(r));
     LONG64 dt = tk() - t0;
     EnterCriticalSection(&g_sh_lock);
@@ -604,7 +644,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     *how = 1;
     int isfs = v->stage == 1;
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    st.stage = isfs ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT; st.module = v->mod; st.pName = "main";
+    st.stage = isfs ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT; st.module = stage_mod_get(v); st.pName = "main";
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1; vp.pNext = vk_vp_next();
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -634,6 +674,8 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     LONG64 tc0 = tk();
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, lib);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
+    if (!alone) stage_mod_releasable(v);
+    stage_mod_put(v);
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double sec = (double)(tk() - tc0) / (double)fq.QuadPart;
         if (sec > 1.0) printf("nvn_vk_gpl: stage library (%s stage %u, %d bytes of machine code%s) took %.1f s in the driver\n", isfs ? "fragment" : "vertex", v->id, v->code_len, (gi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) ? ", NOT optimised" : "", sec);
@@ -763,9 +805,9 @@ static double pipe_build(Pipe *p) {
     uint32_t nst = 0;
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = st[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[nst].stage = VK_SHADER_STAGE_VERTEX_BIT; st[nst].module = vs->mod; st[nst++].pName = "main";
-    if (p->gs) { st[nst].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[nst].module = p->gs->mod; st[nst++].pName = "main"; }
-    if (fs) { st[nst].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[nst].module = p->gs && g_gs_dbg_fs ? g_gs_dbg_fs : fs->mod; st[nst++].pName = "main"; }
+    st[nst].stage = VK_SHADER_STAGE_VERTEX_BIT; st[nst].module = stage_mod_get(vs); st[nst++].pName = "main";
+    if (p->gs) { st[nst].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[nst].module = stage_mod_get(p->gs); st[nst++].pName = "main"; }
+    if (fs) { st[nst].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[nst].module = stage_mod_get(fs); if (p->gs && g_gs_dbg_fs) st[nst].module = g_gs_dbg_fs; st[nst++].pName = "main"; }
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -814,6 +856,7 @@ static double pipe_build(Pipe *p) {
     gi.pNext = &ri; gi.stageCount = nst; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
+    stage_mod_put(vs); if (p->gs) stage_mod_put(p->gs); if (fs) stage_mod_put(fs);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, geometry stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, p->gs ? p->gs->id : 0, k->ncolor, k->dfmt, vk_result_name(r));
     InterlockedIncrement64(&R.pipelines);
     EnterCriticalSection(&g_sh_lock);
@@ -1019,7 +1062,7 @@ static Pipe *gs_pipe_get(const PKey *k, VStage *vs, VStage *gs, VStage *fs) {
     static int dbg = -1;                           /* SMO_VK_GS_DEBUG=3: these draws in magenta, without the depth test (draw_prepare) */
     if (dbg < 0 && (dbg = gs_dbg_mode() == 3) != 0) {
         uint64_t h;
-        g_gs_dbg_fs = module_from_glsl(1, "#version 460\nlayout(location = 0) out vec4 o0;\nvoid main() { o0 = vec4(200.0, 0.0, 200.0, 1.0); }\n", "geometry stage debug", &h);
+        g_gs_dbg_fs = module_from_glsl(1, "#version 460\nlayout(location = 0) out vec4 o0;\nvoid main() { o0 = vec4(200.0, 0.0, 200.0, 1.0); }\n", "geometry stage debug", &h, NULL);
     }
     for (GsPipe *q = g_gspipes; q; q = q->next) if (q->gs == gs->id && !memcmp(&q->k, k, sizeof *k)) return q->p;
     GsPipe *q = calloc(1, sizeof *q);
@@ -1537,6 +1580,14 @@ static void stage_copy(Stage *st, int s) {
 void nvn_vk_program_set(void *prog) {
     Prog *p = prog;
     SSrc s[3];
+    {   static volatile LONG first;                /* the process before any stage, library or pipeline of the game exists (nvn_vk_mem lines follow every 300 frames) */
+        if (!first && InterlockedExchange(&first, 1) == 0) {
+            PROCESS_MEMORY_COUNTERS_EX pm;
+            memset(&pm, 0, sizeof pm); pm.cb = sizeof pm;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
+            printf("nvn_vk_mem: the game hands its first program over (frame %lld): working set %llu MB, private bytes %llu MB\n", (long long)nvn_front_frame_next(), (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PrivateUsage >> 20));
+        }
+    }
     if (p->st[2].state) { static int nl; if (nl++ < 20) printf("nvn_vk: program #%d has a geometry stage (%d bytes): its stages and pipelines are made at its first draw\n", p->serial, p->st[2].code_len); }
     if (!g_m4_on || p->st[2].state || p->st[3].state || p->st[4].state) return;
     {   static int on = -1;
@@ -1599,7 +1650,14 @@ static void prewarm_start(void) {
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("smo_glslang.dll cannot be loaded (build_glslang.bat makes it)");
     }
-    {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
+    /* The pipeline cache object costs its entries in the driver's memory: about 640 MB of a game's working set in the Sand
+     * Kingdom (1.4.1), the same whether read from the file or filled while the game hands its programs over, and destroying
+     * it after the boot frees nothing (the driver keeps the memory). It stays: the NVIDIA driver's own shader disk cache
+     * would serve the same pipelines, but it keeps one cache per executable, so an exe started under a new name (every
+     * test copy's first run) would compile everything again (several minutes of every processor). SMO_VK_PCACHE=0 makes
+     * pipelines without the object (nothing read or saved): 640 MB less for an exe whose name the driver has seen. */
+    if (getenv("SMO_VK_PCACHE") && !atoi(getenv("SMO_VK_PCACHE"))) printf("nvn_vk: SMO_VK_PCACHE=0: no pipeline cache object: pipelines are made without one (the driver's own disk cache, kept per executable, serves them); nothing is read or saved\n");
+    else {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
@@ -1608,7 +1666,12 @@ static void prewarm_start(void) {
         FILE *fp = fopen(g_pcache_path, "rb");
         if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
+        PROCESS_MEMORY_COUNTERS_EX pm0, pm1;
+        memset(&pm0, 0, sizeof pm0); pm0.cb = sizeof pm0; pm1 = pm0;
+        K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm0, sizeof pm0);
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
+        K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm1, sizeof pm1);
+        printf("nvn_vk_mem: the driver took the pipeline cache in with %+lld MB private bytes, %+lld MB working set\n", ((long long)pm1.PrivateUsage - (long long)pm0.PrivateUsage) >> 20, ((long long)pm1.WorkingSetSize - (long long)pm0.WorkingSetSize) >> 20);
         /* session 11: what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
@@ -1762,6 +1825,12 @@ static void prewarm_wait(void) {                   /* render thread, before its 
     fflush(stdout);
     free(g_pw_rec); g_pw_rec = NULL;
 }
+void nvn_vk_hold_counts(long long *holds, long long *hold_ms, long long *dummies) {     /* smo_nerve.c (SMO_STAGE_LIST): so far */
+    LARGE_INTEGER fq;
+    QueryPerformanceFrequency(&fq);
+    *holds = g_bar_n; *hold_ms = (long long)((double)g_bar_tk * 1000.0 / (double)fq.QuadPart); *dummies = R.dummy_kind;
+}
+
 static void m4_report(void) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     if (D.has_gpl) {
@@ -1852,13 +1921,14 @@ static DWORD WINAPI pcprobe_main(void *arg) {
     VStage *src = NULL;
     (void)arg;
     EnterCriticalSection(&g_sh_lock);
-    for (int i = 0; i < 4096 && !src; i++) for (VStage *v = g_vstage[i]; v; v = v->next) if (v->ok && v->stage == 1 && v->lib_state == 2 && v->mod && !v->temp) { src = v; break; }
+    for (int i = 0; i < 4096 && !src; i++) for (VStage *v = g_vstage[i]; v; v = v->next) if (v->ok && v->stage == 1 && v->lib_state == 2 && (v->mod || v->spv) && !v->temp) { src = v; break; }
     LeaveCriticalSection(&g_sh_lock);
     if (!src) return 0;
+    VkShaderModule src_mod = stage_mod_get(src);      /* the copies below use src's module: not released meanwhile */
     for (int round = 0; !g_pcprobe_stop || round < 20; round++) {
         static VStage t;
         int how;
-        t = *src; t.lib = NULL; t.lib2 = NULL; t.lib_state = 0; t.lib2_state = 0; t.temp = 1;
+        t = *src; t.mod = src_mod; t.lib = NULL; t.lib2 = NULL; t.lib_state = 0; t.lib2_state = 0; t.temp = 1;
         LONG64 t0 = tk();
         stagelib_ensure(&t, 0, &how);
         LONG64 dt = tk() - t0;
@@ -1867,6 +1937,7 @@ static DWORD WINAPI pcprobe_main(void *arg) {
         else { g_pcprobe_n++; if (dt > g_pcprobe_max) g_pcprobe_max = dt; }
         Sleep(2);
     }
+    stage_mod_put(src);
     return 0;
 }
 /* where: 0 the exit path, 1 the render thread inside a held loading screen, 2 the preparation thread at once (old behaviour) */

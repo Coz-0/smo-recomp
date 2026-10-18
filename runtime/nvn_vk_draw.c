@@ -130,7 +130,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
            D.has_vids, D.has_cbc, D.has_pv, D.has_iu8, D.has_plr, (int)D.f2.features.textureCompressionASTC_LDR, (int)D.f2.features.depthClamp, (int)D.f2.features.wideLines, (int)D.f2.features.robustBufferAccess);
 }
 
-/* ---------------------------------------------------------------- memory: 64 MB blocks per memory type and class, first fit */
+/* ---------------------------------------------------------------- memory: blocks per memory type and class (64 MB, host-visible 16 MB), first fit */
 typedef struct { int block; uint64_t off, size; void *map; VkDeviceMemory mem; } VMem;
 typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; int cls, nfree, used; struct { uint64_t off, size; } fr[512]; } VBlock;
 static VBlock *g_blk[2048];
@@ -164,11 +164,19 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
         if (b == 2048) vkd_fail("out of memory blocks");
         VBlock *k = calloc(1, sizeof *k);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
+        /* large: a block of its own. Host-visible memory is system memory the driver keeps resident for the GPU: its blocks are
+         * 16 MB (the small buffers, compute copy-backs and readbacks of a stage used under 1 MB of two 64 MB blocks) */
+        uint64_t bsz = (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? (16u << 20) : (64u << 20);
+        k->size = rq.size > (16u << 20) ? rq.size : bsz; k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;
         ai.allocationSize = k->size; ai.memoryTypeIndex = type;
         VkResult r = vkAllocateMemory(V.device, &ai, NULL, &k->mem);
         if (r != VK_SUCCESS) vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(k->size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20));
         if (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) VKC(vkMapMemory(V.device, k->mem, 0, VK_WHOLE_SIZE, 0, &k->map));
+        {   static int log = -1;
+            if (log < 0) log = getenv("SMO_VK_MEMLOG") && atoi(getenv("SMO_VK_MEMLOG"));
+            if (log) printf("nvn_vk_mem: block %d: %llu MB, type %u (flags 0x%x, heap %u), class %d, mapped at %p\n", b, (unsigned long long)(k->size >> 20), type,
+                            (unsigned)D.mp.memoryTypes[type].propertyFlags, (unsigned)D.mp.memoryTypes[type].heapIndex, k->cls, k->map);
+        }
         k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
         g_blk[b] = k; if (b == g_nblk) g_nblk++;
         g_mem_total += (LONG64)k->size;
@@ -751,6 +759,47 @@ static void vk_drop(int kind, void *host) {
     if (g_ngarbage == g_garbage_cap) { g_garbage_cap = g_garbage_cap ? g_garbage_cap * 2 : 256; g_garbage = realloc(g_garbage, sizeof *g_garbage * (size_t)g_garbage_cap); }
     g_garbage[g_ngarbage].vt = vt; g_garbage[g_ngarbage++].serial = R.serial + 1;       /* the command buffer being recorded may still name it */
 }
+/* Textures nothing in the game names any more (nvn_gl.c, the note above pool_ent_release: agl gave up every pool slot
+ * of the texture and the object that made it holds another one). Their images go once they have not been used for
+ * SMO_VK_TEXFREE frames (default 8; 0 = never, as before): a command list recorded before agl let go may still be
+ * submitted (RevengeBossMagmaStage, 4,700 images freed: the last use was at most 1 frame after the release). The
+ * texture is not dead: a later use makes its image again (counted and logged as "made again"; what the GPU had drawn
+ * into it is lost then, so none is expected). One still bound as a render target, or a window texture, waits. */
+static Tex **g_rc;                                 /* the textures waiting (each has Tex.reclaim = 1) */
+static int g_rc_n, g_rc_cap;
+static LONG64 g_rc_freed, g_rc_freed_mb, g_rc_again, g_rc_late;
+static int texfree_frames(void) { static int n = -2; if (n == -2) { const char *e = getenv("SMO_VK_TEXFREE"); n = e ? atoi(e) : 8; } return n; }
+static int texlog_vk(void) { static int on = -1; if (on < 0) on = getenv("SMO_TEXLOG") != NULL; return on; }
+static void rc_take(Tex *t) {
+    if (g_rc_n == g_rc_cap) { g_rc_cap = g_rc_cap ? g_rc_cap * 2 : 256; g_rc = realloc(g_rc, sizeof *g_rc * (size_t)g_rc_cap); }
+    g_rc[g_rc_n++] = t;
+}
+static void rc_ignore(Tex *t) { (void)t; }        /* SMO_VK_TEXFREE=0: taken and left (Tex.reclaim stays 1, so it is not offered again) */
+static void tex_reclaim(LONG64 frame) {
+    int idle = texfree_frames(), n = 0;
+    nvn_front_take_unref(idle > 0 ? rc_take : rc_ignore);
+    for (int i = 0; i < g_rc_n; i++) {
+        Tex *t = g_rc[i];
+        if (t->dead) continue;                     /* finalized by the object that made it: vk_drop has its image */
+        if (t->nslots > 0) {                       /* registered again: offered again when agl lets go of it once more */
+            InterlockedExchange(&t->reclaim, 0);
+            if (t->nslots > 0 || InterlockedCompareExchange(&t->reclaim, 1, 0) != 0) continue;     /* (and if that happened just now, it stays) */
+        }
+        int bound = R.depth.tex == t || wintex_is(t);
+        for (int k = 0; k < 8 && !bound; k++) bound = R.col[k].tex == t;
+        if (bound || frame - t->last_use < idle || !nvn_front_tex_unref(t)) { g_rc[n++] = t; continue; }
+        VTex *vt = t->vk;
+        if (vt) {
+            g_rc_freed++; g_rc_freed_mb += (LONG64)(vt->mem.size >> 20);
+            if (texlog_vk()) printf("texlog: image freed host %p %dx%d fmt 0x%x (%llu KB) frame %lld, last used in frame %lld\n", (void *)t, t->b.width, t->b.height, t->b.format, (unsigned long long)(vt->mem.size >> 10), (long long)frame, (long long)t->last_use);
+            vk_drop(K_TEX, t);
+            t->uploaded = 0; t->checked = 0;       /* a texture the CPU wrote is read from its memory again if it is used again */
+            t->image_freed = 1;
+        } else t->image_freed = 2;
+        InterlockedExchange(&t->reclaim, 0);
+    }
+    g_rc_n = n;
+}
 static int lvl_(int v, int l) { v >>= l; return v > 0 ? v : 1; }
 /* Track O. A temporary image of w x h (one level, one layer, the format of `like`) for an upload into, or a read-back from,
  * an image that is smaller than the game's texture. The command buffer is being recorded; the image goes when it has finished. */
@@ -843,6 +892,15 @@ static volatile LONG g_in_fight;                   /* nvn_vk_m4.c (included furt
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
+    t->last_use = g_cur_frame;
+    if (!vt && t->image_freed) {                   /* tex_reclaim freed it (or let it go before it had an image): it is used after all */
+        static int nl;
+        if (t->image_freed == 1) g_rc_again++; else g_rc_late++;
+        if (nl++ < 40) printf("nvn_vk_tex: frame %lld: texture %dx%d format 0x%x %s after nothing named it (written by the GPU %d, pool entries %d)\n", (long long)g_cur_frame, t->b.width, t->b.height, t->b.format,
+                              t->image_freed == 1 ? "used again: its image is made again (empty if the GPU wrote it)" : "used for the first time", t->gpu_written, t->nslots);
+        t->image_freed = 0;
+        if (t->nslots <= 0 && InterlockedCompareExchange(&t->reclaim, 1, 0) == 0) rc_take(t);      /* still nothing names it: it may go again */
+    }
     if (!vt) {
         tu0 = tk();
         TexBuilder *b = &t->b;
@@ -948,7 +1006,7 @@ static void tex_ahead(LONG64 frame) {
     for (Tex *t = head; t && t != done_head; t = t->all_next) {
         Fmt f;
         if (t->ahead_seen < 0) continue;
-        if (t->vk || t->dead) { t->ahead_seen = -1; continue; }
+        if (t->vk || t->dead || t->image_freed) { t->ahead_seen = -1; continue; }
         if (!t->ahead_seen) { t->ahead_seen = frame + 1; pending++; oldest = t; continue; }
         if (frame + 1 - t->ahead_seen < 2) { pending++; oldest = t; continue; }
         if (t->gpu_written || (!t->mem && !t->b.packaged) || t->b.samples > 1 || t->b.width <= 0 || t->b.height <= 0 || !nvn_front_fmt(t->b.format, &f) || f.kind != 4) { t->ahead_seen = -1; continue; }
@@ -1676,7 +1734,12 @@ static void set_dynamic_state3(int samples) {
 typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled */
 static int g_cb_merge = -1;                        /* SMO_VK_CBMERGE=0: the whole range is copied back as before session 5 */
 typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
-static CB g_cb[256];
+/* SMO: 256 were not enough for a Cascade Kingdom room (WindBlowExStage: "more than 256 storage buffers written by compute
+ * in one batch" at its first camera turn, stage stress test, tests/stress_stages.py); its many small skinned objects each
+ * have a written range of their own. */
+#define CB_MAX 4096
+static CB g_cb[CB_MAX];
+static int g_cb_used;                              /* slots taken into use so far (the walks over g_cb stop there) */
 static CDisp g_cdisp[2048];
 static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
@@ -1695,7 +1758,7 @@ static uint32_t g_cb_epoch;
 static void cb_land(int midbatch) {                /* the GPU has finished everything that wrote a CB */
     LONG64 t0 = tk();
     cb_masks();
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < g_cb_used; i++) {
         CB *c = &g_cb[i];
         if (!c->state) continue;
         if (c->dirty) host_wrote(c->addr, c->size, GEN_CB);      /* guest memory changes: ranges the ring copied from it are copied again */
@@ -1911,13 +1974,13 @@ static void occ_report(uint64_t dst) {
 static void cb_batch_end(void) {
     if (!g_cb_live) return;
     g_cb_serial = cmd_submit(NULL, NULL);
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1) g_cb[i].state = 2;
+    for (int i = 0; i < g_cb_used; i++) if (g_cb[i].state == 1) g_cb[i].state = 2;
     g_cb_pending = g_cb_live; g_cb_live = 0;
 }
 /* The CBs of this batch (state 1), in the order they were made: the first g_cb_live entries (every change of a CB out of
  * state 1 sets g_cb_live to 0). Every range a draw reads is looked up here while compute results are live, about 10,000
  * a frame: walking the 256 slots for the dozen CBs of a frame cost 0.5-0.7 ms a frame once they stayed live longer. */
-static int16_t g_cb_live_list[256];
+static int16_t g_cb_live_list[CB_MAX];
 static CB *cb_inside(uint64_t addr, uint64_t size) {
     for (int k = 0; k < g_cb_live; k++) { CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr >= c->addr && addr + size <= c->addr + c->size) return c; }
     return NULL;
@@ -1928,16 +1991,17 @@ static int cb_overlap(uint64_t addr, uint64_t size) {
 }
 static CB *cb_new(uint64_t addr, uint64_t size) {
     CB *c = NULL, *empty = NULL, *victim = NULL;
-    for (int i = 0; i < 256 && !c; i++) {
+    for (int i = 0; i < g_cb_used && !c; i++) {
         CB *k = &g_cb[i];
         if (k->state || k->busy > R.done) continue;
         if (!k->buf) { if (!empty) empty = k; }
         else if (k->cap >= size && k->cap <= size * 2 + 4096) c = k;
         else if (!victim) victim = k;
     }
+    if (!c && !empty && g_cb_used < CB_MAX) empty = &g_cb[g_cb_used++];      /* slots are taken into use as needed: the walks above stay short */
     if (!c) {
         c = empty ? empty : victim;
-        if (!c) vkd_fail("more than 256 storage buffers written by compute in one batch");
+        if (!c) vkd_fail("more than %d storage buffers written by compute in one batch", CB_MAX);
         if (c->buf) { vkDestroyBuffer(V.device, c->buf, NULL); vmem_free(c->mem); c->buf = NULL; }      /* free and not busy: nothing in flight names it */
         if (g_cb_cached < 0) {                     /* read back by the CPU: cached host memory when the device has it */
             g_cb_cached = 0;
@@ -2094,11 +2158,13 @@ static void compute_pipe_make(VStage *v) {         /* any thread */
         pl.setLayoutCount = 2; pl.pSetLayouts = v->cdl;
         VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &v->cl));
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = v->mod; ci.stage.pName = "main"; ci.layout = v->cl;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = stage_mod_get(v); ci.stage.pName = "main"; ci.layout = v->cl;
         VkPipeline cp = NULL;
         VkResult r = vkCreateComputePipelines(V.device, g_pcache, 1, &ci, NULL, &cp);
         if (r != VK_SUCCESS) vkd_fail("vkCreateComputePipelines (compute stage %u): %s", v->id, vk_result_name(r));
         v->cp = cp;
+        stage_mod_releasable(v);
+        stage_mod_put(v);
         InterlockedIncrement64(&R.pipelines);
     }
 }
@@ -2476,7 +2542,7 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
     if (!vs) {
         vs = calloc(1, sizeof *vs);
         vs->id = ++g_vstage_ids; vs->ok = 1; vs->stage = -1;
-        vs->mod = module_from_glsl(0, "#version 460\nvoid main() { gl_Position = vec4(vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2) * 2.0 - 1.0, 0.0, 1.0); }\n", "internal stencil clear", &g_spv_unused);
+        vs->mod = module_from_glsl(0, "#version 460\nvoid main() { gl_Position = vec4(vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2) * 2.0 - 1.0, 0.0, 1.0); }\n", "internal stencil clear", &g_spv_unused, NULL);
         if (!vs->mod) vkd_fail("the internal stencil-clear vertex shader does not compile");
         vs->next = g_vstage[0]; g_vstage[0] = vs;
     }
@@ -2731,9 +2797,52 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
 
 /* ---------------------------------------------------------------- replay */
 static void replay(uint64_t handle, int depth);
+/* NVN_DRAW_PRIMITIVE_QUADS (7), which Vulkan has not (met in a Sand Kingdom room, SandWorldKillerExStage): each quad
+ * v0 v1 v2 v3 is drawn as the triangles v0 v1 v2 and v0 v2 v3, the quad's own winding, from an index list made here in
+ * the stream ring: for arrays the vertex numbers from 0 (the draw's first vertex is its vertex offset), for elements the
+ * game's indices (type t: 0 8-bit, 1 16-bit, 2 32-bit) rearranged. Vertices after the last whole quad are left out, as
+ * GL leaves them. Render thread only (the list is a static buffer); call before draw_prepare, like buf_ref: it may wrap
+ * the ring. Returns the ring offset of the 32-bit list, its length in *n. */
+static LONG64 g_quad_draws;
+static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t *n) {
+    static uint32_t *buf, cap;
+    uint32_t nq = count / 4;
+    *n = nq * 6;
+    if (*n > cap) { free(buf); cap = *n + 1024; buf = malloc((size_t)cap * 4); if (!buf) vkd_fail("out of memory for a quad index list of %u indices", *n); }
+    for (uint32_t q = 0; q < nq; q++) {
+        uint32_t v[4], *o = buf + 6 * q;
+        for (uint32_t k = 0; k < 4; k++) {
+            uint64_t i = (uint64_t)q * 4 + k;
+            v[k] = !src ? (uint32_t)i : t == 0 ? rd8(src + i) : t == 1 ? rd16(src + 2 * i) : rd32(src + 4 * i);
+        }
+        o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; o[3] = v[0]; o[4] = v[2]; o[5] = v[3];
+    }
+    if (g_quad_draws++ == 0)
+        printf("nvn_vk: first quad draw (NVN_DRAW_PRIMITIVE_QUADS, %s, %u vertices): drawn as %u triangles, programs vertex #%d fragment #%d\n", src ? "elements" : "arrays",
+               count, nq * 2, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1);
+    return ring_raw(buf, (uint64_t)*n * 4);
+}
 /* The two kinds of draw (nvnCommandBufferDrawArrays* / DrawElements*, and each draw of an indirect one). */
 static LONG64 g_indirect_draws, g_indirect_disp;
+static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
+    unsigned t = type < 3 ? type : 1;
+    uint32_t n;
+    if (count < 4) { R.frame_skipped++; nvn_front_count(1, 1); return; }
+    if (indices && g_cb_live && cb_overlap(indices, (uint64_t)count << t)) cb_sync();      /* the indices are read from guest memory: compute results there first */
+    uint64_t off = quad_indices(indices, t, count, &n);
+    vtx_switches();
+    if (indices && g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
+    if (indices) { int64_t mv = (int64_t)index_max(indices, (int)count, t) + base_vertex; vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
+    else vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0);
+    { LONG64 t0 = tk(); int ok = draw_prepare(4 /* NVN_DRAW_PRIMITIVE_TRIANGLES */); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
+    vkCmdBindIndexBuffer(R.cmd, R.ring, off, VK_INDEX_TYPE_UINT32);
+    occ_draw();
+    vkCmdDrawIndexed(R.cmd, n, inst, 0, indices ? base_vertex : (int32_t)first, base_inst);
+    memset(g_vneed, 0, sizeof g_vneed);
+    R.frame_draws++; nvn_front_count(0, 1);
+}
 static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32_t base_inst, uint32_t inst) {
+    if (prim == 7) { vk_draw_quads(first, count, 0, 0, 0, base_inst, inst); return; }
     int gsr = R.prog[2] && g_gs_draws % 20 == 0 && g_gs_draws <= 400 && (gs_dbg_mode() == 1 || gs_dbg_mode() == 3);      /* SMO_VK_GS_DEBUG: gs_dbg_read */
     if (gsr) gs_dbg_read(0);
     vtx_switches();
@@ -2750,6 +2859,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
 static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
     unsigned t = type < 3 ? type : 1;
     if (count <= 0 || !indices) { R.frame_skipped++; nvn_front_count(1, 1); return; }
+    if (prim == 7) { vk_draw_quads(0, (uint32_t)count, type, indices, base_vertex, base_inst, inst); return; }
     if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); return; }
     BufRef ib;
     if (g_cb_live && cb_overlap(indices, (uint64_t)count << t)) cb_sync();      /* index_max reads the indices from guest memory: compute results there first */
@@ -3401,6 +3511,23 @@ static void vk_menu(void *arg) {
     g_menu.on = 0;
     m->ok = 1;
 }
+/* Process memory every 300 frames (tools/dev/memmap.py names the allocations): working set (pages in memory; the guest
+ * heap's pages count once per address they are mapped at), its private part, private bytes (commit of private memory)
+ * and the commit of pagefile-backed sections (the guest memory heap), next to the Vulkan memory this file allocated. */
+typedef struct { DWORD cb, faults; SIZE_T peak_ws, ws, qpp, qp, qpnp, qnp, pagefile, peak_pagefile, priv, priv_ws, shared_commit; } MemCounters;
+static void mem_report(LONG64 frame) {
+    MemCounters m;
+    memset(&m, 0, sizeof m); m.cb = sizeof m;
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) { m.cb = (DWORD)offsetof(MemCounters, priv_ws); K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, m.cb); }
+    LONG64 host = 0;
+    for (int b = 0; b < g_nblk; b++) if (g_blk[b] && g_blk[b]->map) host += (LONG64)g_blk[b]->size;
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    printf("nvn_vk_mem: frame %lld: working set %llu MB (private %llu MB, peak %llu MB), private bytes %llu MB, section commit %llu MB | Vulkan memory %lld MB (host-visible %lld MB) | shader modules made %lld, released %lld (%.0f ms in vkDestroyShaderModule), made again %lld\n",
+           (long long)frame, (unsigned long long)(m.ws >> 20), (unsigned long long)(m.priv_ws >> 20), (unsigned long long)(m.peak_ws >> 20), (unsigned long long)(m.priv >> 20),
+           (unsigned long long)(m.shared_commit >> 20), (long long)(g_mem_total >> 20), (long long)(host >> 20), (long long)R.modules, (long long)g_mod_released,
+           (double)g_mod_destroy_tk * 1000.0 / (double)fq.QuadPart, (long long)g_mod_again);
+    fflush(stdout);
+}
 static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
@@ -3573,6 +3700,7 @@ swap: ;
         g_up_fr_tk = g_up_fr_bytes = 0; g_up_fr_n = 0;
         tex_ahead(frame);
     }
+    tex_reclaim(frame);
     if (frame % 300 == 0) {                      /* where the render thread's time went, per frame, in the last 300 frames */
         static LONG64 last[12], last_sets, last_flush, last_reused, last_disp;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
@@ -3593,12 +3721,13 @@ swap: ;
             memcpy(lg, g_gen_why, sizeof lg); memcpy(lw, g_wlog_why, sizeof lw); lcalls = g_rput_calls; lhits = g_rput_hits; lagain = g_rput_again; lagain_b = g_rput_again_bytes; lbytes = g_ring_bytes;
         }
         if (frame % 3000 == 0) m4_report();
+        mem_report(frame);
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }
     if (frame % 600 == 0)
-        printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory\n",
+        printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory; images of textures nothing names freed %lld (%lld MB), waiting %d, made again %lld (first used after %lld)\n",
                (long long)frame, (long long)R.images, (long long)R.images_live, (long long)R.views, (long long)R.uploads, (long long)(R.upload_bytes >> 20), (long long)R.modules, (long long)R.pipelines, (long long)R.sets,
-               (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20));
+               (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (frame % 600 == 0 && R.dispatches) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk: compute at frame %lld: %lld dispatches, %lld KB copied back to guest memory, draws using a vertex buffer written by compute in the same batch: %lld, copy-backs forced inside a batch: %lld, waits for the GPU before a copy-back: %lld (%.1f ms in all), %lld buffers made; words the guest wrote into a range pending copy-back: %lld (also written by compute: %lld)\n",
@@ -3837,7 +3966,7 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < 8; i++) for (int k = 0; k < 2; k++) if (g_sem[i][k]) { vkDestroySemaphore(V.device, g_sem[i][k], NULL); g_sem[i][k] = NULL; }
     for (int i = 0; i < 16; i++) if (g_sem_img[i]) { vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL; }
     if (g_ovl.made) { vkDestroyImage(V.device, g_ovl.img, NULL); g_ovl.made = 0; }      /* the progress bar's image; its memory goes with the blocks */
-    for (int i = 0; i < 256; i++) if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; }
+    for (int i = 0; i < g_cb_used; i++) if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; }
     g_cb_live = g_cb_pending = g_ncdisp = 0;
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i], *n; v; v = n) {
         n = v->next;
@@ -3859,6 +3988,8 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
+    printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
+           texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (g_occ_reports || g_occ_folds) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for); "

@@ -519,6 +519,8 @@ void nvn_vk_shutdown(void) {
     fflush(stdout);
 }
 
+void nvn_vk_counts(long long *failures, long long *missing) { *failures = g_vk_errors; *missing = g_vk_missing_calls; }   /* smo_nerve.c (SMO_STAGE_LIST) */
+
 void nvn_vk_report(FILE *out) {
     fprintf(out, "nvn_vk: %lld frames presented, %lld not presented (no surface area or a failed call), swapchain made again %lld times, %lld Vulkan call failures, %lld validation messages (%s), %lld calls of operations that are not implemented\n",
             (long long)g_vk_frames, (long long)g_vk_skipped, (long long)g_vk_recreated, (long long)g_vk_errors, (long long)g_vk_messages, V.validate ? "layer on" : "layer off", (long long)g_vk_missing_calls);
