@@ -3,8 +3,8 @@
  * SMO_IMPORT_SELFTEST=1: run right after every handler is registered (boot.c), before the game starts; each check
  * calls the handler the game would reach (host code or lifted sdk.elf code, through import_lookup) with known inputs
  * and compares the result. Prints one line per group and exits with the number of failures.
- * The web part writes the Help page's PC copy under ..\manual (scripts/setup.py step `manual`) without opening a
- * browser (SMO_WEB_NOOPEN); it is skipped, and says so, when the document was not extracted. */
+ * The web part prepares the Help page's copy for a web browser (in %TEMP%, from the document under ..\manual) without
+ * opening it (SMO_WEB_NOOPEN); it is skipped, and says so, when the document is not there. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -212,6 +212,20 @@ static void test_diag_time_oe(Ctx *c) {
     printf("  nn::diag (symbols, backtrace), nn::time state, nn::oe (screenshot orientation, inactivity time): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
+static ULONGLONG newest_write(const char *dir) {          /* the newest last-write time in a folder, its own entry included */
+    char pattern[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    ULONGLONG newest = 0;
+    snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (t > newest) newest = t;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return newest;
+}
 static void test_web(Ctx *c) {
     int before = g_bad;
     const char *env = getenv("SMO_MANUAL");
@@ -228,6 +242,10 @@ static void test_web(Ctx *c) {
     args(c, P(arg), 1, 0, 0); call(c, "_ZN2nn3web22ShowOfflineHtmlPageArg17SetPointerEnabledEb");
     args(c, P(arg), 0, 0, 0); call(c, "_ZN2nn3web36ShowOfflineHtmlPageArgWithPlayReport20SetPlayReportEnabledEb");
     args(c, P(ret), 0, 0, 0); call(c, "_ZN2nn3web26OfflineHtmlPageReturnValueC1Ev");
+    char page_dir[MAX_PATH], js_dir[MAX_PATH];
+    snprintf(page_dir, sizeof page_dir, "%s\\html-document\\htmlcontents.htdocs\\html\\USen", env && env[0] ? env : "..\\manual");
+    snprintf(js_dir, sizeof js_dir, "%s\\html-document\\htmlcontents.htdocs\\js", env && env[0] ? env : "..\\manual");
+    ULONGLONG page_was = newest_write(page_dir), js_was = newest_write(js_dir);
     SetEnvironmentVariableA("SMO_WEB_NOOPEN", "1");
     _putenv("SMO_WEB_NOOPEN=1");
     args(c, P(ret), P(arg), 0, 0); call(c, "_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE");
@@ -236,15 +254,18 @@ static void test_web(Ctx *c) {
     args(c, P(ret), 0, 0, 0); call(c, "_ZNK2nn3web26OfflineHtmlPageReturnValue20GetOfflineExitReasonEv"); check("web", "exit reason: closed by the player (0)", (uint32_t)c->x[0] == 0);
     args(c, P(ret), 0, 0, 0); call(c, "_ZNK2nn3web26OfflineHtmlPageReturnValue10GetLastUrlEv");
     check("web", "GetLastUrl answers a URL", c->x[0] == P(ret) + 8 && !strncmp((const char *)(uintptr_t)c->x[0], "http", 4));
-    char pc[MAX_PATH], js[MAX_PATH];
-    snprintf(pc, sizeof pc, "%s\\html-document\\htmlcontents.htdocs\\html\\USen\\index_pc.html", env && env[0] ? env : "..\\manual");
-    snprintf(js, sizeof js, "%s\\html-document\\htmlcontents.htdocs\\js\\nx_pc.js", env && env[0] ? env : "..\\manual");
-    FILE *fp = fopen(pc, "rb");
-    char head[4096] = {0};
+    /* the web browser's copy: in %TEMP%\smo-recomp-help, a <base> naming the page's own folder, then window.nx, inside
+     * <head>; nothing written next to the document (the dump is read in place) */
+    char tmp[MAX_PATH] = "", copy[MAX_PATH];
+    GetTempPathA(sizeof tmp, tmp);
+    snprintf(copy, sizeof copy, "%ssmo-recomp-help\\index.html", tmp);
+    FILE *fp = fopen(copy, "rb");
+    char head[8192] = {0};
     if (fp) { fread(head, 1, sizeof head - 1, fp); fclose(fp); }
-    check("web", "index_pc.html loads nx_pc.js inside <head>", fp && strstr(head, "<script src=\"../../js/nx_pc.js\"></script>") && strstr(head, "<head") < strstr(head, "nx_pc.js"));
-    check("web", "nx_pc.js written", GetFileAttributesA(js) != INVALID_FILE_ATTRIBUTES);
-    printf("  nn::web Help (argument and return value lifted from sdk.elf, the page's PC copy): %s\n", g_bad == before ? "ok" : "FAILED");
+    char *hd = strstr(head, "<head"), *base = strstr(head, "/htmlcontents.htdocs/html/USen/\"><script>"), *nx = strstr(head, "window.nx = {");
+    check("web", "the browser's copy: <base> at the page's folder, then window.nx, inside <head>", fp && hd && base && nx && hd < base && base < nx);
+    check("web", "nothing written next to the document", newest_write(page_dir) == page_was && newest_write(js_dir) == js_was);
+    printf("  nn::web Help (argument and return value lifted from sdk.elf, the page's copy for a web browser): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
 /* The amiibo menu (smo_amiibo.c, smo_ui.c): its list from the game's own messages, its picture from the game's own layout

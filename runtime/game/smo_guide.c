@@ -1,17 +1,19 @@
 /* smo_guide.c - the console's offline web applet (the game's Help, its Action Guide) INSIDE the game window.
  *
  * On the console nn::web::ShowOfflineHtmlPage starts the browser applet, which shows the game's HTML manual over the game,
- * and the calling thread waits until the player closes it. Here the same page (the extracted manual, made ready by
- * nnapplet.c web_open_offline: <page>_pc.html, which loads nx_pc.js, the console browser's window.nx) is shown by
- * Microsoft Edge WebView2 in the game window, covering it, while the calling guest thread waits:
+ * and the calling thread waits until the player closes it. Here the same page (the manual in the dump, read in place) is
+ * shown by Microsoft Edge WebView2 in the game window, covering it, while the calling guest thread waits:
  *   - the window thread (display.c, an STA with a message loop) owns the WebView2 objects. The first opening creates the
- *     environment and the controller (both asynchronously, on that thread); later ones navigate and show the page again.
- *     Closing only hides it, so the next opening is quick.
- *   - the page closes itself through window.nx.endApplet (nx_pc.js posts "endApplet" and calls window.close()).
- *   - keys go to the page itself (it has the keyboard focus): nx_pc.js turns Escape / Backspace into B, Q / E / Page Up /
+ *     environment and the controller (both asynchronously, on that thread) and adds nnapplet.c's script (the console
+ *     browser's window.nx) to every document before the page's own scripts run; later openings navigate and show the page
+ *     again. Closing only hides it, so the next opening is quick. Nothing is written next to the page.
+ *   - the page closes itself through window.nx.endApplet (the script posts "endApplet" and calls window.close()), or by
+ *     going to a callback address (http://localhost/...: the Action Guide's "change mode" item): the console's browser then
+ *     ends with exit reason CallbackURL and that address, which nnapplet.c hands to the game.
+ *   - keys go to the page itself (it has the keyboard focus): the script turns Escape / Backspace into B, Q / E / Page Up /
  *     Page Down into L / R; the page has its own arrow keys. Pads are read by the runtime on the waiting thread
  *     (hid_menu_pad_buttons: the game's own pad layer and mappings) and handed to the page as footer presses (A B L R) and
- *     arrow keys through window.__smo_pad; nx_pc.js then leaves the browser's Gamepad API alone.
+ *     arrow keys through window.__smo_pad; the script then leaves the browser's Gamepad API alone.
  *   - while it is open the game is held as for the amiibo menu (display_menu_hold: the refreshes are not counted, so the
  *     game does not run ahead afterwards, and the freeze watchdog stays quiet); buttons still held when it closes are
  *     kept from the game until let go (hid_menu_closed).
@@ -50,9 +52,10 @@ static ICoreWebView2Environment *g_env;
 static ICoreWebView2Controller *g_ctl;
 static ICoreWebView2 *g_wv;
 static volatile LONG g_state;                         /* ST_*: written by the window thread, waited for by the guest thread */
+static volatile LONG g_called_back;                   /* the page went to a callback address (g_callback) */
 static int g_creating, g_shot_n;
-static char g_shot_path[MAX_PATH];
-static wchar_t g_url[4096];
+static char g_shot_path[MAX_PATH], g_callback[4096];
+static wchar_t g_url[4096], *g_script;
 static HMODULE g_loader;
 typedef HRESULT (STDAPICALLTYPE *CreateEnvFn)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
 
@@ -66,6 +69,8 @@ static const IID k_iid_navigated = {0xd33a35bf, 0x1c49, 0x4f98, {0x93, 0xab, 0x0
 static const IID k_iid_key = {0xb29c7e28, 0xfa79, 0x41a8, {0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2}};
 static const IID k_iid_shot = {0x697e05e9, 0x3d8f, 0x45fa, {0x96, 0xf4, 0x8f, 0xfe, 0x1e, 0xde, 0xda, 0xf5}};
 static const IID k_iid_script = {0x49511172, 0xcc67, 0x4bca, {0x99, 0x23, 0x13, 0x71, 0x12, 0xf4, 0xc4, 0xcc}};
+static const IID k_iid_starting = {0x9adbe429, 0xf36d, 0x432b, {0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3}};
+static const IID k_iid_added = {0xb99369f3, 0x9b11, 0x47b5, {0xbc, 0x6f, 0x8e, 0x78, 0x95, 0xfc, 0xea, 0x17}};
 
 /* COM objects for the callbacks: one static instance of each, no reference counting (they live as long as the process). */
 #define HANDLER(T, iid, invoke_args)                                                                                     \
@@ -89,6 +94,10 @@ HANDLER(ICoreWebView2AcceleratorKeyPressedEventHandler, k_iid_key,
         (ICoreWebView2AcceleratorKeyPressedEventHandler *This, ICoreWebView2Controller *ctl, ICoreWebView2AcceleratorKeyPressedEventArgs *args))
 HANDLER(ICoreWebView2CapturePreviewCompletedHandler, k_iid_shot, (ICoreWebView2CapturePreviewCompletedHandler *This, HRESULT hr))
 HANDLER(ICoreWebView2ExecuteScriptCompletedHandler, k_iid_script, (ICoreWebView2ExecuteScriptCompletedHandler *This, HRESULT hr, LPCWSTR result))
+HANDLER(ICoreWebView2NavigationStartingEventHandler, k_iid_starting,
+        (ICoreWebView2NavigationStartingEventHandler *This, ICoreWebView2 *wv, ICoreWebView2NavigationStartingEventArgs *args))
+HANDLER(ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler, k_iid_added,
+        (ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler *This, HRESULT hr, LPCWSTR id))
 #define VTBL(T) static T##Vtbl T##_vt = {T##_qi, T##_ref, T##_ref, T##_invoke}; static T T##_obj = {&T##_vt};
 VTBL(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)
 VTBL(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)
@@ -98,6 +107,8 @@ VTBL(ICoreWebView2NavigationCompletedEventHandler)
 VTBL(ICoreWebView2AcceleratorKeyPressedEventHandler)
 VTBL(ICoreWebView2CapturePreviewCompletedHandler)
 VTBL(ICoreWebView2ExecuteScriptCompletedHandler)
+VTBL(ICoreWebView2NavigationStartingEventHandler)
+VTBL(ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler)
 
 static void fail_open(const char *what, HRESULT hr) {
     printf("guide: %s failed (0x%08lx): the page goes to the web browser instead\n", what, (unsigned long)hr);
@@ -105,9 +116,17 @@ static void fail_open(const char *what, HRESULT hr) {
     g_creating = 0;
     InterlockedExchange(&g_state, ST_FAILED);
 }
+/* The manual is laid out for the console's 1280 x 720 screen (its style sheet has fixed sizes), so the page gets the largest
+ * 16:9 area of the window, centred, and is zoomed to fill it: in a 2560 x 1440 window it would otherwise fill the top-left
+ * quarter. */
 static void fit(void) {
     RECT rc;
-    if (g_ctl && GetClientRect(g_parent, &rc)) ICoreWebView2Controller_put_Bounds(g_ctl, rc);
+    if (!g_ctl || !GetClientRect(g_parent, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
+    int w = rc.right, h = rc.bottom, pw = w, ph = w * 9 / 16;
+    if (ph > h) { ph = h; pw = h * 16 / 9; }
+    RECT page = {(w - pw) / 2, (h - ph) / 2, (w - pw) / 2 + pw, (h - ph) / 2 + ph};
+    ICoreWebView2Controller_put_Bounds(g_ctl, page);
+    ICoreWebView2Controller_put_ZoomFactor(g_ctl, pw / 1280.0);
 }
 static void show_page(void) {
     fit();
@@ -152,11 +171,37 @@ static HRESULT STDMETHODCALLTYPE ICoreWebView2CreateCoreWebView2ControllerComple
     EventRegistrationToken tok;
     ICoreWebView2_add_WebMessageReceived(g_wv, &ICoreWebView2WebMessageReceivedEventHandler_obj, &tok);
     ICoreWebView2_add_WindowCloseRequested(g_wv, &ICoreWebView2WindowCloseRequestedEventHandler_obj, &tok);
+    ICoreWebView2_add_NavigationStarting(g_wv, &ICoreWebView2NavigationStartingEventHandler_obj, &tok);
     ICoreWebView2_add_NavigationCompleted(g_wv, &ICoreWebView2NavigationCompletedEventHandler_obj, &tok);
     ICoreWebView2Controller_add_AcceleratorKeyPressed(ctl, &ICoreWebView2AcceleratorKeyPressedEventHandler_obj, &tok);
+    /* window.nx before the page's own scripts, in every document from now on; the page is shown once it is in place */
+    hr = ICoreWebView2_AddScriptToExecuteOnDocumentCreated(g_wv, g_script, &ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_obj);
+    if (FAILED(hr)) fail_open("ICoreWebView2::AddScriptToExecuteOnDocumentCreated", hr);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_invoke(
+        ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler *This, HRESULT hr, LPCWSTR id) {
+    (void)This; (void)id;
+    if (FAILED(hr)) { fail_open("adding window.nx to the page (AddScriptToExecuteOnDocumentCreated)", hr); return S_OK; }
     g_creating = 0;
     printf("guide: WebView2 ready in the game window\n");
     show_page();
+    return S_OK;
+}
+/* A callback address (http://localhost/...) ends the page as the console's browser does: the navigation is not made, and
+ * guide_show returns the address. */
+static HRESULT STDMETHODCALLTYPE ICoreWebView2NavigationStartingEventHandler_invoke(
+        ICoreWebView2NavigationStartingEventHandler *This, ICoreWebView2 *wv, ICoreWebView2NavigationStartingEventArgs *args) {
+    (void)This; (void)wv;
+    LPWSTR uri = NULL;
+    if (g_state != ST_OPEN || FAILED(ICoreWebView2NavigationStartingEventArgs_get_Uri(args, &uri)) || !uri) return S_OK;
+    if (!_wcsnicmp(uri, L"http://localhost/", 17) && !g_called_back) {
+        ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, TRUE);
+        WideCharToMultiByte(CP_UTF8, 0, uri, -1, g_callback, (int)sizeof g_callback, NULL, NULL);
+        InterlockedExchange(&g_called_back, 1);
+        PostMessageW(g_parent, WM_SMO_GUIDE, GUIDE_CLOSE, 0);         /* hide_page outside this event */
+    }
+    CoTaskMemFree(uri);
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE ICoreWebView2WebMessageReceivedEventHandler_invoke(
@@ -249,10 +294,16 @@ void guide_on_message(HWND hwnd, WPARAM what, LPARAM arg) {
 void guide_on_size(void) { if (g_ctl && g_state == ST_OPEN) fit(); }
 
 /* nnapplet.c web_open_offline, on the guest thread that called ShowOfflineHtmlPage: shows the page (a file URL with its
- * query) in the game window and returns when it has been closed: 1. Returns 0 at once when it cannot be shown here. */
-int guide_show(const char *url) {
+ * query) in the game window, with script (window.nx) added before the page's own scripts, and returns when it has been
+ * closed: 1, or 2 when it went to a callback address (copied to callback). Returns 0 at once when it cannot be shown here. */
+int guide_show(const char *url, const char *script, char *callback, size_t cap) {
     HWND hwnd = (HWND)display_hwnd();
     if (!hwnd) return 0;
+    if (!g_script) {                                                      /* added once: it stays for every later document */
+        int n = MultiByteToWideChar(CP_UTF8, 0, script, -1, NULL, 0);
+        if (n <= 0 || !(g_script = malloc((size_t)n * sizeof *g_script))) return 0;
+        MultiByteToWideChar(CP_UTF8, 0, script, -1, g_script, n);
+    }
     if (!g_loader) {
         wchar_t exe[MAX_PATH], *slash;
         GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -263,6 +314,8 @@ int guide_show(const char *url) {
     }
     if (g_state == ST_FAILED) return 0;                                   /* WebView2 did not start earlier in this run */
     MultiByteToWideChar(CP_UTF8, 0, url, -1, g_url, (int)(sizeof g_url / sizeof g_url[0]));
+    g_callback[0] = 0;
+    InterlockedExchange(&g_called_back, 0);
     InterlockedExchange(&g_state, ST_OPENING);
     if (!PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_OPEN, 0)) { InterlockedExchange(&g_state, ST_IDLE); return 0; }
     for (int t = 0; g_state == ST_OPENING && t < 30000 && !display_closing(); t += 10) Sleep(10);
@@ -296,6 +349,12 @@ int guide_show(const char *url) {
     hid_menu_closed();
     display_menu_hold(0);
     InterlockedExchange(&g_state, ST_IDLE);
+    if (g_called_back) {
+        snprintf(callback, cap, "%s", g_callback);
+        printf("guide: the page went to %s: closed with that callback address, back to the game\n", g_callback);
+        fflush(stdout);
+        return 2;
+    }
     printf("guide: closed, back to the game\n");
     fflush(stdout);
     return 1;

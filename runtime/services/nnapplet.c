@@ -88,6 +88,7 @@ void os_clear_event(uint64_t key);
 /* ================================================================ nn::web */
 #define WEB_RESULT_TERMINATED 0x2d2u
 #define WEB_EXIT_END_BUTTON 0u
+#define WEB_EXIT_CALLBACK_URL 3u
 static const char g_last_url[] = "http://localhost/";
 
 /* Input TLVs of a Show*Arg ([doc] switchbrew "Internet Browser": header u16 count, u16 pad, u32 shim kind; entries
@@ -107,28 +108,31 @@ static void web_log(Ctx *c, const char *what, uint64_t arg) {
            (unsigned long long)c->x[30] - 4);
     trace_printf("     %s \"%.200s\" -> closed (EndButtonPressed)\n", what, doc ? doc : url ? url : "");
 }
-static void web_fill_common(uint64_t ret) {                /* 0x1010 bytes */
+static void web_fill_return(uint64_t ret, uint32_t reason, const char *url) {      /* 0x1010 bytes */
+    size_t n = strlen(url) < 0xfff ? strlen(url) : 0xfff;
     memset((void *)(uintptr_t)ret, 0, 0x1010);
-    wr32(ret, WEB_EXIT_END_BUTTON);
-    memcpy((void *)(uintptr_t)(ret + 8), g_last_url, sizeof g_last_url);
-    wr64(ret + 0x1008, sizeof g_last_url - 1);
+    wr32(ret, reason);
+    memcpy((void *)(uintptr_t)(ret + 8), url, n);
+    wr64(ret + 0x1008, n);
 }
 /* ShowOfflineHtmlPage with the game's own offline document: SMO's Help, its Action Guide (al::HtmlViewer::call
  * asks for "htmlcontents.htdocs/html/<region and language>/index.html<query>"). On the console the browser applet shows
- * the page full screen and the game waits until the player closes it. Here the page, from the extracted document
- * (scripts/setup.py step `manual` -> build\manual, read as ..\manual from the exe's folder, or SMO_MANUAL=<folder>), is
- * shown INSIDE the game window by smo_guide.c (Microsoft Edge WebView2) and the call returns when the player has closed
- * it; only when WebView2 cannot be used does it open in the PC's web browser, and the call then returns at once.
- * The page's script uses the console browser's window.nx (footer buttons L / R / B, endApplet, play reports) before
- * anything else and stops without it; so it is shown from a copy next to it (<name>_pc.html, written once) that first
- * loads nx_pc.js (written into the document's js folder): the footer buttons answer to the keyboard (Q / E or Page Up /
- * Page Down for L / R, Escape or Backspace for B; the page's own arrow keys stay); pads come from the runtime in the game
- * window (window.__smo_pad, smo_guide.c) and through the browser's Gamepad API in a PC browser (shoulder buttons L / R,
- * bottom face button B, right face button A, D-pad = arrow keys); endApplet closes the page (in a PC browser: the tab),
- * play reports do nothing. A file URL with a query cannot be opened by name in a PC browser, so a small page in %TEMP%
- * forwards to it. Without the document the page is answered as closed, as before. */
+ * the page full screen and the game waits until the player closes it. Here the page, from the document in the dump
+ * (build\manual, read as ..\manual from the exe's folder, or SMO_MANUAL=<folder>), is shown INSIDE the game window by
+ * smo_guide.c (Microsoft Edge WebView2) and the call returns when the player has closed it; only when WebView2 cannot be
+ * used does it open in the PC's web browser, and the call then returns at once.
+ * The page's script uses the console browser's window.nx (footer buttons L / R / B, endApplet, play reports) and its
+ * event NXFirstPaintEndAfterLoad (the page loads its pictures on it) and stops without them; g_nx_pc_js below gives
+ * them, added before the page's own scripts (by WebView2, or inside the browser's copy of the page): the footer buttons
+ * answer to the keyboard (Q / E or Page Up / Page Down for L / R, Escape or Backspace for B; the page's own arrow keys
+ * stay); pads come from the runtime in the game window (window.__smo_pad, smo_guide.c) and through the browser's Gamepad
+ * API in a PC browser (shoulder buttons L / R, bottom face button B, right face button A, D-pad = arrow keys); endApplet
+ * closes the page (in a PC browser: the tab), play reports do nothing. Nothing is written next to the document.
+ * The return value: exit reason 0 (EndButtonPressed) and "http://localhost/" when the player closed the page; exit reason
+ * 3 (CallbackURL) and the address when the page went to http://localhost/... (the Action Guide's "change mode" item):
+ * [game] 0x6cb5e0 reads the last URL only for exit reason 3. Without the document the page is answered as closed. */
 static const char g_nx_pc_js[] =
-    "/* smo-recomp: window.nx of the console's browser applet, for SMO's Help in the game window or a PC browser (written by the runtime) */\n"
+    "/* smo-recomp: window.nx of the console's browser applet, for SMO's Help in the game window or a PC browser (added by the runtime) */\n"
     "(function () {\n"
     "  var keys = {};\n"
     "  var host = window.chrome && window.chrome.webview;   /* inside the game window: pads come from the runtime */\n"
@@ -174,6 +178,8 @@ static const char g_nx_pc_js[] =
     "    requestAnimationFrame(poll);\n"
     "  }\n"
     "  if (!host) requestAnimationFrame(poll);\n"
+    "  /* the console's browser tells the page when its first frame after loading is drawn; the page loads its pictures then */\n"
+    "  window.addEventListener('load', function () { setTimeout(function () { window.dispatchEvent(new Event('NXFirstPaintEndAfterLoad')); }, 0); });\n"
     "  window.nx = {\n"
     "    footer: { setAssign: function (b, label, fn) { keys[b] = fn; }, unsetAssign: function (b) { delete keys[b]; } },\n"
     "    playReport: { setCounterSetIdentifier: function () {}, incrementCounter: function () {} },\n"
@@ -209,63 +215,76 @@ static void url_append(char *url, size_t cap, const char *s) {      /* a path as
     }
     url[n] = 0;
 }
-static int web_open_offline(const char *doc) {
-    char root[MAX_PATH], path[MAX_PATH], full[MAX_PATH], pc[MAX_PATH], js[MAX_PATH];
-    const char *env = getenv("SMO_MANUAL"), *q = strpbrk(doc, "?#");
-    size_t plen = q ? (size_t)(q - doc) : strlen(doc);
-    snprintf(root, sizeof root, "%s", env && env[0] ? env : "..\\manual");
-    snprintf(path, sizeof path, "%s\\html-document\\%.*s", root, (int)plen, doc);
-    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
-    if (!GetFullPathNameA(path, sizeof full, full, NULL) || GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES) {
-        printf("nn::web::ShowOfflineHtmlPage: %s not found (run scripts\\setup.py --only manual)\n", full);
-        return 0;
-    }
-    /* nx_pc.js: <document root>\htmlcontents.htdocs\js\nx_pc.js, the page's own js folder when the path has that form */
-    char *html = strstr(full, "\\html\\");
-    snprintf(js, sizeof js, "%.*s\\js\\nx_pc.js", html ? (int)(html - full) : 0, full);
-    if (!html || !write_if_differs(js, g_nx_pc_js, sizeof g_nx_pc_js - 1)) { printf("nn::web::ShowOfflineHtmlPage: cannot write %s\n", js); return 0; }
-    /* <name>_pc.html: the page with nx_pc.js loaded first */
+/* A PC web browser: a copy of the page in %TEMP%\smo-recomp-help with window.nx first and a <base> naming the page's own
+ * folder (its pictures, scripts and styles load from there), and a forwarding page, because a file URL with a query cannot
+ * be opened by name. SMO_WEB_NOOPEN (self-test): both written, nothing opened. */
+static int web_open_in_browser(const char *doc, const char *full, const char *q) {
+    char tmp[MAX_PATH], dir[MAX_PATH], copy[MAX_PATH], fwd[MAX_PATH], base[4096] = "file:///", url[4096] = "file:///", page[8192];
+    const char *name = strrchr(full, '\\') ? strrchr(full, '\\') + 1 : full;
+    if (!GetTempPathA(sizeof tmp, tmp)) return 0;
+    snprintf(dir, sizeof dir, "%ssmo-recomp-help", tmp);
+    snprintf(copy, sizeof copy, "%s\\%s", dir, name);
+    snprintf(fwd, sizeof fwd, "%ssmo-recomp-help.html", tmp);
+    CreateDirectoryA(dir, NULL);
     FILE *f = fopen(full, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *src = malloc((size_t)size + 1), *out = malloc((size_t)size + 256);
+    url_append(base, sizeof base, full);
+    *(strrchr(base, '/') + 1) = 0;                                      /* the page's folder */
+    size_t extra = strlen(base) + sizeof g_nx_pc_js + 64, n;
+    char *src = malloc((size_t)size + 1), *out = malloc((size_t)size + extra);
     if (!src || !out || fread(src, 1, (size_t)size, f) != (size_t)size) { fclose(f); free(src); free(out); return 0; }
     fclose(f);
     src[size] = 0;
-    const char *tag = "<script src=\"../../js/nx_pc.js\"></script>";
     char *head = NULL;
     for (char *p = src; *p && !head; p++) if (!_strnicmp(p, "<head", 5)) head = strchr(p, '>');
-    size_t at = head ? (size_t)(head + 1 - src) : 0, n = 0;
-    memcpy(out, src, at); n = at;
-    n += (size_t)sprintf(out + n, "%s", tag);
-    memcpy(out + n, src + at, (size_t)size - at); n += (size_t)size - at;
-    snprintf(pc, sizeof pc, "%.*s_pc.html", (int)(strlen(full) - 5), full);       /* ...\index.html -> ...\index_pc.html */
-    int ok = strlen(full) > 5 && !_stricmp(full + strlen(full) - 5, ".html") && write_if_differs(pc, out, n);
+    size_t at = head ? (size_t)(head + 1 - src) : 0;
+    memcpy(out, src, at);
+    n = at + (size_t)snprintf(out + at, extra, "<base href=\"%s\"><script>%s</script>", base, g_nx_pc_js);
+    memcpy(out + n, src + at, (size_t)size - at);
+    n += (size_t)size - at;
+    int ok = write_if_differs(copy, out, n);
     free(src); free(out);
-    if (!ok) { printf("nn::web::ShowOfflineHtmlPage: cannot write %s\n", pc); return 0; }
-    /* the forwarding page, then the default browser */
-    char url[4096] = "file:///", fwd[MAX_PATH], tmp[MAX_PATH], page[8192];
-    url_append(url, sizeof url, pc);
+    if (!ok) { printf("nn::web::ShowOfflineHtmlPage: cannot write %s\n", copy); return 0; }
+    url_append(url, sizeof url, copy);
     if (q) snprintf(url + strlen(url), sizeof url - strlen(url), "%s", q);
-    if (!GetTempPathA(sizeof tmp, tmp)) return 0;
-    snprintf(fwd, sizeof fwd, "%ssmo-recomp-help.html", tmp);
     int pn = snprintf(page, sizeof page, "<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url=%s\">"
                       "<title>Super Mario Odyssey - Help</title><a href=\"%s\">Help</a>\n", url, url);
     if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
-    if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }    /* self-test */
-    int guide_show(const char *url);                    /* smo_guide.c: in the game window, back when the player has closed it */
-    if (guide_show(url)) return 1;
+    if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }
     HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
     printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
     return (INT_PTR)r > 32;
 }
+/* 0: the document is not there or could not be shown; 1: shown and closed by the player (or opened in a web browser); 2: the
+ * page went to a callback address, copied to callback. */
+static int web_open_offline(const char *doc, char *callback, size_t cap) {
+    char root[MAX_PATH], path[MAX_PATH], full[MAX_PATH], url[4096] = "file:///";
+    const char *env = getenv("SMO_MANUAL"), *q = strpbrk(doc, "?#");
+    size_t plen = q ? (size_t)(q - doc) : strlen(doc);
+    snprintf(root, sizeof root, "%s", env && env[0] ? env : "..\\manual");
+    snprintf(path, sizeof path, "%s\\html-document\\%.*s", root, (int)plen, doc);
+    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
+    if (!GetFullPathNameA(path, sizeof full, full, NULL) || GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES || !strrchr(full, '\\')) {
+        printf("nn::web::ShowOfflineHtmlPage: %s not found (run scripts\\setup.py --only manual)\n", full);
+        return 0;
+    }
+    url_append(url, sizeof url, full);
+    if (q) snprintf(url + strlen(url), sizeof url - strlen(url), "%s", q);
+    int guide_show(const char *url, const char *script, char *callback, size_t cap);    /* smo_guide.c: in the game window */
+    int shown = getenv("SMO_WEB_NOOPEN") ? 0 : guide_show(url, g_nx_pc_js, callback, cap);
+    return shown ? shown : web_open_in_browser(doc, full, q);
+}
 static void web_ShowOfflineHtmlPage(Ctx *c) {
     uint64_t ret = A0;
     const char *doc = web_arg_string(A1, 6);
-    if (!doc || !web_open_offline(doc)) web_log(c, "nn::web::ShowOfflineHtmlPage", A1);
-    web_fill_common(ret);
+    char callback[0x1000] = "";
+    int shown = doc ? web_open_offline(doc, callback, sizeof callback) : 0;
+    if (!shown) web_log(c, "nn::web::ShowOfflineHtmlPage", A1);
+    if (shown == 2) web_fill_return(ret, WEB_EXIT_CALLBACK_URL, callback);
+    else web_fill_return(ret, WEB_EXIT_END_BUTTON, g_last_url);
     RET(0);
 }
 
