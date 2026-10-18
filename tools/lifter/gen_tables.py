@@ -8,14 +8,11 @@ Writes (everything derived from the dump; build/ is ignored by git):
                      update's main without symbols: matched with the base executable's, see find_sampler_sort),
                      GAME_VSYM_<name> of the virtual functions it watches for (from RTTI vtables, see find_vsym), and
                      GAME_FN_<name> of the game functions its test aids call (matched likewise, see find_func).
-                     Replaces the 13.0.4 constants ssbu-recomp hard-coded in hostrt.c / boot.c / sdklift.h / libcxx.c.
-  imports_all.txt    names main imports (undefined dynamic symbols), symbol-table order (as ssbu's gen_imports.py)
+  imports_all.txt    names main imports (undefined dynamic symbols), symbol-table order
   sdkdata.c          values of the data symbols main imports from sdk (nn::util tables, nn::hid NpadId constants),
-                     copied out of the real sdk module (as ssbu's gen_sdkdata.py)
-  fake_whitelist.h   strict-audit white list: EMPTY at first (nothing is proven correct-by-semantics for SMO yet)
-  fake_openlist.h    strict-audit open-row list: EMPTY
-  sdklift_install.h  imports replaced by lifted SDK code: EMPTY until sdklift is ported to SMO's sdk
-  sdklift_gen.c      lifted SDK functions: an EMPTY set (the image is still mapped by sdklift_rt.c)
+                     copied out of the real sdk module
+  sdklift_install.h  imports replaced by lifted SDK code, and
+  sdklift_gen.c      the lifted SDK functions: empty stand-ins only until tools/lifter/sdklift.py has written them
 """
 import bisect
 import csv
@@ -29,28 +26,28 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'extract'))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 import functions as F                                     # noqa: E402  (the ELF reader of tools/extract)
-import target as T                                        # noqa: E402  (SMO_TARGET: which package, which build/)
+import target as T                                        # noqa: E402
 
 DUMP = os.path.join(T.DUMP, 'elf')
-BASE_MAIN = os.path.join(REPO, 'build', 'dump', 'base', 'elf', 'main.elf')
+BASE_MAIN = T.base_elf('main')
 OUT = T.build('gen')
 GUEST_BASE = 0x7100000000
 SDK_BASE = 0x7500000000
 # game functions the runtime calls by name (the console's own allocator lives in main for this game)
 GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
              '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
-# Optional: runtime/smo_fast.c's sampler list sort of agl::driver::NVNMgr in host code. A main without these symbols
+# Optional: runtime/game/smo_fast.c's sampler list sort of agl::driver::NVNMgr in host code. A main without these symbols
 # (1.4.1's is stripped) gets them from the base executable's by matching (find_sampler_sort), or 0 when that fails, and
 # smo_fast.c then leaves the game's own code alone. Order: the sort, registerSampler_, the key comparison.
 GAME_SYMS_OPTIONAL = ['_ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E', '_ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj',
                       '_ZN3agl6driver6NVNMgr18compareSamplerKey_EPKNS1_10SamplerKeyES4_']
 # Virtual functions the runtime watches for (GAME_VSYM_<name>): (class as RTTI names it, mangled function, name). In a
 # main without symbols they come from the class's vtable, in the slot that holds them in the base executable's
-# (find_vsym), or 0. StageScene::init: a stage scene starts (test aid SMO_START_STAGE, runtime/smo_nerve.c).
+# (find_vsym), or 0. StageScene::init: a stage scene starts (test aid SMO_START_STAGE, runtime/game/smo_nerve.c).
 GAME_VSYMS = [('10StageScene', '_ZN10StageScene4initERKN2al13SceneInitInfoE', 'StageScene_init')]
 # Game functions the runtime calls (GAME_FN_<name>): (mangled function, name). A main without symbols gets each from the
 # base executable's (find_func), or 0. ChangeStageInfo's constructor and GameDataFunction::tryChangeNextStage: a stage
-# change of the game's own, as a door makes it (test aid SMO_STAGE_LIST, runtime/smo_nerve.c).
+# change of the game's own, as a door makes it (test aid SMO_STAGE_LIST, runtime/game/smo_nerve.c).
 GAME_FUNCS = [('_ZN15ChangeStageInfoC1EPK14GameDataHolderPKcS4_biNS_15SubScenarioTypeE', 'ChangeStageInfo_ctor'),
               ('_ZN16GameDataFunction18tryChangeNextStageE20GameDataHolderWriterPK15ChangeStageInfo', 'tryChangeNextStage')]
 
@@ -133,7 +130,7 @@ def find_sampler_sort(main_m):
     has); registerSampler_ is the only function that loads a pointer to it, and the sort is the first call after that
     load. The same rule run on the base must give the base's own symbols, and the sort found must, like the base's,
     call only through pointers (the comparator). The sort's algorithm itself is checked at run time with
-    SMO_FAST_CHECK=1 (runtime/smo_fast.c). Returns ({name: address}, None) or ({}, why not)."""
+    SMO_FAST_CHECK=1 (runtime/game/smo_fast.c). Returns ({name: address}, None) or ({}, why not)."""
     if not os.path.exists(BASE_MAIN):
         return {}, 'the base executable is not in build/dump/base'
     base = F.Module(BASE_MAIN)
@@ -314,14 +311,14 @@ def main():
     ro_end, file_image, image_size = layout(main_m)
     _, _, sdk_image_size = layout(sdk_m)
     dt = main_m.dt
-    package = json.load(open(os.path.join(REPO, 'build', 'dump', 'version.json')))[T.DUMP_KIND]
+    package = json.load(open(os.path.join(REPO, 'build', 'dump', 'version.json')))['update']
     build_id = package['modules']['main']['build_id']
-    sdk = next(n['sdk_version'] for n in package['ncas'] if n['type'] == 'Program')     # "7.3.2.0"
+    sdk = package['program_sdk_version']                                               # "7.3.2.0"
     sdk_version = sum(int(x) << (24 - 8 * i) for i, x in enumerate(sdk.split('.')[:4]))
     elf_from_bin = os.path.relpath(os.path.join(DUMP, 'main.elf'), T.build('bin')).replace('/', '\\')
     h = ['/* generated by tools/lifter/gen_tables.py from main.elf / sdk.elf of the dump -- do not edit */',
          '#ifndef SMO_IMAGE_H', '#define SMO_IMAGE_H', '',
-         '#define GAME_VERSION "%s"' % T.TARGET,
+         '#define GAME_VERSION "%s"' % T.VERSION,
          '#define SDK_VERSION 0x%08xu      /* the NintendoSDK of the game\'s program NCA (%s): layouts that differ by SDK */'
          % (sdk_version, sdk),
          '#define GAME_ELF_DEFAULT "%s"      /* main.elf from the exe\'s folder (sdk.elf beside it) */'
@@ -385,8 +382,6 @@ def main():
     c += ['};', 'const int sdk_data_count = %d;' % len(found), '']
     write('sdkdata.c', '\n'.join(c))
 
-    for name, var in (('fake_whitelist.h', 'audit_whitelist'), ('fake_openlist.h', 'audit_openlist')):
-        write(name, '/* generated: EMPTY (nothing proven for SMO yet) */\nstatic const char *const %s[] = { "" };\n' % var)
     # empty stand-ins, only where tools/lifter/sdklift.py has not written the real files (never overwrite them)
     if not os.path.exists(os.path.join(OUT, 'sdklift_install.h')):
         write('sdklift_install.h', '/* generated: EMPTY (run tools/lifter/sdklift.py gen) */\n'

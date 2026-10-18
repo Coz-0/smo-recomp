@@ -1,6 +1,6 @@
 """Stress test: every stage of the game, started from a copy of a save warped there, played briefly at a raised speed.
 
-    python tests/stress_stages.py --save <save folder> [--target 1.4.1] [--stages all | <name,name,...> | @<file>]
+    python tests/stress_stages.py --save <save folder> [--stages all | <name,name,...> | @<file>]
                                   [--scenarios] [--jobs 2] [--speed 4] [--seconds 150] [--cache <shader cache to copy>]
                                   [--chain N] [--direct] [--name <run>]
 
@@ -23,7 +23,7 @@ it. For each:
      without an implementation, freeze reports, dummy textures, audio dropped, the stage not reaching play in time;
      four small pictures are kept. Frame times are recorded as information only: at the raised speed, with jobs side by
      side, they are not those of normal play.
-Everything goes to build/<version>/stress/<name>/: results.jsonl (one line per run), summary.md, thumbs/. Each job has
+Everything goes to build/stress/<name>/: results.jsonl (one line per run), summary.md, thumbs/. Each job has
 its own exe copy and shader cache copy; saves and full-size pictures are deleted as it goes (the disk fills quickly).
 Exit status 0 when it ran; the summary lists what was found. The save folder is only read.
 
@@ -88,11 +88,10 @@ def sequence(stage, first=True):
     return s + MAIN if stage['category'] == 'MainStage' else s
 
 
-def stage_list(target, zones=False, default_world=0):
+def stage_list(zones=False, default_world=0):
     """Every stage of WorldListFromDb with a map file (zones, which are placed inside stages, only with zones=True), then
     the stages of StageData the list does not name (the ship's inside, the world map, travel scenes, the update's *Rsv*
     stages): their world from their name where it starts with a world's, else default_world."""
-    os.environ['SMO_TARGET'] = target
     sys.path.insert(0, os.path.join(REPO, 'tools', 'dev'))
     sys.path.insert(0, os.path.join(REPO, 'tools'))
     import target as T
@@ -413,7 +412,6 @@ def split_run(text, n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--save', required=True, help='a save folder to start from (only read)')
-    ap.add_argument('--target', default=os.environ.get('SMO_TARGET', '1.0.0'))
     ap.add_argument('--stages', default='all')
     ap.add_argument('--jobs', type=int, default=2)
     ap.add_argument('--speed', default='4')
@@ -435,7 +433,7 @@ def main():
     ap.add_argument('--direct', action='store_true',
                     help='start a stage that only a painting leads to directly, not from the painting\'s room (for comparisons)')
     a = ap.parse_args()
-    stages, worlds, T = stage_list(a.target, a.zones, a.default_world)
+    stages, worlds, T = stage_list(a.zones, a.default_world)
     if not a.special:
         left = [s['stage'] for s in stages if not_a_stage_scene(s)]
         stages = [s for s in stages if not not_a_stage_scene(s)]
@@ -490,11 +488,11 @@ def main():
             warp += ['--checkpoint', stage['checkpoint'], '--visited']
         for f in reached:
             warp += ['--reached', f]
-        w = subprocess.run(warp, cwd=REPO, env=dict(os.environ, SMO_TARGET=a.target), capture_output=True, text=True)
+        w = subprocess.run(warp, cwd=REPO, capture_output=True, text=True)
         return 'warp failed: ' + (w.stdout + w.stderr).strip()[-200:] if w.returncode else None
 
     def game_cmd(name, k, stage, work, shots, seconds, timeout=None):
-        cmd = [PY, os.path.join(REPO, 'scripts', 'run.py'), name, '--target', a.target, '--exe', '%s_%d.exe' % (a.exe_prefix, k),
+        cmd = [PY, os.path.join(REPO, 'scripts', 'run.py'), name, '--exe', '%s_%d.exe' % (a.exe_prefix, k),
                '--seconds', str(seconds), '--userdata', work,
                '--env', 'SMO_SEQ=' + sequence(stage), '--env', 'SMO_SEQ_EXIT=1', '--env', 'SMO_SPEED=' + a.speed,
                '--env', 'SMO_SHOT_EVERY=500', '--env', 'SMO_SHOT_DIR=' + shots]      # at most one capture a 300-frame window: p99 stays clean
@@ -531,7 +529,7 @@ def main():
             shots = os.path.join(work, 'shots')
             os.makedirs(shots)
             t0 = time.time()
-            subprocess.run(game_cmd(name, k, stage, work, shots, a.seconds), cwd=REPO, env=dict(os.environ, SMO_TARGET=a.target),
+            subprocess.run(game_cmd(name, k, stage, work, shots, a.seconds), cwd=REPO,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             r = read_log(T.build('run', name + '.log'), stage)
             r['seconds'] = round(time.time() - t0)
@@ -544,7 +542,7 @@ def main():
     def run_chain(chain, k):
         """One run of the game for the stages of a chain: the first starts as run_one starts it, each next one through
         the game's own stage change when the one before has played its input sequence (SMO_STAGE_LIST); the time
-        limit is per stage. The log is split per stage (build/<version>/run/<name>_<stage>.log, as run_one's) and each
+        limit is per stage. The log is split per stage (build/run/<name>_<stage>.log, as run_one's) and each
         stage is recorded as its own run would be. Returns the stages a crash or a time limit left unplayed."""
         with lock:
             name = '%s_run%04d' % (a.name, next(runs))
@@ -579,7 +577,7 @@ def main():
         for i, s in enumerate(chain[1:], 2):
             cmd += ['--env', 'SMO_SEQ_%d=%s' % (i, sequence(s, first=False))]
         t0 = time.time()
-        subprocess.run(cmd, cwd=REPO, env=dict(os.environ, SMO_TARGET=a.target), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         wall = time.time() - t0
         log = T.build('run', name + '.log')
         parts, ran = split_run(open(log, encoding='utf-8', errors='replace').read() if os.path.exists(log) else '', len(chain))

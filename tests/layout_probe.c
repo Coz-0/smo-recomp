@@ -1,4 +1,4 @@
-/* layout_probe.dll: the runtime's texture layout (runtime/tex_decode.c, unchanged) and a Yaz0 decoder, behind a flat C
+/* layout_probe.dll: the runtime's texture layout (runtime/gfx/tex_decode.c, unchanged) and a Yaz0 decoder, behind a flat C
  * interface for tests/bntx_layout_check.py. Test code only; not part of the game build. */
 #include <stdint.h>
 #include <string.h>

@@ -1,35 +1,52 @@
-"""Which game version a build is for, and where its files go (used by the tools, scripts and tests).
+"""Where the build's files are (used by the tools, scripts and tests).
 
-SMO_TARGET=1.0.0 (the default): the base package alone; its modules in build/dump/base, everything else under build/.
-SMO_TARGET=<your update's version> (1.4.1): the update package applied; its modules in build/dump/update and a build
-folder of its own, build/<version>/, laid out as build/ is (romfs, manual, functions, lift, obj, gen, bin, run, ...), so
-the runtime's paths relative to its exe (..\\romfs, ..\\manual, ..\\userdata) work unchanged. build/dump is shared.
-scripts/setup.py --target sets SMO_TARGET for every step it runs.
+The game is Super Mario Odyssey 1.4.1: the base game with its 1.4.1 update applied. Everything derived from your dump
+goes under build/:
+    build/dump/update   the program's modules (ExeFS, ELF conversions) and its control data
+    build/dump/base     the base game's executable, read only for its symbols: they name 1.4.1's stripped functions
+    build/<the rest>    romfs, manual, functions, lift, obj, gen, bin, run, ... laid out so that the runtime's paths
+                        relative to its exe (..\\romfs, ..\\manual, ..\\userdata) work
 """
 import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASE_VERSION = '1.0.0'
-TARGET = os.environ.get('SMO_TARGET') or BASE_VERSION
-IS_BASE = TARGET == BASE_VERSION
-BUILD = os.path.join(REPO, 'build') if IS_BASE else os.path.join(REPO, 'build', TARGET)
-DUMP_KIND = 'base' if IS_BASE else 'update'          # also the key of the package in build/dump/version.json
-DUMP = os.path.join(REPO, 'build', 'dump', DUMP_KIND)
+VERSION = '1.4.1'                                       # the game version this project builds
+BUILD = os.path.join(REPO, 'build')
+DUMP = os.path.join(BUILD, 'dump', 'update')
+BASE_DUMP = os.path.join(BUILD, 'dump', 'base')
+RUNTIME = os.path.join(REPO, 'runtime')
+# the host runtime's subsystem folders (runtime/<folder>); every one is an include directory of the runtime's code
+RUNTIME_DIRS = ['core', 'libc', 'os', 'fs', 'gfx', 'audio', 'input', 'services', 'game']
+
+
+def runtime(folder, name):
+    """A file of the host runtime, e.g. runtime('gfx', 'mx_translate.c')."""
+    return os.path.join(RUNTIME, folder, name)
+
+
+def runtime_includes():
+    """clang -I arguments for every runtime folder (the runtime's files include each other by bare name)."""
+    return [arg for d in RUNTIME_DIRS for arg in ('-I', os.path.join(RUNTIME, d))]
 
 
 def build(*parts):
-    """A path in this target's build folder."""
+    """A path in the build folder."""
     return os.path.join(BUILD, *parts)
 
 
 def elf(module):
-    """The converted module (main, sdk, subsdk0, rtld) of this target's package."""
+    """The converted module (main, sdk, subsdk0, rtld) of the program."""
     return os.path.join(DUMP, 'elf', module + '.elf')
 
 
-def update_version():
-    """The display version of the extracted update package (from its NACP), or None."""
-    p = os.path.join(REPO, 'build', 'dump', 'update', 'control.nacp')
+def base_elf(module):
+    """The converted module of the base game (only its main is used: for its symbols)."""
+    return os.path.join(BASE_DUMP, 'elf', module + '.elf')
+
+
+def dump_version():
+    """The display version of the extracted program (from its control data), or None."""
+    p = os.path.join(DUMP, 'control.nacp')
     if not os.path.isfile(p):
         return None
     return open(p, 'rb').read()[0x3060:0x3070].split(b'\0')[0].decode('ascii', 'replace')

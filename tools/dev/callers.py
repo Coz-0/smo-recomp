@@ -3,7 +3,6 @@
     python tools/dev/callers.py <symbol substring> [--module main]
 
 Same inputs as disasm.py (build/functions/<module>_functions.tsv and the converted dump); prints addresses and names only.
-SMO_TARGET picks the game version (tools/target.py).
 """
 import argparse
 import bisect
@@ -25,7 +24,7 @@ def main():
     ap.add_argument('--module', default='main')
     a = ap.parse_args()
     rows = list(csv.DictReader(open(T.build('functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
-    names = {int(r['start'], 16): (r['symbol'] or r['decomp_name']).split('|')[0] for r in rows}
+    names = {int(r['start'], 16): (r['symbol'] or r['rtti_name']).split('|')[0] for r in rows}
     ends = {int(r['start'], 16): int(r['end'], 16) for r in rows}
     m = F.Module(T.elf(a.module))
     if 23 in m.dt:

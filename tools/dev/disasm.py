@@ -3,8 +3,7 @@
     python tools/dev/disasm.py <symbol substring | hex address> [--module main] [--max 400]
 
 Addresses are module-relative (main loads at 0x7100000000). PLT stubs of main are named by their import (JMPREL).
-Reads only the converted dump in build/; prints instructions, not data. SMO_TARGET picks the game version
-(tools/target.py).
+Reads only the converted dump in build/; prints instructions, not data.
 """
 import argparse
 import csv
@@ -28,7 +27,7 @@ def main():
     ap.add_argument('--max', type=int, default=400)
     a = ap.parse_args()
     rows = list(csv.DictReader(open(T.build('functions', '%s_functions.tsv' % a.module), encoding='utf-8'), delimiter='\t'))
-    names = {int(r['start'], 16): (r['symbol'] or r['decomp_name']).split('|')[0] for r in rows}
+    names = {int(r['start'], 16): (r['symbol'] or r['rtti_name']).split('|')[0] for r in rows}
     ends = {int(r['start'], 16): int(r['end'], 16) for r in rows}
     m = F.Module(T.elf(a.module))
     # PLT stubs -> import names

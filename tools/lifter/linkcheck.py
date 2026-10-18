@@ -15,7 +15,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 OBJ = T.build('obj', 'main')
 GEN = T.build('lift', 'main')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
@@ -29,7 +29,7 @@ def main():
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     dll = T.build('obj', 'main_linkcheck.dll')
     t = time.time()
-    r = subprocess.run([CLANG, '-shared', '-O1', '-w', '-I', os.path.join(REPO, 'runtime'), '-I', GEN,
+    r = subprocess.run([CLANG, '-shared', '-O1', '-w', '-I', os.path.join(REPO, 'runtime', 'core'), '-I', GEN,
                         os.path.join(HERE, 'linkcheck_stub.c'), '@' + rsp, '-o', dll], capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
     unresolved = [l for l in out.split('\n') if 'unresolved' in l.lower()]

@@ -1,4 +1,4 @@
-"""Check the runtime's texture layout (runtime/tex_decode.c tex_layout) against every texture SMO ships.
+"""Check the runtime's texture layout (runtime/gfx/tex_decode.c tex_layout) against every texture SMO ships.
 
     python tests/bntx_layout_check.py [--limit N] [--show 12]
 
@@ -7,7 +7,7 @@ Reference: the BNTX texture containers in the RomFS (inside Yaz0-compressed SARC
 alignment, block height (texture layout word, bits 0..2) and the offset of every mip level. For each texture the same
 parameters go through tex_layout and every field is compared. Formats are mapped only where the block size is certain
 (R8, RG8, RGB565, RGBA8, BGRA8, BC1..BC7, all ASTC footprints); other formats are counted as unmapped, not guessed.
-Needs build/test/layout_probe.dll (built here with clang from tests/layout_probe.c + runtime/tex_decode.c).
+Needs build/test/layout_probe.dll (built here with clang from tests/layout_probe.c + runtime/gfx/tex_decode.c).
 """
 import argparse
 import collections
@@ -19,7 +19,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 ROMFS = T.build('romfs')
 OUT = os.path.join(REPO, 'build', 'test')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
@@ -39,9 +39,9 @@ class ProbeOut(ctypes.Structure):
 def build_probe():
     os.makedirs(OUT, exist_ok=True)
     dll = os.path.join(OUT, 'layout_probe.dll')
-    srcs = [os.path.join(REPO, 'tests', 'layout_probe.c'), os.path.join(REPO, 'runtime', 'tex_decode.c')]
+    srcs = [os.path.join(REPO, 'tests', 'layout_probe.c'), T.runtime('gfx', 'tex_decode.c')]
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(s) for s in srcs):
-        r = subprocess.run([CLANG, '-shared', '-O2', '-w', '-I', os.path.join(REPO, 'runtime')] + srcs + ['-o', dll],
+        r = subprocess.run([CLANG, '-shared', '-O2', '-w'] + T.runtime_includes() + srcs + ['-o', dll],
                            capture_output=True, text=True)
         if r.returncode:
             raise SystemExit(r.stdout + r.stderr)

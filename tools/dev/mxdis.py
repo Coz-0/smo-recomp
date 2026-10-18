@@ -13,7 +13,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def load_table():
-    src = open(os.path.join(REPO, 'runtime', 'mx_ops.h'), encoding='utf-8').read()
+    src = open(os.path.join(REPO, 'runtime', 'gfx', 'mx_ops.h'), encoding='utf-8').read()
     enum = re.search(r'enum\s*\{(.*?)\}', src, re.S).group(1)
     ops = [x.strip().split('=')[0].strip() for x in enum.split(',') if x.strip().startswith('MXOP_')]
     names = re.search(r'mx_op_name\[MXOP_COUNT\]\s*=\s*\{(.*?)\};', src, re.S).group(1)

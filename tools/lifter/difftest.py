@@ -10,7 +10,7 @@ state: once by Unicorn, once by the C code recomp.py generates. Final registers,
     python tools/lifter/difftest.py check    run difftest.exe and Unicorn, compare; exit code 1 on any failure
     python tools/lifter/difftest.py show <i> registers that differ for one test
     python tools/lifter/difftest.py all      sample + gen + build + check
-Working files live in build/difftest/ (build/<version>/difftest/ for an update target: SMO_TARGET, tools/target.py).
+Working files live in build/difftest/.
 
 Test kinds (column `kind`):
   straight  data processing, loads/stores, FP/SIMD: registers + NZCV + a memory window must match (ssbu-recomp's test)
@@ -36,10 +36,10 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recomp
 
-T = recomp._T                    # SMO_TARGET (tools/target.py): which package's modules, which build/
+T = recomp._T                    # tools/target.py: where the modules and the build folder are
 WORK = T.build('difftest')
 HERE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = os.path.join(recomp._REPO, 'runtime')
+RUNTIME = os.path.join(recomp._REPO, 'runtime', 'core')
 LLVM = os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0')
 HOST_EXE = os.environ.get('DIFFTEST_EXE') or os.path.join(WORK, 'difftest.exe')
 

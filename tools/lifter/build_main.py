@@ -22,10 +22,10 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 GEN = T.build('lift', 'main')
 OBJ = T.build('obj', 'main')
-RUNTIME = os.path.join(REPO, 'runtime')
+RUNTIME = os.path.join(T.RUNTIME, 'core')        # runtime.h, neon.h, fpexact.h: what the lifted C includes
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 OPT = os.environ.get('RECOMP_OPT', '-O1')
 EXTRA = ['-ffp-contract=off']

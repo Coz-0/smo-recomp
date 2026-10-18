@@ -1,4 +1,4 @@
-"""Static recompiler: AArch64 (Super Mario Odyssey 1.0.0 `main`) -> C.
+"""Static recompiler: AArch64 (Super Mario Odyssey's `main`) -> C.
 
 Adapted from ssbu-recomp tools/lifter/recomp.py (GPL-3.0-or-later). The INSTRUCTION translator (class Fn) is
 ssbu-recomp's, unchanged; the PROGRAM level differs:
@@ -14,9 +14,8 @@ real address (0x7100000000), so guest pointers are host pointers.
     python recomp.py full  [<outdir>] [jobs]     lift every listed function into <outdir> (default build/lift/main)
     python recomp.py cover                       per-instruction-word translation coverage of the listed functions
     python recomp.py lift  <out.c> <root>[,...]  lift roots and their callees (debugging)
-Environment: RECOMP_ELF (default build/dump/base/elf/main.elf), RECOMP_FUNCS (default
-build/functions/main_functions.tsv), RECOMP_BASE (default 0x7100000000). The default paths follow SMO_TARGET
-(tools/target.py): for an update target, build/dump/update and build/<version>/.
+Environment: RECOMP_ELF (default build/dump/update/elf/main.elf), RECOMP_FUNCS (default
+build/functions/main_functions.tsv), RECOMP_BASE (default 0x7100000000).
 """
 import os
 import struct
@@ -25,7 +24,7 @@ import collections
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO, 'tools'))
-import target as _T  # noqa: E402  (SMO_TARGET: the defaults below are the target's, tools/target.py)
+import target as _T  # noqa: E402
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
 BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
@@ -58,7 +57,7 @@ JMPREL, PLTRELSZ = _DT.get(23, 0), _DT.get(2, 0)
 SYMTAB, STRTAB = _DT[6], _DT[5]
 
 
-# Instruction patch list (N3, plan\phases\N3_new_kind.md): DEFAULT OFF. A patch replaces one instruction word of the
+# Instruction patch list: DEFAULT OFF. A patch replaces one instruction word of the
 # game by another before it is lifted: the way a table size or a member offset that is fixed in the game's code becomes
 # ours without editing generated C by hand. File format, one patch per line:  <address> <original word> <new word>  # note
 # (hex; the original word is checked against the binary). Switched on by RECOMP_PATCHES=<file> (a full lift with

@@ -2,7 +2,7 @@
 
     python tools/dev/byml.py StageData/CapWorldHomeStageMap.szs [--file CapWorldHomeStageMap.byml] [--grep Frog] [--scenario N]
 
-Reads build/romfs (generated locally by tools/extract/romfs.py) and prints only names and coordinates to the console,
+Reads build/romfs (your dump's RomFS, linked by setup's import step) and prints only names and coordinates to the console,
 as a guide for test input scripts; nothing of the game's data is written anywhere. BYML version 2/3, little-endian.
 """
 import argparse
@@ -15,7 +15,7 @@ import sarc as S  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 
 
 class Byml:

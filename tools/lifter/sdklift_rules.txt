@@ -15,7 +15,7 @@
 #   trap <name>      calls to it stop with the name
 #   lift <name>      lift the SDK's own code even though the game imports the name
 
-# nn::audio: SMO's sdk contains the whole AudioRenderer (client, nn::audio::server, nn::audio::dsp); see runtime/smo_audio.c
+# nn::audio: SMO's sdk contains the whole AudioRenderer (client, nn::audio::server, nn::audio::dsp); see runtime/audio/smo_audio.c
 family ^_ZNK?2nn5audio
 # the server and DSP side and the sf implementation templates of the audio interfaces (called through method tables)
 rootall ^_ZNK?2nn5audio
@@ -36,7 +36,7 @@ ctorsdata AudioRendererManagerImpl17AudioRendererImpl
 # contains; the host answers with the in-process (DFC) manager instead of opening an IPC session.
 cut _ZN2nn5audio32CreateAudioRendererManagerByHipcEv
 
-# transfer memory (OpenAudioRenderer lends the work buffer to the server): host side in runtime/smo_nn.c
+# transfer memory (OpenAudioRenderer lends the work buffer to the server): host side in runtime/os/smo_nn.c
 cut _ZN2nn2os6detail27TransferMemoryImplByHorizon6CreateEPjPvmNS0_16MemoryPermissionE
 cut _ZN2nn2os6detail27TransferMemoryImplByHorizon5CloseEj
 cut _ZN2nn2os6detail27TransferMemoryImplByHorizon3MapEPPvjS3_mNS0_16MemoryPermissionE
@@ -44,13 +44,13 @@ cut _ZN2nn2os6detail27TransferMemoryImplByHorizon5UnmapEjPvm
 cut _ZN2nn2os6detail21AddressSpaceAllocator13AllocateSpaceEmm
 cut _ZN2nn2os6detail21AddressSpaceAllocator15CheckGuardSpaceEmmm
 
-# the rendering clock and the DSP (runtime/smo_audio.c): the host keeps the list of started renderers and runs the
+# the rendering clock and the DSP (runtime/audio/smo_audio.c): the host keeps the list of started renderers and runs the
 # command lists; SendCommandBuffer is an empty stub in this SDK
 wrap _ZN2nn5audio6server17AudioRenderSystem5StartEv
 wrap _ZN2nn5audio6server17AudioRenderSystem4StopEv
 cut _ZN2nn5audio3dsp17SendCommandBufferEimmibm
 
-# system events: host model shared through handles (runtime/os_threads.c sev_*), for game and lifted SDK alike
+# system events: host model shared through handles (runtime/os/os_threads.c sev_*), for game and lifted SDK alike
 cut _ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb
 cut _ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE
 cut _ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE
@@ -69,7 +69,7 @@ cut _ZN2nn2os30GetReadableHandleOfSystemEventEPNS0_15SystemEventTypeE
 cut _ZN2nn2os30GetWritableHandleOfSystemEventEPNS0_15SystemEventTypeE
 
 # the audio DEVICE layer: stubs in the application SDK, answered by the host as the audio system module does
-# (runtime/smo_audio.c dev_*)
+# (runtime/audio/smo_audio.c dev_*)
 cut _ZN2nn5audio6server6detail21InitializeAudioDeviceERKNS_6applet20AppletResourceUserIdE
 cut _ZN2nn5audio6server6detail19FinalizeAudioDeviceERKNS_6applet20AppletResourceUserIdE
 cut _ZN2nn5audio6server6detail19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi
@@ -90,11 +90,11 @@ datafuncs ^_ZTVN2nn3hid[0-9]+Vibration
 # nn::hid handle getters: pure functions of (npad id, style set) in the sdk (no IPC, no shared memory), lifted as they are
 family ^_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE$
 family ^_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE$
-# the vibration queue's one request to the hid module (runtime/nnhid.c hid_SendVibrationValues)
+# the vibration queue's one request to the hid module (runtime/input/nnhid.c hid_SendVibrationValues)
 cut _ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi
 
 # nn::util: the NintendoWare binary file helpers and the UTF-8 / UTF-16 conversions, pure functions over guest memory.
-# Relocate is lifted with Unrelocate, so that one undoes exactly what the other did (it replaces runtime/nnsdk.c's host
+# Relocate is lifted with Unrelocate, so that one undoes exactly what the other did (it replaces runtime/os/nnsdk.c's host
 # Relocate, which added a section's base without taking off the section's position). Users in the game: unloading of
 # g3d / font / ui2d / vfx resources, the IsValid checks of g3d and gfx resource files, nn::font's formatted text.
 family ^_ZN2nn4util15RelocationTable(8Relocate|10Unrelocate)Ev$
@@ -103,5 +103,5 @@ family ^_ZNK2nn4util16BinaryFileHeader7IsValidEliii$
 family ^_ZN2nn4util30ConvertString(Utf16NativeToUtf8EPciPKti|Utf8ToUtf16NativeEPtiPKci)$
 
 # nn::web: the offline page's argument (TLV writers) and return value (readers) of SMO's Help (al::HtmlViewer::call);
-# ShowOfflineHtmlPage itself is the host's (runtime/nnapplet.c: the page opens in the PC's web browser)
+# ShowOfflineHtmlPage itself is the host's (runtime/services/nnapplet.c: the page opens in the PC's web browser)
 family ^_ZNK?2nn3web(22ShowOfflineHtmlPageArg|26OfflineHtmlPageReturnValue|36ShowOfflineHtmlPageArgWithPlayReport)

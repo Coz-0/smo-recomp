@@ -29,7 +29,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 OFFSET_TYPES = (0xC0, 0xC1, 0xD4, 0xD5, 0xD6)          # node types whose value is an offset to the node's data
 
 

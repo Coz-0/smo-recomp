@@ -1,5 +1,5 @@
 """Link the runnable program: build/bin/smo_game.dll (lifted main + game_shim.c) and build/bin/smo_native.exe (host
-runtime + gamedll.c), as ssbu-recomp's build.py `link` step (GPL-3.0-or-later) does.
+runtime + gamedll.c); adapted from ssbu-recomp's build.py `link` step (GPL-3.0-or-later).
 
     python tools/lifter/build_exe.py [--exe smo_native.exe] [--force]
 
@@ -19,8 +19,7 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
-RT = os.path.join(REPO, 'runtime')
+import target as T  # noqa: E402
 GEN = T.build('gen')
 LIFT = T.build('lift', 'main')
 OBJ_GAME = T.build('obj', 'main')
@@ -30,15 +29,25 @@ SDL3 = os.environ.get('SDL3_ROOT') or os.path.join(REPO, 'deps', 'SDL3-3.4.18')
 WEBVIEW2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
 VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
 
-# ssbu-recomp's HOST_SOURCES without the Smash-only modules (nnro.c, nro_registry.c, debug_mode.c), plus smo_port.c
-HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c',
-                'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'display.c',
-                'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c',
-                'nncxxlib.c', 'nnlibc2.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c',
-                'nnfsdir.c', 'nnunwind.c', 'nvn_layout_smo.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'smo_port.c', 'smo_nn.c', 'smo_audio.c', 'smo_nerve.c',
-                'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c', 'gamedll.c']
+# The host runtime's build units by subsystem folder (runtime/<folder>/<file>). Not listed: nvn_vk_draw.c,
+# nvn_vk_pipelines.c and nvn_vk_watchdog.c (included by nvn_vk.c), game_shim.c (part of the game DLL) and
+# vk_shaderc_shim.c (smo_glslang.dll).
+HOST_SOURCES = {
+    'core': ['hostrt.c', 'boot.c', 'gamedll.c', 'sdklift_rt.c', 'hitch.c'],
+    'libc': ['clib.c', 'nnlibc2.c', 'libcxx.c', 'nncxxlib.c', 'nncxxrt.c', 'nniostream.c', 'nnunwind.c'],
+    'os': ['os_threads.c', 'nnsdk.c', 'nntime.c', 'nnmisc.c', 'smo_nn.c'],
+    'fs': ['nnfs.c', 'nnfsdir.c'],
+    'gfx': ['nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'nvn_misc.c', 'nvn_handles.c', 'nvn_layout.c', 'mx_translate.c',
+            'tex_decode.c', 'display.c', 'gfx_options.c'],
+    'audio': ['nnaudio.c', 'smo_audio.c'],
+    'input': ['nnhid.c', 'nnpad_sdl.c'],
+    'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnmii.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c',
+                 'nnmovie_mf.c'],
+    'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c'],
+}
+INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c')]
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
-HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', RT, '-I', GEN, '-I', LIFT,
+HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing'] + T.runtime_includes() + ['-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(SDL3, 'include'), '-I', VKH, '-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')]
@@ -48,7 +57,7 @@ LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid
 def build_game_dll(force):
     dll = os.path.join(BIN, 'smo_game.dll')
     lib = dll[:-4] + '.lib'
-    shim = os.path.join(RT, 'game_shim.c')
+    shim = T.runtime('core', 'game_shim.c')
     objs = sorted(glob.glob(os.path.join(OBJ_GAME, '*.obj')))
     if not objs:
         raise SystemExit('no objects in %s: run tools/lifter/build_main.py first' % OBJ_GAME)
@@ -60,7 +69,7 @@ def build_game_dll(force):
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     t0 = time.time()
-    r = subprocess.run([CLANG, '-shared', '-O1', '-w', '-I', RT, '-I', LIFT, shim, '@' + rsp, '-o', dll],
+    r = subprocess.run([CLANG, '-shared', '-O1', '-w'] + T.runtime_includes() + ['-I', LIFT, shim, '@' + rsp, '-o', dll],
                        capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
     if r.returncode:
@@ -85,13 +94,13 @@ def main():
         return 1
     objdir = T.build('obj', 'host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
-    deps = [p for p in glob.glob(os.path.join(RT, '*.h')) + glob.glob(os.path.join(RT, '*.inc')) +
-            glob.glob(os.path.join(GEN, '*.h')) + [os.path.join(RT, 'nvn_vk_store.c'), os.path.join(RT, 'nvn_vk_draw.c'),
-                                                   os.path.join(RT, 'nvn_vk_m4.c'), os.path.join(RT, 'nvn_vk_wd.c'),
-                                                   os.path.abspath(__file__)]]
+    deps = (glob.glob(os.path.join(T.RUNTIME, '**', '*.h'), recursive=True) +
+            glob.glob(os.path.join(T.RUNTIME, '**', '*.inc'), recursive=True) +
+            glob.glob(os.path.join(GEN, '*.h')) + INCLUDED + [os.path.abspath(__file__)])
     newest_dep = max(os.path.getmtime(p) for p in deps)
     objs, jobs = [], []
-    for src in [os.path.join(RT, n) for n in HOST_SOURCES] + [os.path.join(GEN, n) for n in GEN_SOURCES]:
+    sources = [T.runtime(d, n) for d, names in HOST_SOURCES.items() for n in names]
+    for src in sources + [os.path.join(GEN, n) for n in GEN_SOURCES]:
         obj = os.path.join(objdir, os.path.basename(src)[:-2] + '.obj')
         objs.append(obj)
         if force or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep):
@@ -126,11 +135,11 @@ def copy_if_changed(src, dst):
 
 
 def build_shader_shim():
-    """smo_glslang.dll from runtime/vk_shaderc_shim.c (see its header for why not glslang's static libraries), plus the
+    """smo_glslang.dll from runtime/gfx/vk_shaderc_shim.c (see its header for why not glslang's static libraries), plus the
     Vulkan SDK's shaderc_shared.dll beside it; then a self-test: one vertex shader must compile to SPIR-V."""
     import ctypes
     dll = os.path.join(BIN, 'smo_glslang.dll')
-    src = os.path.join(RT, 'vk_shaderc_shim.c')
+    src = T.runtime('gfx', 'vk_shaderc_shim.c')
     if not os.path.exists(dll) or os.path.getmtime(dll) < os.path.getmtime(src):
         r = subprocess.run([CLANG, '-shared', '-O1', '-w', src, '-o', dll], capture_output=True, text=True)
         if r.returncode:

@@ -1,4 +1,4 @@
-"""Table per frame of a timeline written by SMO_FRAMETL (runtime/nvn_gl.c).
+"""Table per frame of a timeline written by SMO_FRAMETL (runtime/gfx/nvn_gl.c).
 
     python tools/dev/frametl.py <frametl file> [--slow 17.5] [--all]
 
@@ -21,7 +21,7 @@ import bisect
 import collections
 
 TL_POST, TL_RUN, TL_RUN_RET, TL_JOB_BEGIN, TL_JOB_END, TL_PACE_BEGIN, TL_PACE_END, TL_VSYNC, TL_FRAME_END, TL_PRESENT_CALL, TL_SYNC_CALL, TL_SYNC_RET, \
-    TL_GPU_WAIT, TL_GPU_WAIT_END, TL_GPU_SUBMIT = range(1, 16)       # as the enum in runtime/nvn_gl.c
+    TL_GPU_WAIT, TL_GPU_WAIT_END, TL_GPU_SUBMIT = range(1, 16)       # as the enum in runtime/gfx/nvn_gl.c
 
 
 def gpu_wait(ev, rt, i0, i1):

@@ -11,7 +11,7 @@
    it is found through its control section (magic 0x98761234; +0x6f8 code bytes, +0x6fc / +0x700 constant data size and
    offset, +0x714 NVN stage, +0x748 work group, +0x754 shared and local bytes). Programs that cannot be delimited are
    reported, not guessed (see stages_of).
-2. Builds build/bin/mx_all.exe (tests/mx_all.c + runtime/mx_translate.c, clang 9) and runs it from build/bin on them:
+2. Builds build/bin/mx_all.exe (tests/mx_all.c + runtime/gfx/mx_translate.c, clang 9) and runs it from build/bin on them:
    translation with the Vulkan back end's settings and compilation to SPIR-V with the renderer's compiler.
 Exit status 0 when every stage translates and compiles.
 """
@@ -24,7 +24,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 ROM = T.build('romfs')
 OUT = T.build('shaders_all')
 BIN = T.build('bin')
@@ -215,8 +215,8 @@ def main():
     if a.extract_only:
         sys.exit(1 if unpaired_all else 0)
     exe = os.path.join(BIN, 'mx_all.exe')
-    r = subprocess.run([CLANG, '-O1', '-w', '-I', os.path.join(REPO, 'runtime'), os.path.join(REPO, 'tests', 'mx_all.c'),
-                        os.path.join(REPO, 'runtime', 'mx_translate.c'), '-o', exe], capture_output=True, text=True)
+    r = subprocess.run([CLANG, '-O1', '-w'] + T.runtime_includes() + [os.path.join(REPO, 'tests', 'mx_all.c'),
+                        T.runtime('gfx', 'mx_translate.c'), '-o', exe], capture_output=True, text=True)
     if r.returncode:
         print((r.stdout + r.stderr)[-3000:])
         sys.exit('check_all_shaders: build of mx_all.exe failed')

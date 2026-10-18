@@ -51,7 +51,7 @@ def main():
     open(os.path.join(MUT, 'difftest_gen.c'), 'w').write('\n'.join(lines))
     clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
     exe = os.path.join(MUT, 'difftest.exe')
-    r = subprocess.run([clang, '-O0', '-w', '-fno-strict-aliasing', '-I', os.path.join(recomp._REPO, 'runtime'),
+    r = subprocess.run([clang, '-O0', '-w', '-fno-strict-aliasing', '-I', os.path.join(recomp._REPO, 'runtime', 'core'),
                         os.path.join(MUT, 'difftest_gen.c'), os.path.join(HERE, 'difftest_host.c'), '-o', exe],
                        capture_output=True, text=True)
     if r.returncode:

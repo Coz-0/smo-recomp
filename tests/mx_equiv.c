@@ -1,4 +1,4 @@
-/* mx_equiv.c - equivalence test of the shader translator's two control-flow forms (SMO port).
+/* mx_equiv.c - equivalence test of the shader translator's two control-flow forms.
  *
  * For every fragment stage dumped by the renderer (vk_prog_<n>_1.bin: program header + Maxwell code; SMO_VK_DUMP_MINBYTES=0
  * with an empty SMO_VK_CACHE dumps every stage it translates), mx_translate is run twice: structured (plan_structured:

@@ -6,7 +6,7 @@ Plays tests/cap_kingdom.seq through scripts/run.py with a new, empty save folder
 be new), then reads build/run/<run name>.log and prints one line per checkpoint with the frame it was reached at, the
 run's health counters (host exceptions, Vulkan call failures, operations not implemented, unknown command handles, audio
 drops and underruns) and the frame rate. Exit code 0 only if every checkpoint was reached and every counter is zero.
-Checkpoints are changes of the game's own state machines (SMO_NERVELOG, runtime/smo_nerve.c) and sequence steps, not
+Checkpoints are changes of the game's own state machines (SMO_NERVELOG, runtime/game/smo_nerve.c) and sequence steps, not
 pictures; --shots N also saves a frame every N frames to build/run/<run name>_shots for looking at.
 About 12 minutes with a warm stage cache (--cache, or the default build/cache/vk after a first run); a cold cache needs
 more time for compiling shaders, so give it a larger --seconds.
@@ -19,7 +19,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 RUN = T.build('run')
 
 # (what, regular expression on the log). Nerve lines read "nerve: frame F keeper K: A -> B".
@@ -57,7 +57,7 @@ def main():
             raise SystemExit('%s exists: the run must start from an empty save, choose another run name' % save)
         cmd = [sys.executable, os.path.join(REPO, 'scripts', 'run.py'), a.name, '--seconds', str(a.seconds),
                '--seq', os.path.join(REPO, 'tests', 'cap_kingdom.seq'), '--userdata', save,
-               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60', '--target', T.TARGET]
+               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60']
         if a.cache:
             cmd += ['--env', 'SMO_VK_CACHE=' + a.cache]
         if a.shots:

@@ -2,7 +2,7 @@
 
     python tools/dev/sarc.py <romfs-relative path> [...]        e.g. ObjectData/CapManHero.szs
 
-Reads build/romfs (generated locally by tools/extract/romfs.py); prints nothing of the files' contents.
+Reads build/romfs (your dump's RomFS, linked by setup's import step); prints nothing of the files' contents.
 """
 import os
 import struct
@@ -10,7 +10,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
-import target as T  # noqa: E402  (SMO_TARGET: build/ or build/<update version>/)
+import target as T  # noqa: E402
 
 
 def yaz0(d):

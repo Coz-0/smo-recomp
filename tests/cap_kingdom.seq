@@ -1,6 +1,6 @@
 # A scripted Cap Kingdom run from an empty save to Mario's first capture (tests/run_cap_kingdom.py runs it and checks it).
-# SMO_SEQ steps (runtime/nnhid.c), one per line; '#' starts a comment. The run waits on the game's own states (nerves,
-# runtime/smo_nerve.c) and steers to world points with the game's camera (@goto), so it does not depend on the frame
+# SMO_SEQ steps (runtime/input/nnhid.c), one per line; '#' starts a comment. The run waits on the game's own states (nerves,
+# runtime/game/smo_nerve.c) and steers to world points with the game's camera (@goto), so it does not depend on the frame
 # rate or on loading times. Points are positions measured in earlier runs (Cappy's path, boot144-146) or the stage's
 # route guide (the arrows the game shows); no game data is kept here.
 

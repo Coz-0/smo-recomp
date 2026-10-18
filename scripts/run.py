@@ -7,14 +7,12 @@
 Copies build/bin/smo_native.exe (+ its .map) to the test name (only smo_native.exe / smo_user.exe open a visible window
 and play sound; SMO_SHOW=1 shows a test exe), runs it from build/bin with the converted dump's main.elf and the time
 limit, writes everything to build/run/<name>.log, then prints: the boot phases reached, the unimplemented imports
-(name and call count), the do-nothing audit line, frames presented, and a crash with its host frames named from the
+(name and call count), the strict check line (do-nothing handlers), frames presented, and a crash with its host frames named from the
 linker map. --full prints the whole log instead.
 
---seq plays an input sequence file (SMO_SEQ, runtime/nnhid.c; one or more steps per line, '#' starts a comment), e.g.
+--seq plays an input sequence file (SMO_SEQ, runtime/input/nnhid.c; one or more steps per line, '#' starts a comment), e.g.
 tests/cap_kingdom.seq. --userdata gives the game its own save folder (SMO_USERDATA; created if missing): a new, empty
 folder starts a new game, a copy of an earlier run's folder continues from there. Without it saves go to build/userdata.
---target <version> runs the build of another game version (scripts/setup.py --target): build/<version>/ in place of
-build/ for everything above.
 
 A test copy first waits for one of SMO_MAX_GAMES places on this PC (default: one per 12 GB of memory, 2 on a 32 GB PC;
 0 = no limit): a game in a stage takes 4-7 GB, and more test games than fit make the PC page, which slows every game
@@ -100,12 +98,9 @@ def main():
     ap.add_argument('--full', action='store_true')
     ap.add_argument('--seq', help='input sequence file (SMO_SEQ)')
     ap.add_argument('--userdata', help='save folder for this run (SMO_USERDATA)')
-    ap.add_argument('--target', help='game version of the build to run (default 1.0.0, or SMO_TARGET)')
     ap.add_argument('--timeout', type=int, help='seconds after which a game still running is killed (default --seconds + 120; '
                                                 'a run of several stages, SMO_STAGE_LIST, has the time limit per stage)')
     a = ap.parse_args()
-    if a.target:
-        os.environ['SMO_TARGET'] = a.target
     import target as T
     BIN, RUN = T.build('bin'), T.build('run')
     os.makedirs(RUN, exist_ok=True)
@@ -145,7 +140,7 @@ def main():
     lines = text.split('\n')
     print('log: %s   exit code: %s   lines: %d' % (log, code, len(lines)))
     for l in lines:
-        if l.startswith(('[phase', 'fake audit', 'display: ', 'nnMain returned', 'still running', 'GUEST TRAP', 'UNTRANSLATED',
+        if l.startswith(('[phase', 'strict check', 'display: ', 'nnMain returned', 'still running', 'GUEST TRAP', 'UNTRANSLATED',
                          'STRICT', 'memory heap', 'imports reached', 'main thread: last')) or 'frames presented' in l:
             print('  ' + l[:220])
     if 'unimplemented imports reached:' in text:
