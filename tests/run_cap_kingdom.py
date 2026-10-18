@@ -1,6 +1,6 @@
 """The scripted Cap Kingdom run: a new game from an empty save to Mario's first capture, checked against the game's state.
 
-    python tests/run_cap_kingdom.py <run name> [--seconds 720] [--cache <stage cache dir>] [--shots N] [--check-only]
+    python tests/run_cap_kingdom.py <run name> [--seconds 600] [--cache <stage cache dir>] [--shots N] [--check-only]
 
 Plays tests/cap_kingdom.seq through scripts/run.py with a new, empty save folder (build/run/<run name>_save; the name must
 be new), then reads build/run/<run name>.log and prints one line per checkpoint with the frame it was reached at, the
@@ -8,8 +8,9 @@ run's health counters (host exceptions, Vulkan call failures, operations not imp
 drops and underruns) and the frame rate. Exit code 0 only if every checkpoint was reached and every counter is zero.
 Checkpoints are changes of the game's own state machines (SMO_NERVELOG, runtime/game/smo_nerve.c) and sequence steps, not
 pictures; --shots N also saves a frame every N frames to build/run/<run name>_shots for looking at.
-About 12 minutes with a warm stage cache (--cache, or the default build/cache/vk after a first run); a cold cache needs
-more time for compiling shaders, so give it a larger --seconds.
+The run ends when the sequence is done (SMO_SEQ_EXIT=1), a second after the capture's message is closed; --seconds is
+only the limit for a run that gets stuck. ABOUT_MINUTES with a warm stage cache (--cache, or the default build/cache/vk
+after a first run); a cold cache needs more time for compiling shaders, so give it a larger --seconds.
 """
 import argparse
 import os
@@ -37,6 +38,7 @@ CHECKPOINTS = [
     ('tower door opened by the cap', r'-> DoorAreaChangeNrvOpenWait$'),
     ('inside Top-Hat Tower (new stage)', r'input sequence: .* player at .* within 800 of -500 0 13950'),
     ('frog captured', r'-> PlayerActorHakoniwaNrvHack$'),
+    ('capture message closed (A)', r'StageSceneNrvDemoHackStartFirst -> '),
 ]
 NERVELOG = ('SceneStateSelectMode,DemoScene,OpeningStageStartDemo,StageSceneNrv,OpeningStageStartCapManHero,'
             'InformationWindowCapMsgRequester,HackCapNrv,CapSwitchNrv,DoorAreaChange,PlayerActorHakoniwaNrv')
@@ -45,7 +47,7 @@ NERVELOG = ('SceneStateSelectMode,DemoScene,OpeningStageStartDemo,StageSceneNrv,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('name')
-    ap.add_argument('--seconds', type=int, default=720)
+    ap.add_argument('--seconds', type=int, default=600)
     ap.add_argument('--cache', help='SMO_VK_CACHE: a stage cache folder from an earlier run')
     ap.add_argument('--shots', type=int, default=0)
     ap.add_argument('--check-only', action='store_true', help='only read an existing log')
@@ -57,7 +59,7 @@ def main():
             raise SystemExit('%s exists: the run must start from an empty save, choose another run name' % save)
         cmd = [sys.executable, os.path.join(REPO, 'scripts', 'run.py'), a.name, '--seconds', str(a.seconds),
                '--seq', os.path.join(REPO, 'tests', 'cap_kingdom.seq'), '--userdata', save,
-               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60']
+               '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60', '--env', 'SMO_SEQ_EXIT=1']
         if a.cache:
             cmd += ['--env', 'SMO_VK_CACHE=' + a.cache]
         if a.shots:
@@ -81,7 +83,10 @@ def main():
     stale = re.search(r'command lists \((\d+) unknown handles\)', text)
     au = re.search(r'audio: device sink: (\d+) frames output, .*?(\d+) samples dropped .*?(\d+) underruns', text)
     fps = [float(x) for x in re.findall(r'nvn_perf: frames \d+\.\.\d+ .*fps avg ([\d.]+)', text)]
+    done = re.search(r'input sequence: done at poll (\d+) \(SMO_SEQ_EXIT\)', text)
     print('  host exceptions %d; steering steps that gave up %d' % (exc, gave_up))
+    print('  run ended: %s' % ('with its sequence at poll ' + done.group(1) if done else
+                               'by the time limit' if 'still running after' in text else 'otherwise (see the log)'))
     if vk:
         print('  frames %s; Vulkan call failures %s; operations not implemented %s' % vk.groups())
         ok &= vk.group(2) == '0' and vk.group(3) == '0'

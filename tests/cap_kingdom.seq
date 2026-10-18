@@ -56,4 +56,7 @@
 @goto:-500,13800,150/600 @goto:-500,10550,150/600 @goto:250,10550,150/600 @goto:250,9150,150/600
 @near:FrogNrv,250/900 4:V
 @nerve:PlayerActorHakoniwaNrvHack
-300:Z 120:Z 600
+
+# The first capture's scene ends on its message "You captured a frog!": A (every 30 polls) closes it and play goes on as
+# the frog. The run ends 60 polls later (tests/run_cap_kingdom.py runs it with SMO_SEQ_EXIT=1)
+@until-nerve:StageSceneNrvPlay:Z/30 60
