@@ -4,8 +4,8 @@
     python scripts/setup.py --dump <folder> [--jobs N]
 
 The game is Super Mario Odyssey 1.4.1. <folder> is your decrypted dump of it (docs/building.md: what to dump with
-nxdumptool and how to lay it out): the program's ExeFS with the update, the base game's main, the RomFS with the update
-applied and the update's control.nacp; the Help pages and the console's shared fonts are optional. No keys and no
+nxdumptool and how to lay it out): the program's ExeFS with the update, the RomFS with the update applied and the
+update's control.nacp; the Help pages and the console's shared fonts are optional. No keys and no
 firmware are read: the files are already decrypted by your console. Where the files go: tools/target.py.
 
 Nothing of the game is stored in the repository: every step derives its files from the dump into <repo>/build (ignored

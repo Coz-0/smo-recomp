@@ -4,17 +4,15 @@
 
 <folder> holds what you dumped from your own console, already decrypted by the console (docs/building.md):
     exefs/          the program's ExeFS with the 1.4.1 update: main, main.npdm, rtld, sdk, subsdk*
-    exefs-1.0.0/    the base game's ExeFS, or only its main: read for its symbols, which name 1.4.1's functions
     romfs/          the game's RomFS with the 1.4.1 update applied
     control.nacp    the update's control data
     manual/         optional: the Help pages (the RomFS of the game's HtmlDocument content: html-document/...)
     fonts/          optional: the console's shared fonts, as .bfttf files the way the console stores them, or .ttf
-Each piece is checked: the program id in main.npdm, the NintendoSDK version the modules carry (7.3.2 for 1.4.1, 3.5.1
-for the base game), the display version in control.nacp, and the RomFS and Help folders by what they contain.
+Each piece is checked: the program id in main.npdm, the NintendoSDK version main carries (7.3.2 for 1.4.1), the display
+version in control.nacp, and the RomFS and Help folders by what they contain.
 
 Writes, all under build/ (ignored by git):
     dump/update/exefs/<name>, elf/<name>.elf, control.nacp   the program; its modules converted to ELF
-    dump/base/exefs/main, elf/main.elf                       the base game's main
     dump/version.json                                        what was found: versions, build ids, SHA-256 of modules
     romfs, manual                                            directory junctions to your dump's folders (read in place)
     sysdata/fonts/<name>.ttf                                 the shared fonts, unwrapped (when given)
@@ -35,7 +33,7 @@ sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T  # noqa: E402
 
 PROGRAM_ID = 0x0100000000010000                   # Super Mario Odyssey
-SDK = {'update': '7.3.2.0', 'base': '3.5.1.0'}    # the NintendoSDK of the 1.4.1 program and of the base game
+SDK = '7.3.2.0'                                   # the NintendoSDK the 1.4.1 program was built with
 
 
 class DumpError(Exception):
@@ -50,8 +48,8 @@ def find(dump, *names):
     return None
 
 
-def read_exefs(path, kind, need):
-    """{name: bytes} of an ExeFS folder, checked to be the program of `kind` ('update' or 'base')."""
+def read_exefs(path, need):
+    """{name: bytes} of an ExeFS folder, checked to be the 1.4.1 program."""
     files = {n: open(os.path.join(path, n), 'rb').read() for n in sorted(os.listdir(path))
              if os.path.isfile(os.path.join(path, n))}
     missing = [n for n in need if n not in files]
@@ -62,21 +60,18 @@ def read_exefs(path, kind, need):
                         % (path, nso.npdm_program_id(files['main.npdm'])))
     elf, _ = nso.nso_to_elf(files['main'])
     sdk = nso.sdk_version(elf)
-    if sdk != SDK[kind]:
-        raise DumpError('%s: its main was built with NintendoSDK %s, %s\'s with %s: is this the %s?' % (
-            path, sdk, 'the 1.4.1 update' if kind == 'update' else 'the base game', SDK[kind],
-            'ExeFS with the 1.4.1 update' if kind == 'update' else 'base game\'s ExeFS (version 1.0.0)'))
+    if sdk != SDK:
+        raise DumpError('%s: its main was built with NintendoSDK %s, the 1.4.1 update\'s with %s: is this the ExeFS '
+                        'with the 1.4.1 update?' % (path, sdk, SDK))
     return files
 
 
-def write_exefs(files, dst, only=None):
+def write_exefs(files, dst):
     """ExeFS files as given and every NSO converted to ELF; {name: facts} for version.json."""
     for sub in ('exefs', 'elf'):
         os.makedirs(os.path.join(dst, sub), exist_ok=True)
     modules = {}
     for name, d in files.items():
-        if only and name not in only:
-            continue
         open(os.path.join(dst, 'exefs', name), 'wb').write(d)
         m = {'size': len(d), 'sha256': hashlib.sha256(d).hexdigest()}
         if d[:4] == b'NSO0':
@@ -142,11 +137,10 @@ def main():
         raise SystemExit('%s: no such folder' % dump)
     try:
         exefs = find(dump, 'exefs')
-        base = find(dump, 'exefs-1.0.0', 'exefs-base')
         romfs = find(dump, 'romfs')
         nacp = find(dump, 'control.nacp')
-        for what, p in (('exefs/ (the program with the 1.4.1 update)', exefs), ('exefs-1.0.0/ (the base game\'s main)', base),
-                        ('romfs/ (the RomFS with the update applied)', romfs), ('control.nacp (the update\'s)', nacp)):
+        for what, p in (('exefs/ (the program with the 1.4.1 update)', exefs), ('romfs/ (the RomFS with the update applied)', romfs),
+                        ('control.nacp (the update\'s)', nacp)):
             if not p:
                 raise DumpError('%s: %s is missing (see docs/building.md for what to dump)' % (dump, what))
         info = nso.nacp_info(open(nacp, 'rb').read())
@@ -154,21 +148,17 @@ def main():
             raise DumpError('%s: version %s, this project builds %s' % (nacp, info['display_version'] or '(none)', T.VERSION))
         if not all(os.path.isdir(os.path.join(romfs, d)) for d in ('SystemData', 'StageData', 'ObjectData')):
             raise DumpError('%s: not the game\'s RomFS (no SystemData, StageData or ObjectData folder)' % romfs)
-        upd_files = read_exefs(exefs, 'update', ('main', 'main.npdm', 'sdk', 'rtld'))
-        base_files = read_exefs(base, 'base', ('main',))
+        upd_files = read_exefs(exefs, ('main', 'main.npdm', 'sdk', 'rtld'))
     except DumpError as e:
         raise SystemExit('dump: %s' % e)
 
     out = os.path.join(a.build, 'dump')
     print('program (%s, version %s): %s' % (info['name'], info['display_version'], exefs))
     shutil.rmtree(os.path.join(out, 'update'), ignore_errors=True)
-    result = {'update': {'program_id': '%016x' % PROGRAM_ID, 'program_sdk_version': SDK['update'], 'nacp': info,
+    result = {'update': {'program_id': '%016x' % PROGRAM_ID, 'program_sdk_version': SDK, 'nacp': info,
                          'modules': write_exefs(upd_files, os.path.join(out, 'update'))}}
     shutil.copyfile(nacp, os.path.join(out, 'update', 'control.nacp'))
-    print('base game\'s main: %s' % base)
-    shutil.rmtree(os.path.join(out, 'base'), ignore_errors=True)
-    result['base'] = {'program_id': '%016x' % PROGRAM_ID, 'program_sdk_version': SDK['base'],
-                      'modules': write_exefs(base_files, os.path.join(out, 'base'), only=('main', 'main.npdm'))}
+    shutil.rmtree(os.path.join(out, 'base'), ignore_errors=True)     # the base game's main older builds kept (unused)
     with open(os.path.join(out, 'version.json'), 'w') as f:
         json.dump(result, f, indent=1)
     print('wrote', os.path.join(out, 'version.json'))

@@ -4,10 +4,12 @@
 
 Writes (everything derived from the dump; build/ is ignored by git):
   image.h            image layout of main and sdk (segment ends, relocation tables, .dynsym, .init_array, entry
-                     points), and GAME_SYM_<name> addresses of the game functions the runtime calls by name (in an
-                     update's main without symbols: matched with the base executable's, see find_sampler_sort),
-                     GAME_VSYM_<name> of the virtual functions it watches for (from RTTI vtables, see find_vsym), and
-                     GAME_FN_<name> of the game functions its test aids call (matched likewise, see find_func).
+                     points), GAME_SYM_<name> addresses of the game functions the runtime calls by name, and the game
+                     functions its fast path and test aids need (GAME_SYM_ of the sampler sort, GAME_VSYM_, GAME_FN_).
+                     1.4.1's main keeps almost no symbols: those functions are found by what they are and what they do
+                     (find_game_functions, find_sampler_sort): a class's vtable from its RTTI name, a game state's from
+                     its nerve's, the strings a function loads, the functions it calls, the shape of its code. Each rule
+                     must give exactly one function, or the entry is 0 and the runtime leaves that feature off.
   imports_all.txt    names main imports (undefined dynamic symbols), symbol-table order
   sdkdata.c          values of the data symbols main imports from sdk (nn::util tables, nn::hid NpadId constants),
                      copied out of the real sdk module
@@ -21,6 +23,8 @@ import os
 import struct
 import sys
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'extract'))
@@ -29,7 +33,6 @@ import functions as F                                     # noqa: E402  (the ELF
 import target as T                                        # noqa: E402
 
 DUMP = os.path.join(T.DUMP, 'elf')
-BASE_MAIN = T.base_elf('main')
 OUT = T.build('gen')
 GUEST_BASE = 0x7100000000
 SDK_BASE = 0x7500000000
@@ -37,19 +40,32 @@ SDK_BASE = 0x7500000000
 GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
              '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
 # Optional: runtime/game/smo_fast.c's sampler list sort of agl::driver::NVNMgr in host code. A main without these symbols
-# (1.4.1's is stripped) gets them from the base executable's by matching (find_sampler_sort), or 0 when that fails, and
-# smo_fast.c then leaves the game's own code alone. Order: the sort, registerSampler_, the key comparison.
+# (1.4.1's is stripped) gets them from find_sampler_sort, or 0 when that fails, and smo_fast.c then leaves the game's own
+# code alone. Order: the sort, registerSampler_, the key comparison.
 GAME_SYMS_OPTIONAL = ['_ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E', '_ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj',
                       '_ZN3agl6driver6NVNMgr18compareSamplerKey_EPKNS1_10SamplerKeyES4_']
-# Virtual functions the runtime watches for (GAME_VSYM_<name>): (class as RTTI names it, mangled function, name). In a
-# main without symbols they come from the class's vtable, in the slot that holds them in the base executable's
-# (find_vsym), or 0. StageScene::init: a stage scene starts (test aid SMO_START_STAGE, runtime/game/smo_nerve.c).
-GAME_VSYMS = [('10StageScene', '_ZN10StageScene4initERKN2al13SceneInitInfoE', 'StageScene_init')]
-# Game functions the runtime calls (GAME_FN_<name>): (mangled function, name). A main without symbols gets each from the
-# base executable's (find_func), or 0. ChangeStageInfo's constructor and GameDataFunction::tryChangeNextStage: a stage
-# change of the game's own, as a door makes it (test aid SMO_STAGE_LIST, runtime/game/smo_nerve.c).
-GAME_FUNCS = [('_ZN15ChangeStageInfoC1EPK14GameDataHolderPKcS4_biNS_15SubScenarioTypeE', 'ChangeStageInfo_ctor'),
-              ('_ZN16GameDataFunction18tryChangeNextStageE20GameDataHolderWriterPK15ChangeStageInfo', 'tryChangeNextStage')]
+# Where the virtual functions the rules start from sit in a class's vtable (vtable_slots: the functions after the
+# offset-to-top and the typeinfo): an actor's init(const al::ActorInitInfo &) and a scene's init(const al::SceneInitInfo &).
+ACTOR_INIT_SLOT, SCENE_INIT_SLOT = 1, 3
+# al::LiveActor's pose keeper (its position, rotation and velocity), and the byte offsets in the keeper's vtable of the
+# functions al::updatePoseTrans and al::setVelocityZero call through it (updatePoseTrans, getVelocityPtr)
+POSE_KEEPER, POSE_TRANS_SLOT, POSE_VELOCITY_SLOT = 0x50, 0x80, 0x50
+# The functions the rules start from (find_anchors): an actor's or a scene's init in its class's vtable (by the RTTI
+# name), a game state's execute (by its nerve class's RTTI name: the function its execute slot branches to), or the one
+# function that loads the address of a string. StageScene::init: a stage scene starts (test aids SMO_START_STAGE and
+# SMO_STAGE_LIST, runtime/game/smo_nerve.c; GAME_VSYM_StageScene_init); the three states that change the stage find
+# ChangeStageInfo's constructor and GameDataFunction::tryChangeNextStage.
+ANCHORS = {
+    'StageScene::init': ('scene', '10StageScene'),
+    'HakoniwaSequence::exePlayStage': ('nerve', 'N12_GLOBAL__N_128HakoniwaSequenceNrvPlayStageE'),
+    'ShineTowerBackDoor::exeEnter': ('nerve', 'N12_GLOBAL__N_126ShineTowerBackDoorNrvEnterE'),
+    'ShineTowerRocket::exeWait': ('nerve', 'N12_GLOBAL__N_123ShineTowerRocketNrvWaitE'),
+}
+# The game functions the runtime calls (GAME_FN_<name>), in the order of image.h; how each is found: find_game_functions.
+# ChangeStageInfo's constructor and GameDataFunction::tryChangeNextStage: a stage change of the game's own, as a door
+# makes it (test aid SMO_STAGE_LIST, runtime/game/smo_nerve.c). al::updatePoseTrans and al::setVelocityZero: the player
+# moved to a point, as PlayerPuppet::setTrans moves him (test aid, sequence step @warp).
+GAME_FN_NAMES = ['ChangeStageInfo_ctor', 'tryChangeNextStage', 'updatePoseTrans', 'setVelocityZero']
 
 
 def code_words(m, start, size):
@@ -60,104 +76,10 @@ def adrp_page(a, w):
     return (a & ~0xfff) + (F.sext(((w >> 29) & 3) | (((w >> 5) & 0x7ffff) << 2), 21) << 12)
 
 
-def masked(words):
-    """AArch64 instruction words with the fields that depend on where code and data lie cleared: branch and literal
-    offsets, ADR / ADRP immediates, and the low 12 bits an ADD or a load / store adds to a register an ADRP set."""
-    out, pages = [], set()
-    for w in words:
-        if w & 0x7c000000 == 0x14000000:                 # B, BL
-            w &= 0xfc000000
-        elif w & 0xff000010 == 0x54000000 or w & 0x7e000000 == 0x34000000 or w & 0x3b000000 == 0x18000000:
-            w &= 0xff00001f                              # B.cond, CBZ / CBNZ, LDR (literal)
-        elif w & 0x7e000000 == 0x36000000:               # TBZ / TBNZ
-            w &= 0xfff8001f
-        elif w & 0x1f000000 == 0x10000000:               # ADR, ADRP
-            if w & 0x80000000:
-                pages.add(w & 31)
-            w &= 0x9f00001f
-        elif (w & 0x7f800000 == 0x11000000 or w & 0x3b000000 == 0x39000000) and (w >> 5) & 31 in pages:
-            w &= ~(0xfff << 10) & 0xffffffff
-        out.append(w)
-    return out
-
-
-def pointer_loads(m, target):
-    """Addresses of the 64-bit loads (LDR after an ADRP of the same register, within 16 instructions) of a pointer slot
-    that holds `target` (a RELATIVE relocation with that addend)."""
-    slots = {off for off, info, add in m.relocs() if info & 0xffffffff == 1027 and add == target}
-    ws, out = m.words(), []
-    for i, w in enumerate(ws):
-        if w & 0x9f000000 != 0x90000000:
-            continue
-        page, rd = adrp_page(i * 4, w), w & 31
-        for k in range(i + 1, min(i + 17, len(ws))):
-            v = ws[k]
-            if v & 0xffc00000 == 0xf9400000 and (v >> 5) & 31 == rd:
-                if page + ((v >> 10) & 0xfff) * 8 in slots:
-                    out.append(k * 4)
-                break
-    return out
-
-
-def caller_and_callee(m, funcs, keycmp):
-    """registerSampler_ = the one function that loads a pointer to the key comparison; the sort = the first call after
-    that load. (start, size of the caller, callee) or None."""
-    starts = [s for s, _ in funcs]
-    found = set()
-    loads = pointer_loads(m, keycmp)
-    for a in loads:
-        i = bisect.bisect_right(starts, a) - 1
-        found.add(funcs[i] if i >= 0 and a < funcs[i][0] + funcs[i][1] else None)
-    if len(found) != 1 or None in found:
-        return None
-    (start, size), = found
-    for q in range(loads[0], start + size, 4):
-        w = m.u32(q)
-        if w & 0xfc000000 == 0x94000000:                 # BL
-            return start, size, q + F.sext(w & 0x3ffffff, 26) * 4
-    return None
-
-
-def indirect_calls(m, start, size):
-    """(BL count, BLR count) of a function."""
-    ws = code_words(m, start, size)
-    return sum(1 for w in ws if w & 0xfc000000 == 0x94000000), sum(1 for w in ws if w & 0xfffffc1f == 0xd63f0000)
-
-
-def find_sampler_sort(main_m):
-    """GAME_SYMS_OPTIONAL in a main without symbols (1.4.1), from the base executable's (build/dump/base): the key
-    comparison is the only function of its size whose masked instructions equal the base's (which no other base function
-    has); registerSampler_ is the only function that loads a pointer to it, and the sort is the first call after that
-    load. The same rule run on the base must give the base's own symbols, and the sort found must, like the base's,
-    call only through pointers (the comparator). The sort's algorithm itself is checked at run time with
-    SMO_FAST_CHECK=1 (runtime/game/smo_fast.c). Returns ({name: address}, None) or ({}, why not)."""
-    if not os.path.exists(BASE_MAIN):
-        return {}, 'the base executable is not in build/dump/base'
-    base = F.Module(BASE_MAIN)
-    syms = {n: (v, s) for n, t, b, sh, v, s in base.symbols() if sh and n in GAME_SYMS_OPTIONAL}
-    if len(syms) != len(GAME_SYMS_OPTIONAL):
-        return {}, 'the base executable does not name them'
-    sort_n, reg_n, cmp_n = GAME_SYMS_OPTIONAL
-    base_funcs = sorted({(v, s) for n, t, b, sh, v, s in base.symbols() if sh and t == 2 and s})
-    rows = csv.DictReader(open(T.build('functions', 'main_functions.tsv'), encoding='utf-8'), delimiter='\t')
-    funcs = sorted((int(r['start'], 16), int(r['size'])) for r in rows)
-    cv, cs = syms[cmp_n]
-    pattern = masked(code_words(base, cv, cs))
-    if [v for v, s in base_funcs if s == cs and masked(code_words(base, v, s)) == pattern] != [cv]:
-        return {}, 'the key comparison\'s instructions are not unique in the base executable'
-    same = [st for st, sz in funcs if sz == cs and masked(code_words(main_m, st, sz)) == pattern]
-    if len(same) != 1:
-        return {}, '%d functions have the key comparison\'s instructions' % len(same)
-    on_base = caller_and_callee(base, base_funcs, cv)
-    if not on_base or on_base[0] != syms[reg_n][0] or on_base[2] != syms[sort_n][0]:
-        return {}, 'the rule does not give the base executable\'s own registerSampler_ and sort'
-    found = caller_and_callee(main_m, funcs, same[0])
-    if not found:
-        return {}, 'no single function loads a pointer to the key comparison'
-    sort_size = next((sz for st, sz in funcs if st == found[2]), 0)
-    if not sort_size or indirect_calls(main_m, found[2], sort_size) != indirect_calls(base, *syms[sort_n]):
-        return {}, 'the function called after the load does not call like the base\'s sort'
-    return {sort_n: found[2], reg_n: found[0], cmp_n: same[0]}, None
+def bl_targets(m, start, size):
+    """The targets of a function's BL instructions, in order."""
+    return [start + 4 * i + F.sext(w & 0x3ffffff, 26) * 4 for i, w in enumerate(code_words(m, start, size))
+            if w & 0xfc000000 == 0x94000000]
 
 
 def vtable_slots(m, cls):
@@ -188,98 +110,210 @@ def vtable_slots(m, cls):
     return out
 
 
-def find_vsym(main_m, defined, cls, name):
-    """(address, how) of virtual function `name` of class cls: main's own symbol (checked against its vtable), else the
-    function in the slot of main's vtable for the class that holds it in the base executable's; (0, why not)."""
-    base = F.Module(BASE_MAIN) if os.path.exists(BASE_MAIN) else None
-    ref = (base, {n: v for n, t, b, sh, v, s in base.symbols() if sh}) if base else (main_m, defined)
-    slots_ref = vtable_slots(ref[0], cls)
-    if name not in ref[1] or not slots_ref or slots_ref.count(ref[1][name]) != 1:
-        return 0, 'the base executable\'s vtable of %s does not hold it once' % cls
-    slots = vtable_slots(main_m, cls)
-    k = slots_ref.index(ref[1][name])
-    if not slots or k >= len(slots) or not slots[k]:
-        return 0, 'no vtable of %s in this main.elf' % cls
-    if name in defined and defined[name] != slots[k]:
-        return 0, 'the vtable slot does not hold the symbol'
-    return slots[k], 'own symbol' if name in defined else 'vtable slot %d, as in the base executable' % k
+def nerve_exe(m, rtti):
+    """The function the execute slot (the first virtual function) of nerve class `rtti` branches to, or None."""
+    slots = vtable_slots(m, rtti)
+    if not slots or not slots[0]:
+        return None
+    for k in range(4):
+        w = m.u32(slots[0] + 4 * k)
+        if w & 0xfc000000 == 0x14000000:                 # B: the nerve's execute is a tail call of the host's exe...
+            return slots[0] + 4 * k + F.sext(w & 0x3ffffff, 26) * 4
+    return None
 
 
-def bl_targets(m, start, size):
-    """The targets of a function's BL instructions, in order."""
-    return [start + 4 * i + F.sext(w & 0x3ffffff, 26) * 4 for i, w in enumerate(code_words(m, start, size))
-            if w & 0xfc000000 == 0x94000000]
+class Code:
+    """main.elf's code, for finding game functions by what they do: every function with its exact bounds
+    (build/functions/main_functions.tsv), the calls (BL) each makes, the addresses each forms (ADRP then ADD of the same
+    register: strings) and the pointer slots each loads (ADRP then a 64-bit LDR)."""
 
-
-class FuncMatcher:
-    """Functions of a main without symbols found from the base executable's (build/dump/base), which names them."""
-
-    def __init__(self, main_m):
-        self.main, self.base = main_m, F.Module(BASE_MAIN)
-        self.base_sym = {n: (v, s) for n, t, b, sh, v, s in self.base.symbols() if sh and t == 2 and s}
-        base_funcs = sorted({vs for vs in self.base_sym.values()})
+    def __init__(self, m):
+        self.m = m
         rows = csv.DictReader(open(T.build('functions', 'main_functions.tsv'), encoding='utf-8'), delimiter='\t')
-        funcs = sorted((int(r['start'], 16), int(r['size'])) for r in rows)
-        self.base_size, self.size = dict(base_funcs), dict(funcs)
-        self.base_by_size, self.by_size = {}, {}
-        for v, s in base_funcs:
-            self.base_by_size.setdefault(s, []).append(v)
-        for v, s in funcs:
-            self.by_size.setdefault(s, []).append(v)
-        self.calls, self.base_calls, self.equal_of = None, None, {}
+        self.size = {int(r['start'], 16): int(r['size']) for r in rows}
+        self.starts = sorted(self.size)
+        self.rel = {off: add for off, info, add in m.relocs() if info & 0xffffffff == 0x403}
+        w = np.array(m.words(), dtype=np.uint32)
+        # the ADDs (immediate) and 64-bit LDRs based on the register an ADRP set, within 16 instructions and until the
+        # register is written again or the code calls or branches away
+        self.forms, self.slot_loads = {}, {}
+        ws = w.tolist()
+        for i in np.nonzero((w & 0x9f000000) == 0x90000000)[0].tolist():
+            page, rd = adrp_page(i * 4, ws[i]), ws[i] & 31
+            for k in range(i + 1, min(i + 17, len(ws))):
+                v = ws[k]
+                if (v >> 5) & 31 == rd:
+                    if v & 0xffc00000 == 0x91000000:                        # ADD (immediate, 64-bit, no shift)
+                        self.forms.setdefault(page + ((v >> 10) & 0xfff), []).append(k * 4)
+                    elif v & 0xffc00000 == 0xf9400000:                      # LDR (64-bit, unsigned offset)
+                        self.slot_loads.setdefault(page + ((v >> 10) & 0xfff) * 8, []).append(k * 4)
+                if (v & 0x7c000000 == 0x14000000 or v & 0xfe9ffc1f == 0xd61f0000          # B, BL; BR, BLR, RET
+                        or v & 31 == rd and not (v & 0x0a400000 == 0x08000000              # writes it (not a store,
+                                                 or v & 0x7e000000 in (0x34000000, 0x36000000))):  # CBZ / TBZ)
+                    break
 
-    def equal(self, v):
-        """The one function of this main whose masked instructions equal those of base function v, which no other base
-        function has; else None."""
-        if v not in self.equal_of:
-            s, r = self.base_size.get(v), None
-            if s:
-                pat = masked(code_words(self.base, v, s))
-                if [o for o in self.base_by_size[s] if masked(code_words(self.base, o, s)) == pat] == [v]:
-                    same = [o for o in self.by_size.get(s, []) if masked(code_words(self.main, o, s)) == pat]
-                    r = same[0] if len(same) == 1 else None
-            self.equal_of[v] = r
-        return self.equal_of[v]
+    def owner(self, a):
+        i = bisect.bisect_right(self.starts, a) - 1
+        return self.starts[i] if i >= 0 and a < self.starts[i] + self.size[self.starts[i]] else None
 
-    def by_calls(self, v, s):
-        """The one function of this main of about the size of base function v (within a quarter) whose calls (BL)
-        go to the same functions as v's wherever the callee is matched by equal(), at least two of them and at least
-        half; the same rule over the base executable's functions must give v alone. (address, matched calls) or None."""
-        want = bl_targets(self.base, v, s)
-        mapped = [self.equal(t) for t in want]
-        known = [i for i, x in enumerate(mapped) if x is not None]
-        if len(known) < 2 or 2 * len(known) < len(want):
-            return None
-        if self.calls is None:
-            self.calls = {o: bl_targets(self.main, o, sz) for o, sz in self.size.items()}
-            self.base_calls = {o: bl_targets(self.base, o, sz) for o, sz in self.base_size.items()}
+    def calls(self, a):
+        return bl_targets(self.m, a, self.size[a])
 
-        def fits(calls, targets):
-            return len(calls) == len(want) and all(calls[i] == targets[i] for i in known)
-        if [o for o, c in self.base_calls.items() if fits(c, want)] != [v]:
-            return None
-        hits = [o for o, c in self.calls.items() if fits(c, mapped) and abs(self.size[o] - s) <= s // 4]
-        return (hits[0], len(known)) if len(hits) == 1 else None
+    def call_sites(self, a):
+        """[(place, target)] of the BL instructions of function a."""
+        return [(a + 4 * i, a + 4 * i + F.sext(w & 0x3ffffff, 26) * 4) for i, w in enumerate(code_words(self.m, a, self.size[a]))
+                if w & 0xfc000000 == 0x94000000]
+
+    def string_addrs(self, text):
+        raw = b'\x00' + text.encode() + b'\x00'
+        out, i = set(), self.m.d.find(raw)
+        while i >= 0:
+            out.add(i + 1 - F.OFF)
+            i = self.m.d.find(raw, i + 1)
+        return out
+
+    def string_users(self, text):
+        """The functions that form the address of the string `text`."""
+        return {self.owner(p) for a in self.string_addrs(text) for p in self.forms.get(a, [])} - {None}
+
+    def string_func(self, text):
+        """The one function that forms the address of `text`, or None."""
+        users = self.string_users(text)
+        return users.pop() if len(users) == 1 else None
+
+    def forms_in(self, func, text):
+        """Places in func where the address of `text` is formed."""
+        end = func + self.size[func]
+        return sorted(p for a in self.string_addrs(text) for p in self.forms.get(a, []) if func <= p < end)
+
+    def slot_users(self, slot):
+        return {self.owner(p) for p in self.slot_loads.get(slot, [])} - {None}
+
+    def pointer_loads(self, func):
+        """[(place, function)] of the loads in func of a pointer slot that holds a function of main (RELATIVE)."""
+        end = func + self.size[func]
+        out = []
+        for slot, places in self.slot_loads.items():
+            target = self.rel.get(slot)
+            if target in self.size:
+                out += [(p, target) for p in places if func <= p < end]
+        return sorted(out)
 
 
-def find_func(main_m, defined, name, matcher):
-    """(address, how) of game function `name`: main's own symbol, else (a main without symbols) the one function whose
-    masked instructions equal the base executable's function of that name, else the one whose calls match its calls
-    (FuncMatcher.by_calls); (0, why not)."""
-    if name in defined:
-        return defined[name], 'own symbol'
-    if not matcher:
-        return 0, 'the base executable is not in build/dump/base'
-    if name not in matcher.base_sym:
-        return 0, 'the base executable does not name it'
-    v, s = matcher.base_sym[name]
-    a = matcher.equal(v)
-    if a is not None:
-        return a, 'matched with the base executable\'s instructions'
-    hit = matcher.by_calls(v, s)
-    if hit:
-        return hit[0], 'matched with the base executable\'s by %d of the %d functions it calls' % (hit[1], len(bl_targets(matcher.base, v, s)))
-    return 0, 'no single function of this main.elf matches the base executable\'s'
+def one(found, what):
+    """(address, how) when found holds exactly one function, else (0, why not)."""
+    found = {a for a in found if a}
+    return (found.pop(), what) if len(found) == 1 else (0, '%d functions are %s' % (len(found), what))
+
+
+def find_anchors(code, anchors):
+    """{name: (address, how)} of anchors {name: (kind, what)}: kind 'actor' / 'scene' (the init in the vtable of the
+    class whose RTTI name is what), 'nerve' (the execute of that nerve class) or 'string' (the one function that loads
+    the address of that string); (0, why not) where there is not exactly one."""
+    f = {}
+    for name, (kind, what) in anchors.items():
+        if kind in ('actor', 'scene'):
+            k = ACTOR_INIT_SLOT if kind == 'actor' else SCENE_INIT_SLOT
+            slots = vtable_slots(code.m, what)
+            a = slots[k] if slots and k < len(slots) else None
+            f[name] = (a, 'slot %d of the vtable of %s' % (k, what)) if a else (0, 'no vtable of %s' % what)
+        elif kind == 'nerve':
+            a = nerve_exe(code.m, what)
+            f[name] = (a, 'the execute of nerve %s' % what) if a else (0, 'no nerve %s' % what)
+        else:
+            a = code.string_func(what)
+            f[name] = (a, 'the one function that loads the address of "%s"' % what) if a else (0, 'not exactly one function loads "%s"' % what)
+    return f
+
+
+def find_game_functions(code):
+    """{name: (address, how)} of the ANCHORS and GAME_FN_NAMES, each found by its rule; (0, why not) where the rule
+    does not give one function."""
+    f = find_anchors(code, ANCHORS)
+    A = {name: a for name, (a, _) in f.items()}
+
+    def calls(name):
+        return set(code.calls(A[name])) if A.get(name) else set()
+
+    # a stage change of the game's own: the play state of the stage sequence, the Odyssey's back door and its rocket
+    # each make a ChangeStageInfo (its constructor sets the wipe "WipeCircle") and change the stage with it
+    states = ['HakoniwaSequence::exePlayStage', 'ShineTowerBackDoor::exeEnter', 'ShineTowerRocket::exeWait']
+    shared = set.intersection(*[calls(s) for s in states])
+    ctor = one({a for a in shared if code.forms_in(a, 'WipeCircle')},
+               'called by the play state, the back door and the rocket and loading "WipeCircle"')
+    f['ChangeStageInfo_ctor'] = ctor
+    later = set()
+    if ctor[0]:
+        for a in shared - {ctor[0]}:
+            seqs = [code.calls(A[s]) for s in states]
+            if all(ctor[0] in s and a in s[s.index(ctor[0]) + 1:] for s in seqs):
+                later.add(a)
+    f['tryChangeNextStage'] = one(later, 'called by all three after the constructor')
+    # moving an actor: the 4-instruction wrappers of its pose keeper's virtual functions
+    f['updatePoseTrans'] = one(set(pose_wrappers(code)), 'loading the pose keeper (+0x%x) and branching to its +0x%x'
+                               % (POSE_KEEPER, POSE_TRANS_SLOT))
+    f['setVelocityZero'] = one(set(velocity_zeroers(code)), 'zeroing the vector the pose keeper\'s +0x%x returns' % POSE_VELOCITY_SLOT)
+    return f
+
+
+def pose_wrappers(code):
+    """Functions `ldr x0, [x0, #POSE_KEEPER]; ldr x8, [x0]; ldr xN, [x8, #POSE_TRANS_SLOT]; br xN`."""
+    out = []
+    for a, s in code.size.items():
+        if s != 16:
+            continue
+        w = code_words(code.m, a, 16)
+        if (w[0] & 0xffc003ff == 0xf9400000 and ((w[0] >> 10) & 0xfff) * 8 == POSE_KEEPER and w[1] == 0xf9400008
+                and w[2] & 0xffc003e0 == 0xf9400100 and ((w[2] >> 10) & 0xfff) * 8 == POSE_TRANS_SLOT
+                and w[3] & 0xfffffc1f == 0xd61f0000 and (w[3] >> 5) & 31 == w[2] & 31):
+            out.append(a)
+    return out
+
+
+def velocity_zeroers(code):
+    """Functions that load the pose keeper (x0 = [x0 + POSE_KEEPER]), call its function at POSE_VELOCITY_SLOT and store
+    zero to the 12 bytes it returns: `ldr x8, [x0]; ldr x8, [x8, #slot]; blr x8; str xzr, [x0]; str wzr, [x0, #8]`."""
+    keeper = 0xf9400000 | ((POSE_KEEPER // 8) << 10)                       # ldr x0, [x0, #POSE_KEEPER]
+    slot = 0xf9400108 | ((POSE_VELOCITY_SLOT // 8) << 10)                   # ldr x8, [x8, #POSE_VELOCITY_SLOT]
+    want = [keeper, 0xf9400008, slot, 0xd63f0100, 0xf900001f, 0xb900081f]
+    out = []
+    for a, s in code.size.items():
+        if 24 <= s <= 64:
+            w = code_words(code.m, a, s)
+            if any(w[i:i + 6] == want for i in range(len(w) - 5)):
+                out.append(a)
+    return out
+
+
+def find_sampler_sort(code):
+    """GAME_SYMS_OPTIONAL from what they do: the NVN loader stores the function the driver gives for
+    "nvnSamplerPoolRegisterSampler" in a global, through a pointer slot it loads right after it asks for it;
+    registerSampler_ is the one other function that loads that slot and also loads a pointer to a function of main (the
+    key comparison), and the sort is the first function it calls after that load, which must call nothing directly
+    (it calls the comparison through its pointer). The sort's algorithm itself is checked at run time with
+    SMO_FAST_CHECK=1 (runtime/game/smo_fast.c). Returns ({name: address}, None) or ({}, why not)."""
+    sort_n, reg_n, cmp_n = GAME_SYMS_OPTIONAL
+    loader = code.string_func('nvnSamplerPoolRegisterSampler')
+    if not loader:
+        return {}, 'not exactly one function loads "nvnSamplerPoolRegisterSampler"'
+    at = code.forms_in(loader, 'nvnSamplerPoolRegisterSampler')[0]
+    near = sorted((p, s) for s, places in code.slot_loads.items() for p in places if at < p < at + 40)
+    if not near:
+        return {}, 'the NVN loader stores "nvnSamplerPoolRegisterSampler" nowhere it loads'
+    found = set()
+    for f in code.slot_users(near[0][1]) - {loader}:
+        sites = code.call_sites(f)
+        for place, cmp_ in code.pointer_loads(f):
+            later = [t for p, t in sites if p > place]
+            if later:
+                found.add((f, cmp_, later[0]))
+    if len(found) != 1:
+        return {}, '%d functions using the sampler pool\'s registration load a function pointer and call' % len(found)
+    reg, cmp_, sort = found.pop()
+    words = code_words(code.m, sort, code.size.get(sort, 0))
+    if not words or any(w & 0xfc000000 == 0x94000000 for w in words) or not any(w & 0xfffffc1f == 0xd63f0000 for w in words):
+        return {}, 'the function called after the load does not call only through pointers'
+    return {sort_n: sort, reg_n: reg, cmp_n: cmp_}, None
 
 
 def layout(m):
@@ -336,25 +370,24 @@ def main():
         if n not in defined:
             raise SystemExit('main.elf does not define %s' % n)
         h.append('#define GAME_SYM_%s (GUEST_BASE + 0x%xULL)' % (n, defined[n]))
+    code = Code(main_m)
     missing = [n for n in GAME_SYMS_OPTIONAL if n not in defined]
-    matched, why = find_sampler_sort(main_m) if missing else ({}, None)
+    matched, why = find_sampler_sort(code) if missing else ({}, None)
     for n in GAME_SYMS_OPTIONAL:
         if n in defined:
             h.append('#define GAME_SYM_%s (GUEST_BASE + 0x%xULL)' % (n, defined[n]))
         elif n in matched:
-            h.append('#define GAME_SYM_%s (GUEST_BASE + 0x%xULL)      /* matched with the base executable\'s */'
+            h.append('#define GAME_SYM_%s (GUEST_BASE + 0x%xULL)      /* found by what it does (find_sampler_sort) */'
                      % (n, matched[n]))
         else:
             h.append('#define GAME_SYM_%s 0ULL      /* not in this main.elf */' % n)
-    vsyms = []
-    for cls, n, short in GAME_VSYMS:
-        a, how = find_vsym(main_m, defined, cls, n)
-        vsyms.append('%s %s' % (short, '0x%x (%s)' % (a, how) if a else 'not found: ' + how))
-        h.append('#define GAME_VSYM_%s %s      /* %s */' % (short, '(GUEST_BASE + 0x%xULL)' % a if a else '0ULL', how))
+    found = find_game_functions(code)
+    a, how = found['StageScene::init']
+    vsyms = ['StageScene_init %s' % ('0x%x (%s)' % (a, how) if a else 'not found: ' + how)]
+    h.append('#define GAME_VSYM_StageScene_init %s      /* %s */' % ('(GUEST_BASE + 0x%xULL)' % a if a else '0ULL', how))
     fns = []
-    matcher = FuncMatcher(main_m) if os.path.exists(BASE_MAIN) and any(n not in defined for n, _ in GAME_FUNCS) else None
-    for n, short in GAME_FUNCS:
-        a, how = find_func(main_m, defined, n, matcher)
+    for short in GAME_FN_NAMES:
+        a, how = found[short]
         fns.append('%s %s' % (short, '0x%x (%s)' % (a, how) if a else 'not found: ' + how))
         h.append('#define GAME_FN_%s %s      /* %s */' % (short, '(GUEST_BASE + 0x%xULL)' % a if a else '0ULL', how))
     h += ['', '#define SDK_IMAGE_SIZE_GEN 0x%xULL' % sdk_image_size,
@@ -368,18 +401,18 @@ def main():
     for n, t, b, sh, v, s in sdk_m.symbols():
         if sh and t == 1:
             sdk_objs[n] = (v, s)
-    found = []
+    found_data = []
     for n in imports:
         if n.startswith(('_ZN2nn4util', '_ZN2nn3hid6NpadId', '_ZNK2nn4util')) and n in sdk_objs and 0 < sdk_objs[n][1] <= 1 << 20:
             v, s = sdk_objs[n]
-            found.append((n, sdk_m.d[0x1000 + v:0x1000 + v + s]))
+            found_data.append((n, sdk_m.d[0x1000 + v:0x1000 + v + s]))
     c = ['/* generated by tools/lifter/gen_tables.py from the real sdk module -- do not edit */', '#include "hostrt.h"', '']
-    for k, (n, data) in enumerate(found):
+    for k, (n, data) in enumerate(found_data):
         c.append('static const unsigned char d%d[] = {%s};' % (k, ','.join(str(x) for x in data)))
-    c += ['', 'const SdkData sdk_data[] = {'] + ['  { "%s", d%d, %d },' % (n, k, len(data)) for k, (n, data) in enumerate(found)]
-    if not found:
+    c += ['', 'const SdkData sdk_data[] = {'] + ['  { "%s", d%d, %d },' % (n, k, len(data)) for k, (n, data) in enumerate(found_data)]
+    if not found_data:
         c.append('  { 0, 0, 0 },')
-    c += ['};', 'const int sdk_data_count = %d;' % len(found), '']
+    c += ['};', 'const int sdk_data_count = %d;' % len(found_data), '']
     write('sdkdata.c', '\n'.join(c))
 
     # empty stand-ins, only where tools/lifter/sdklift.py has not written the real files (never overwrite them)
@@ -394,9 +427,9 @@ def main():
                                'const uint64_t sdk_ctors[] = { 0 };\nconst int sdk_ctor_count = 0;\n')
     print('image: file 0x%x, mapped 0x%x, ro end 0x%x, init_array %d entries; sdk mapped 0x%x'
           % (file_image, image_size, ro_end, dt[27] // 8, sdk_image_size))
-    print('imports: %d   sdk data symbols: %d   game symbols: %s' % (len(imports), len(found), ', '.join(GAME_SYMS)))
+    print('imports: %d   sdk data symbols: %d   game symbols: %s' % (len(imports), len(found_data), ', '.join(GAME_SYMS)))
     if matched:
-        print('not in this main.elf, matched with the base executable\'s: %s' % ', '.join(
+        print('not in this main.elf, found by what they do: %s' % ', '.join(
             '%s 0x%x' % (n, matched[n]) for n in GAME_SYMS_OPTIONAL if n in matched))
     elif missing:
         print('not in this main.elf (their fast path stays off: %s): %s' % (why, ', '.join(missing)))

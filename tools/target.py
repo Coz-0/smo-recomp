@@ -3,7 +3,6 @@
 The game is Super Mario Odyssey 1.4.1: the base game with its 1.4.1 update applied. Everything derived from your dump
 goes under build/:
     build/dump/update   the program's modules (ExeFS, ELF conversions) and its control data
-    build/dump/base     the base game's executable, read only for its symbols: they name 1.4.1's stripped functions
     build/<the rest>    romfs, manual, functions, lift, obj, gen, bin, run, ... laid out so that the runtime's paths
                         relative to its exe (..\\romfs, ..\\manual, ..\\userdata) work
 """
@@ -13,7 +12,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION = '1.4.1'                                       # the game version this project builds
 BUILD = os.path.join(REPO, 'build')
 DUMP = os.path.join(BUILD, 'dump', 'update')
-BASE_DUMP = os.path.join(BUILD, 'dump', 'base')
 RUNTIME = os.path.join(REPO, 'runtime')
 # the host runtime's subsystem folders (runtime/<folder>); every one is an include directory of the runtime's code
 RUNTIME_DIRS = ['core', 'libc', 'os', 'fs', 'gfx', 'audio', 'input', 'services', 'game']
@@ -37,11 +35,6 @@ def build(*parts):
 def elf(module):
     """The converted module (main, sdk, subsdk0, rtld) of the program."""
     return os.path.join(DUMP, 'elf', module + '.elf')
-
-
-def base_elf(module):
-    """The converted module of the base game (only its main is used: for its symbols)."""
-    return os.path.join(BASE_DUMP, 'elf', module + '.elf')
 
 
 def dump_version():
