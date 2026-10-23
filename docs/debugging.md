@@ -23,6 +23,11 @@ The end of every log has the counts that tell whether a run was healthy:
   `SMO_SHOT_TO=<frame>` when given), as `frame_<n>.bmp` in `SMO_SHOT_DIR=<folder>` (the folder must exist).
   `SMO_SHOT_PLAY=<n>` saves the n-th play frame (a frame with compute dispatches and more than 120 draws) as
   `play_<n>.bmp`: the same moment of play whatever the loading took.
+- Recording a video: `SMO_SHOT_RANGES=<first>-<last>[/<every>][,...]` saves the frames of several ranges and logs each
+  as `shot: frame <n> audio <sample>`, where that frame falls in the `SMO_AUDIO_WAV` capture, so picture and sound can
+  be put together. A saved frame normally waits for the GPU (about 32 ms); with `SMO_SHOT_ASYNC=1` it is copied on the
+  GPU and written by a thread, and the game keeps its pace (measured: 35 ms per two frames while saving every second
+  one, against 65 ms); a frame that finds no free copy buffer is logged as left out.
 - `SMO_VK_PASSSHOT=<frame>` saves colour target 0 at the end of every render pass of that frame
   (`pass_<n>_<format>.bmp`) and logs every draw of it: programs, blend and depth state, viewport, vertex attributes and
   the texture behind every binding. `SMO_VK_PASSSHOT=<first>-<last>/<step>` does it for several frames
@@ -111,7 +116,7 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_FAST=0` leaves the game's own code where `runtime/game/smo_fast.c` puts host code in its place (the sort of the
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
-  by matching the base executable's (in `build\dump\base`), and the log says so when the fast path stays off.
+  by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
@@ -211,7 +216,7 @@ The end of every log has the counts that tell whether a run was healthy:
   and the start point (the id of a placed start, e.g. a checkpoint flag's `PlayerRestartPos` link; default: the stage's
   default start), and hands it to `GameDataFunction::tryChangeNextStage`; the scene then ends and the game loads the
   stage, a kingdom's home stage with its kingdom. The game's `main` has no symbols for the two functions: they are
-  matched with the base executable's (`GAME_FN_*` in `build\gen\image.h`, see `find_func` in
+  found by what they do (`GAME_FN_*` in `build\gen\image.h`, see `find_game_functions` in
   `tools\lifter\gen_tables.py`). When the
   stage's `StageScene::init` runs, the input sequence starts again: `SMO_SEQ_<n>` for the n-th stage of the list
   (counted from 1), else `SMO_STAGE_SEQ`, else `SMO_SEQ`. The log marks each stage: `stage list: frame F: stage n of N
@@ -264,6 +269,8 @@ The end of every log has the counts that tell whether a run was healthy:
   the Help pages without showing them (neither in the game window nor in the browser). Nothing is written next to the
   manual: the game window adds the console browser's `window.nx` to the page, a web browser gets a copy in
   `%TEMP%\smo-recomp-help`.
+- `SMO_VK_RTLOG=1` logs every new size of image that can be a render target, once: the game's size, format, target,
+  layers, samples and mip levels, and the image's size.
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
   focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
   the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.

@@ -22,6 +22,7 @@ and counted in pad polls (the game polls player 1 once per frame), so it does no
 | `@goto:<x>,<z>[,<r>][/<n>]` | steer the left stick to the world point (x, z) until the player is within r (default 100), at most n polls |
 | `@near:<state prefix>[,<r>][/<n>]` | steer to the nearest actor whose state starts with the prefix until within r (default 250); the player then faces it |
 | `@at:<x>,<y>,<z>[,<r>]` | wait until the player is within r (default 300) of the point, e.g. where a new stage puts him |
+| `@warp:<x>,<y>,<z>` | test only: move the player to the point (the game's own `al::updatePoseTrans`, as when another actor moves him), for a test whose way there is not scripted |
 | `@chase:<state prefix>[,<r>]/<n>` | for n polls, follow that actor, standing still within r (for exploring) |
 | `@draws:<lo>-<hi>[/<n>]` | wait until n frames in a row had between lo and hi draw calls (a screen recognised by its draw count) |
 | `@until:<lo>-<hi>[/<n>]:<keys>/<p>` | press the keys every p polls until the draw count is in that range |

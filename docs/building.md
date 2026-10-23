@@ -37,12 +37,11 @@ converts and reads them.
 ## What to dump
 
 Dump the game from your own console with a homebrew dumping tool that writes decrypted files, such as nxdumptool. The
-build needs the game as the 1.4.1 update leaves it, plus the base game's executable, in one folder laid out like this:
+build needs the game as the 1.4.1 update leaves it, in one folder laid out like this:
 
 ```
 <your dump folder>\
   exefs\          the program's ExeFS with the 1.4.1 update: main, main.npdm, sdk, rtld, subsdk0
-  exefs-1.0.0\    the base game's ExeFS, or only its main (exefs-base\ is accepted too)
   romfs\          the game's RomFS with the 1.4.1 update applied
   control.nacp    the update's control data
   manual\         optional: the Help pages (the RomFS of the game's HTML document content: html-document\...)
@@ -50,11 +49,12 @@ build needs the game as the 1.4.1 update leaves it, plus the base game's executa
                   and the others) or as .ttf files of the same names
 ```
 
-- **Why the base game's `main`:** the update's executable keeps almost no symbols. The base game's does, and the few
-  functions the runtime needs by name are found in the update's by matching them with the base game's.
-- **Checks:** the import reads the program id from `main.npdm`, the NintendoSDK version the modules were built with
-  (7.3.2 for 1.4.1, 3.5.1 for the base game) and the display version in `control.nacp` (1.4.1), and looks for the
-  RomFS's own folders. A missing or wrong piece is named.
+- **One version:** nothing of the base game (1.0.0) is read. The 1.4.1 executable keeps almost no symbols; the few
+  game functions the runtime needs are found in it by what they are and do (`tools/lifter/gen_tables.py`). A dump
+  folder laid out for older builds may still hold the base game's ExeFS as `exefs-1.0.0\`: it is ignored.
+- **Checks:** the import reads the program id from `main.npdm`, the NintendoSDK version `main` was built with (7.3.2)
+  and the display version in `control.nacp` (1.4.1), and looks for the RomFS's own folders. A missing or wrong piece is
+  named.
 - **Read in place:** `build\romfs` and `build\manual` become directory junctions to your dump's folders (the RomFS is
   about 5.7 GB), so keep the dump where it is. Only the executable modules are converted, into `build\dump`.
 - **Fonts:** the game draws with the console's shared fonts in one place met so far, the map screen's legend and its

@@ -57,7 +57,7 @@ something was not checked, it says so.
 
 - Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
   `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* dump: the 1.4.1 program, the base game's executable, the RomFS with the update applied
+- Your own *Super Mario Odyssey* dump at version 1.4.1: the program with the update, the RomFS with the update applied
   and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
   the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
