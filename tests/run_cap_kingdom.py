@@ -1,6 +1,7 @@
 """The scripted Cap Kingdom run: a new game from an empty save to Mario's first capture, checked against the game's state.
 
     python tests/run_cap_kingdom.py <run name> [--seconds 600] [--cache <stage cache dir>] [--shots N] [--check-only]
+                                   [--exe <test copy name>] [--env NAME=VALUE ...]
 
 Plays tests/cap_kingdom.seq through scripts/run.py with a new, empty save folder (build/run/<run name>_save; the name must
 be new), then reads build/run/<run name>.log and prints one line per checkpoint with the frame it was reached at, the
@@ -10,7 +11,8 @@ Checkpoints are changes of the game's own state machines (SMO_NERVELOG, runtime/
 pictures; --shots N also saves a frame every N frames to build/run/<run name>_shots for looking at.
 The run ends when the sequence is done (SMO_SEQ_EXIT=1), a second after the capture's message is closed; --seconds is
 only the limit for a run that gets stuck. ABOUT_MINUTES with a warm stage cache (--cache, or the default build/cache/vk
-after a first run); a cold cache needs more time for compiling shaders, so give it a larger --seconds.
+after a first run); a cold cache needs more time for compiling shaders, so give it a larger --seconds. Runs side by side need
+their own --exe names (the test copy of the game); --env passes more switches, e.g. SMO_FAST_CHECK=1.
 """
 import argparse
 import os
@@ -51,17 +53,21 @@ def main():
     ap.add_argument('--cache', help='SMO_VK_CACHE: a stage cache folder from an earlier run')
     ap.add_argument('--shots', type=int, default=0)
     ap.add_argument('--check-only', action='store_true', help='only read an existing log')
+    ap.add_argument('--exe', default='smo_test.exe', help="the test copy's name (runs side by side need different ones)")
+    ap.add_argument('--env', action='append', default=[], help='more switches for the run (scripts/run.py --env)')
     a = ap.parse_args()
     log = os.path.join(RUN, a.name + '.log')
     if not a.check_only:
         save = os.path.join(RUN, a.name + '_save')
         if os.path.exists(save):
             raise SystemExit('%s exists: the run must start from an empty save, choose another run name' % save)
-        cmd = [sys.executable, os.path.join(REPO, 'scripts', 'run.py'), a.name, '--seconds', str(a.seconds),
+        cmd = [sys.executable, os.path.join(REPO, 'scripts', 'run.py'), a.name, '--seconds', str(a.seconds), '--exe', a.exe,
                '--seq', os.path.join(REPO, 'tests', 'cap_kingdom.seq'), '--userdata', save,
                '--env', 'SMO_NERVELOG=' + NERVELOG, '--env', 'SMO_ACTORPOS=60', '--env', 'SMO_SEQ_EXIT=1']
         if a.cache:
             cmd += ['--env', 'SMO_VK_CACHE=' + a.cache]
+        for e in a.env:
+            cmd += ['--env', e]
         if a.shots:
             shots = os.path.join(RUN, a.name + '_shots')
             os.makedirs(shots, exist_ok=True)
