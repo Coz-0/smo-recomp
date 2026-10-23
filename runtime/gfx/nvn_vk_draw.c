@@ -538,7 +538,7 @@ struct VTex {
     VView *views; VTex *next, *prev;
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
- * A texture of the screen class (2D, one layer, attachable, the game's size exactly 1920x1080 >> k, k = 0..6) gets an image
+ * A texture of the screen class (2D, one layer, attachable, the game's size about 16:9: rs_screen_class) gets an image
  * of round(size * scale); everything the game says in ITS pixels about such an image is converted where it is used:
  * viewport, scissor, clear rectangles, copy / blit / resolve / downsample regions, uploads and read-backs (through a
  * temporary image of the game's size), the crop of the present. The size table of the shaders (c2) and the regions the game
@@ -557,12 +557,16 @@ static float rs_scale(void) {
     return g_rs;
 }
 #define RS_ON (rs_scale() != 1.0f)
-static int rs_screen_class(int w, int h) { for (int k = 0; k < 7; k++) if (w == 1920 >> k && h == 1080 >> k) return 1; return 0; }
+/* The game's screen-sized targets (measured with SMO_VK_RTLOG): its window textures (1600 x 900), the title's and every stage's
+ * scene buffers (1600 x 900, 1440 x 810 in Cascade Kingdom, ...) and their halvings down to 11 x 6 are all about 16:9; every
+ * other target it makes is square, 2:1, 4:1 or upright (shadow and cube maps, look-up tables, icons). So the screen class is
+ * a width 1.65 to 1.9 times the height (the halvings' rounding makes 12 x 7 and 11 x 6). */
+static int rs_screen_class(int w, int h) { return w >= 8 && h >= 4 && w * 100 >= h * 165 && w * 100 <= h * 190; }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s + 0.5f); return r < 0 ? 0 : r > max ? max : r; }
 /* the textures of the game's window (nvn_gl.c win_initialize keeps the list; also noted here at every present).
  * SMO_VK_UI_NATIVE=1 (resolution scale, experiment): a window texture is NOT scaled, so what the game draws straight into it
- * (its last full-screen pass and the 2D interface after it) is drawn at the game's 1920x1080. */
+ * (its last full-screen pass and the 2D interface after it) is drawn at the game's own size (1600 x 900). */
 int nvn_front_tex_is_window(const Tex *t);
 static Tex *g_wintex[8];
 static LONG64 g_rs_mixed;
@@ -917,7 +921,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         vt->levels = nvn_front_tex_levels(t); vt->layers = nvn_front_tex_layers(t); vt->samples = b->samples > 1 ? b->samples : 1; vt->is3d = b->target == 2;
         if (b->target == 0 || b->target == 3) { ci.imageType = VK_IMAGE_TYPE_1D; vt->h = 1; if (b->target == 3) vt->layers = b->height > 0 && b->depth <= 1 ? b->height : vt->layers; }
         else ci.imageType = vt->is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        if (RS_ON && (b->target == 1 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
+        if (RS_ON && (b->target == 1 || b->target == 4 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
             (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)))) {      /* a screen-class target */
             int gw = vt->w, gh = vt->h, lv = 1;
             vt->w = (int)((float)gw * rs_scale() + 0.5f); vt->h = (int)((float)gh * rs_scale() + 0.5f);
@@ -3620,8 +3624,8 @@ static void vkd_init(void) {
     prewarm_start();
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SMO_VK_DEBUG=1)");
-    if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at %d x %d instead of 1920 x 1080; fragment stages are another translation\n",
-                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : "graphics.ini", (int)(1920.0f * rs_scale() + 0.5f), (int)(1080.0f * rs_scale() + 0.5f));
+    if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at that scale (the window's picture %d x %d instead of 1600 x 900); fragment stages are another translation\n",
+                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : "graphics.ini", (int)(1600.0f * rs_scale() + 0.5f), (int)(900.0f * rs_scale() + 0.5f));
     fflush(stdout);
 }
 static int frstat_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }

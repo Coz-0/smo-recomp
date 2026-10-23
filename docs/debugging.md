@@ -270,7 +270,13 @@ The end of every log has the counts that tell whether a run was healthy:
   manual: the game window adds the console browser's `window.nx` to the page, a web browser gets a copy in
   `%TEMP%\smo-recomp-help`.
 - `SMO_VK_RTLOG=1` logs every new size of image that can be a render target, once: the game's size, format, target,
-  layers, samples and mip levels, and the image's size.
+  layers, samples and mip levels, and the image's size; at exit, `nvn_vk_rt:` lines give every render-target size a
+  pass began with, its formats and how many passes used it.
+- Internal resolution scale (`resolution_scale` in `graphics.ini`, 0.25 to 1.0, Vulkan only; `SMO_VK_SCALE=<scale>`
+  wins for a run): the game's screen-sized targets (about 16:9, `rs_screen_class` in `nvn_vk_draw.c`) are made at that
+  scale. The log's `nvn_vk_scale:` lines give the scale and the window picture's size at start, and at exit the images
+  made scaled, the fragment stages translated for it and the uploads, read-backs and copies that touched a scaled
+  image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size.
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
   focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
   the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.
