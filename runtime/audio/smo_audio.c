@@ -163,6 +163,7 @@ static LONG64 g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
 static uint32_t g_sink_peak;
 static FILE *g_wav;                               /* SMO_AUDIO_WAV=<file>: what goes to the device, as a WAV file (header completed at exit) */
 static uint32_t g_wav_frames;
+uint32_t smo_audio_wav_frames(void) { return g_wav_frames; }      /* nvn_vk_draw.c: where in the WAV a saved frame falls */
 static void wav_header(void) {
     uint32_t data = g_wav_frames * 4, riff = 36 + data, fmt = 16, rate = 48000, bps = 48000 * 4;
     uint16_t pcm = 1, ch = 2, align = 4, bits = 16;

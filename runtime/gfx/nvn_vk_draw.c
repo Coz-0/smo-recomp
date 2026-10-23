@@ -932,6 +932,19 @@ static VTex *vt_get2(Tex *t, int sync) {
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         int can_color = vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && f.kind != 4 && !vt->decode && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
         if (can_color) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        {   /* SMO_VK_RTLOG=1 (debug aid): every new size of image that can be a target, once (game size, format, target, layers, samples) */
+            static int on = -1; static struct { int w, h, fmt, target, layers; } seen[256]; static int nseen;
+            if (on < 0) on = getenv("SMO_VK_RTLOG") ? 1 : 0;
+            if (on && (can_color || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT)) {
+                int k = 0;
+                while (k < nseen && !(seen[k].w == b->width && seen[k].h == b->height && seen[k].fmt == (int)b->format && seen[k].target == b->target && seen[k].layers == vt->layers)) k++;
+                if (k == nseen && nseen < 256) {
+                    seen[nseen].w = b->width; seen[nseen].h = b->height; seen[nseen].fmt = (int)b->format; seen[nseen].target = b->target; seen[nseen++].layers = vt->layers;
+                    printf("nvn_vk_rtlog: frame %lld: target-capable image %d x %d format 0x%x target %d layers %d samples %d levels %d (image %d x %d%s)\n", (long long)g_cur_frame,
+                           b->width, b->height, b->format, b->target, vt->layers, vt->samples, vt->levels, vt->w, vt->h, vt->rs ? ", scaled" : "");
+                }
+            }
+        }
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         if ((b->flags & 4) && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !vt->decode && !vt->expand && vt->samples == 1 && !vt->rs && vt->bw == 1 && vt->bh == 1 &&
@@ -3210,6 +3223,100 @@ static void mem_report(LONG64 frame) {
     fflush(stdout);
 }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
+/* SMO_SHOT_ASYNC=1 with SMO_SHOT_RANGES (recording a video): a frame to save is copied on the GPU into a buffer the CPU
+ * can read, in a submission of its own that nothing waits for; once the renderer has seen it finish (R.done), a thread
+ * writes the BMP. The game keeps its pace (the synchronous save waits for the GPU and costs about 32 ms a frame). A frame
+ * that finds all ASHOT_N buffers busy is left out ("shot: frame <n> left out"). */
+#define ASHOT_N 8
+static struct { VkBuffer buf; VMem mem; uint64_t size, serial; volatile LONG state; int w, h, bgr; char path[300]; } g_ashot[ASHOT_N];
+static HANDLE g_ashot_ev;
+static DWORD WINAPI ashot_thread(LPVOID arg) {                 /* state 2 (copied) -> BMP file -> state 0 (free) */
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(g_ashot_ev, INFINITE);
+        for (int i = 0; i < ASHOT_N; i++) {
+            if (g_ashot[i].state != 2) continue;
+            int w = g_ashot[i].w, h = g_ashot[i].h, bgr = g_ashot[i].bgr;
+            uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, fsize = 54 + row * (uint32_t)h, v;
+            uint8_t head[54] = {'B', 'M'}, *img = malloc((size_t)row * h);
+            FILE *f = img ? fopen(g_ashot[i].path, "wb") : NULL;
+            if (f) {
+                memcpy(head + 2, &fsize, 4); v = 54; memcpy(head + 10, &v, 4); v = 40; memcpy(head + 14, &v, 4); memcpy(head + 18, &w, 4); memcpy(head + 22, &h, 4); head[26] = 1; head[28] = 24;
+                for (int y = 0; y < h; y++) {
+                    const uint8_t *s = (const uint8_t *)g_ashot[i].mem.map + (size_t)(h - 1 - y) * w * 4;
+                    uint8_t *d = img + (size_t)y * row;
+                    for (int x = 0; x < w; x++) { d[x * 3] = s[x * 4 + (bgr ? 0 : 2)]; d[x * 3 + 1] = s[x * 4 + 1]; d[x * 3 + 2] = s[x * 4 + (bgr ? 2 : 0)]; }
+                }
+                fwrite(head, 1, 54, f); fwrite(img, 1, (size_t)row * h, f); fclose(f);
+            }
+            free(img);
+            InterlockedExchange(&g_ashot[i].state, 0);
+        }
+    }
+    return 0;
+}
+static int ashot_take(VTex *vt, const char *path) {             /* 1: the copy is on its way */
+    int w = vt->w, h = vt->h, i;
+    uint64_t size = (uint64_t)w * h * 4;
+    if (vt->bpb != 4 || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    for (i = 0; i < ASHOT_N && g_ashot[i].state != 0; i++) {}
+    if (i == ASHOT_N) return 0;
+    if (!g_ashot_ev) { g_ashot_ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, ashot_thread, NULL, 0, NULL)); }
+    if (g_ashot[i].size != size) {                              /* CPU-cached memory when there is some: the thread reads it */
+        if (g_ashot[i].buf) { vkDestroyBuffer(V.device, g_ashot[i].buf, NULL); vmem_free(g_ashot[i].mem); }
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        VkMemoryRequirements rq;
+        VkFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        bi.size = size; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VKC(vkCreateBuffer(V.device, &bi, NULL, &g_ashot[i].buf));
+        vkGetBufferMemoryRequirements(V.device, g_ashot[i].buf, &rq);
+        for (uint32_t t = 0; t < D.mp.memoryTypeCount; t++)
+            if ((rq.memoryTypeBits >> t & 1) && (D.mp.memoryTypes[t].propertyFlags & (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { want |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT; break; }
+        g_ashot[i].mem = vmem_alloc(rq, want, 1);
+        VKC(vkBindBufferMemory(V.device, g_ashot[i].buf, g_ashot[i].mem.mem, g_ashot[i].mem.off));
+        g_ashot[i].size = size;
+    }
+    VkBufferImageCopy c;
+    memset(&c, 0, sizeof c);
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
+    pass_end(); cmd_begin();
+    VkImageLayout was = vt->layout;
+    vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ashot[i].buf, 1, &c);
+    if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
+    g_ashot[i].w = w; g_ashot[i].h = h;
+    g_ashot[i].bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    snprintf(g_ashot[i].path, sizeof g_ashot[i].path, "%s", path);
+    g_ashot[i].serial = cmd_submit(NULL, NULL);
+    InterlockedExchange(&g_ashot[i].state, 1);
+    return 1;
+}
+static void ashot_poll(void) {                                 /* copies the renderer has seen finish -> the thread */
+    int any = 0;
+    for (int i = 0; i < ASHOT_N; i++) if (g_ashot[i].state == 1 && R.done >= g_ashot[i].serial) { InterlockedExchange(&g_ashot[i].state, 2); any = 1; }
+    if (any) SetEvent(g_ashot_ev);
+}
+/* SMO_SHOT_RANGES=<first>-<last>[/<every>][,...] (tests, e.g. recording a video): frames saved as with SMO_SHOT_EVERY in
+ * several ranges, each logged as "shot: frame <n> audio <sample>", the sample of SMO_AUDIO_WAV's capture written by then. */
+static int shot_in_ranges(LONG64 frame, int *any) {
+    static struct { LONG64 lo, hi; int every; } r[32];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        for (const char *p = getenv("SMO_SHOT_RANGES"); p && *p && n < 32; ) {
+            long long lo = 0, hi = 0; int every = 1, used = 0;
+            if (sscanf(p, "%lld-%lld%n", &lo, &hi, &used) < 2) break;
+            p += used;
+            if (*p == '/') { every = atoi(p + 1); if (every < 1) every = 1; while (*p && *p != ',') p++; }
+            r[n].lo = lo; r[n].hi = hi; r[n].every = every; n++;
+            if (*p == ',') p++;
+        }
+    }
+    *any = n > 0;
+    for (int i = 0; i < n; i++) if (frame >= r[i].lo && frame <= r[i].hi && (frame - r[i].lo) % r[i].every == 0) return 1;
+    return 0;
+}
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
@@ -3236,11 +3343,22 @@ static void vk_present2(void *arg, int progress) {
     if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
     pass_end();
     { int step = nvn_front_take_step_shot(); if (step && vt) { char path[300]; const char *dir = getenv("SMO_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp_vk(path, vt); } }
-    if (vt && (frame == shot || (every > 0 && frame >= shot_from && frame <= shot_to && frame % every == 0))) {
+    int ranged = 0, in_range = vt ? shot_in_ranges(frame, &ranged) : 0;
+    static int async = -1;
+    if (async < 0) async = getenv("SMO_SHOT_ASYNC") && atoi(getenv("SMO_SHOT_ASYNC"));
+    if (async) ashot_poll();
+    if (vt && (frame == shot || (every > 0 && frame >= shot_from && frame <= shot_to && frame % every == 0) || in_range)) {
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
+        uint32_t smo_audio_wav_frames(void);
         snprintf(path, sizeof path, "%s%sframe_%lld.bmp", dir ? dir : "", dir ? "/" : "", (long long)frame);
-        save_bmp_vk(path, vt);
+        if (async && in_range) {
+            if (ashot_take(vt, path)) printf("shot: frame %lld audio %u\n", (long long)frame, smo_audio_wav_frames());
+            else printf("shot: frame %lld left out\n", (long long)frame);
+        } else {
+            save_bmp_vk(path, vt);
+            if (ranged) printf("shot: frame %lld audio %u\n", (long long)frame, smo_audio_wav_frames());
+        }
     }
     {   static char at[256] = {1};                    /* SMO_CAPTURE_AT=<frame>[,<frame>...]: the Capture button pressed at those frames (tests) */
         if (at[0] == 1) { const char *e = getenv("SMO_CAPTURE_AT"); snprintf(at, sizeof at, ",%s,", e ? e : ""); }
