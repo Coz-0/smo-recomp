@@ -21,15 +21,15 @@
  *                               @near / @chase steer to an actor found by its nerve (nerve_actor_pos), @at waits for the
  *                               player at a point (nerve_player)
  *   SMO_FUNCTIONS=<path>        the function list (default ..\functions\main_functions.tsv, relative to build\bin)
- *   SMO_START_STAGE=<stage>[:<scenario>]  TEST ONLY: the first stage scene starts that stage (see start_stage_init); the
- *                               one place here that writes game memory
+ *   SMO_START_STAGE=<stage>[:<scenario>]  TEST ONLY: the first stage scene starts that stage (see start_stage_init); it
+ *                               writes game memory, as does the sequence step @warp (player_warp)
  *   SMO_STAGE_LIST=<stage>[:<scenario>[:<start>]],...  TEST ONLY: one stage after another in one run, each changed to by
  *                               the game's own stage change when the input sequence is done (see stage_play_hit)
  *
  * A nerve's name is its mangled nested name without the anonymous namespace, joined with "::"
  * (_ZNK12_GLOBAL__N_135OpeningStageStartDemoNrvWaitStandUp7executeEPN2al11NerveKeeperE -> OpeningStageStartDemoNrvWaitStandUp).
- * Reads game memory only, except for SMO_START_STAGE's one change of a scene's init info and SMO_STAGE_LIST's calls of
- * the game's own stage change. */
+ * Reads game memory only, except for SMO_START_STAGE's one change of a scene's init info, SMO_STAGE_LIST's calls of
+ * the game's own stage change and @warp's of the game's own position setters. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -237,7 +237,8 @@ static void nerve_init(void) {                           /* first indirect call 
     start_stage_init();
     const char *log = getenv("SMO_NERVELOG"), *pos = getenv("SMO_ACTORPOS"), *seq = getenv("SMO_SEQ");
     int want = (log && *log) || (pos && atoi(pos) > 0) || (seq && (strstr(seq, "@nerve:") || strstr(seq, "@until-nerve:") || strstr(seq, "@goto:") ||
-                                                                    strstr(seq, "@near:") || strstr(seq, "@at:") || strstr(seq, "@chase:")));
+                                                                    strstr(seq, "@near:") || strstr(seq, "@at:") || strstr(seq, "@chase:") ||
+                                                                    strstr(seq, "@warp:")));
     if (log) { snprintf(g_filter, sizeof g_filter, "%s", log); g_filter_all = !strcmp(log, "*"); }
     g_pos_every = pos ? atoi(pos) : 0;
     if (pos && strchr(pos, ':')) snprintf(g_pos_prefix, sizeof g_pos_prefix, "%s", strchr(pos, ':') + 1);
@@ -319,6 +320,29 @@ static int filter_match(const char *name) {
     return 0;
 }
 
+/* SMO_SEQ "@warp:<x>,<y>,<z>" (nnhid.c), TEST ONLY: the player is moved to the point by the game's own
+ * al::updatePoseTrans (as PlayerPuppet::setTrans moves a player another actor controls) and al::setVelocityZero, called
+ * when his state machine next runs (nerve_call, on that thread, with its registers put back after). A shortcut for a
+ * test to reach a place whose way there is not scripted; it writes game state. */
+static volatile LONG g_warp_state;                        /* 0 none, 1 asked, 2 done, 3 cannot (not in this build) */
+static __declspec(align(16)) float g_warp_to[4];
+void nerve_warp(float x, float y, float z) { g_warp_to[0] = x; g_warp_to[1] = y; g_warp_to[2] = z; InterlockedExchange(&g_warp_state, 1); }
+int nerve_warp_state(void) { return g_warp_state; }
+static void player_warp(Ctx *c, uint64_t actor) {
+    if (!GAME_FN_updatePoseTrans || !GAME_FN_setVelocityZero) { InterlockedExchange(&g_warp_state, 3); return; }
+    Ctx saved = *c;
+    c->x[0] = actor;
+    c->x[1] = (uint64_t)(uintptr_t)g_warp_to;
+    call_guest(c, GAME_FN_updatePoseTrans);
+    c->x[0] = actor;
+    call_guest(c, GAME_FN_setVelocityZero);
+    *c = saved;
+    printf("nerve: frame %lld: player moved from %.1f %.1f %.1f to %.1f %.1f %.1f (@warp: al::updatePoseTrans)\n", nvn_front_frame_next(),
+           g_player_pos[0], g_player_pos[1], g_player_pos[2], g_warp_to[0], g_warp_to[1], g_warp_to[2]);
+    fflush(stdout);
+    InterlockedExchange(&g_warp_state, 2);
+}
+
 void nerve_call(Ctx *c, uint64_t addr) {
     if (g_nerve_mode < 0) nerve_init();
     if (g_nerve_mode <= 0) return;
@@ -343,7 +367,12 @@ void nerve_call(Ctx *c, uint64_t addr) {
             printf("nerve: frame %lld keeper %llx: %s -> %s\n", frame, (unsigned long long)keeper, old >= 0 ? g_nrv[old].name : "(new)", g_nrv[i].name);
         }
     }
-    if (!strncmp(g_nrv[i].name, "PlayerActorHakoniwaNrv", 22) && actor_trans(keeper, g_player_pos)) { g_player_nrv = i; g_player_actor = rd64(keeper); }
+    int warp = 0;
+    if (!strncmp(g_nrv[i].name, "PlayerActorHakoniwaNrv", 22) && actor_trans(keeper, g_player_pos)) {
+        g_player_nrv = i;
+        g_player_actor = rd64(keeper);
+        warp = g_warp_state == 1;
+    }
     if (g_nrv[i].pos_ok && (g_keep[h].pos_frame < 0 || frame - g_keep[h].pos_frame >= g_pos_every)) {
         float p[3];
         if (actor_trans(keeper, p)) {
@@ -352,6 +381,7 @@ void nerve_call(Ctx *c, uint64_t addr) {
         }
     }
     g_nerve_lock = 0;
+    if (warp) player_warp(c, g_player_actor);             /* the game's calls run outside the lock */
 }
 
 /* the amiibo menu (smo_amiibo.c, nnhid.c): two nerve states watched without the tracker. hostrt.c call_indirect

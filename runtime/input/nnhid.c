@@ -110,6 +110,9 @@ static int script_key(int vk) {
  *                     prefix (its position now), standing still while within r (default 300) of it
  *   @at:<x>,<y>,<z>[,<r>]  SMO: wait until the player is within r (default 300) of the point, e.g. where a new stage
  *                     puts him after a door
+ *   @warp:<x>,<y>,<z>  SMO, TEST ONLY: move the player to the point (smo_nerve.c nerve_warp: the game's own
+ *                     al::updatePoseTrans, from his state machine's next frame), for a test whose way there is not
+ *                     scripted; the step ends when it is done
  *   @near:<prefix>[,<r>][/<n>]  SMO: steer toward that actor until the player is within r (default 250) of it, at most
  *                     n polls (default 1200); the player then faces it, e.g. "@near:FrogNrv 4:V" throws the cap at a frog
  *   @draws:<lo>-<hi>[/<n>]  wait until the presented frames had between lo and hi draw calls for n polls in a
@@ -126,7 +129,7 @@ static int script_key(int vk) {
  * sequence starts again there (SMO_SEQ_<n> for the n-th stage of the list, else SMO_STAGE_SEQ, else SMO_SEQ). */
 #define SEQ_MAX 256
 #define MARK_MAX 128
-enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL, SEQ_GOTO, SEQ_CHASE, SEQ_UNTIL_NERVE, SEQ_NEAR, SEQ_AT };
+enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL, SEQ_GOTO, SEQ_CHASE, SEQ_UNTIL_NERVE, SEQ_NEAR, SEQ_AT, SEQ_WARP };
 static struct { int wait, hold, kind, lo, hi, need; char keys[12]; char mark[96]; float gx, gy, gz, gr; } g_seq[SEQ_MAX];
 static int g_steer_on;                                    /* SEQ_GOTO: the left stick of player 1 is g_steer_x, g_steer_y */
 static float g_steer_x, g_steer_y;
@@ -200,6 +203,12 @@ static void seq_parse(const char *s) {
             g_seq[g_seq_count].kind = SEQ_AT;
             g_seq[g_seq_count].gr = 300;
             if (sscanf(tok + 4, "%f,%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gy, &g_seq[g_seq_count].gz, &g_seq[g_seq_count].gr) < 3) {
+                printf("input sequence: bad step %s\n", tok); break;
+            }
+        } else if (!strncmp(tok, "@warp:", 6)) {
+            g_seq[g_seq_count].kind = SEQ_WARP;
+            g_seq[g_seq_count].wait = 600;
+            if (sscanf(tok + 6, "%f,%f,%f", &g_seq[g_seq_count].gx, &g_seq[g_seq_count].gy, &g_seq[g_seq_count].gz) < 3) {
                 printf("input sequence: bad step %s\n", tok); break;
             }
         } else if (!strncmp(tok, "@chase:", 7) || !strncmp(tok, "@near:", 6)) {
@@ -307,6 +316,22 @@ static void seq_tick(void) {                              /* once per poll of pl
         }
         if (g_seq_run == 0) printf("input sequence: poll %lld step %d: keys %s every %d polls until nerve:%s\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, g_seq[g_seq_index].wait, g_seq[g_seq_index].mark);
         g_seq_holding = g_seq_run % g_seq[g_seq_index].wait < 8;      /* seq_key holds the step's keys while this is set */
+        g_seq_run++;
+        return;
+    }
+    if (g_seq[g_seq_index].kind == SEQ_WARP) {
+        void nerve_warp(float x, float y, float z);       /* smo_nerve.c */
+        int nerve_warp_state(void);
+        long long nvn_front_frame_next(void);
+        if (g_seq_run == 0) nerve_warp(g_seq[g_seq_index].gx, g_seq[g_seq_index].gy, g_seq[g_seq_index].gz);
+        int st = nerve_warp_state();
+        if (st >= 2 || g_seq_run >= g_seq[g_seq_index].wait) {
+            printf("input sequence: poll %lld step %d: warp to %.0f %.0f %.0f %s after %d polls (frame %lld)\n", (long long)g_seq_polls, g_seq_index,
+                   g_seq[g_seq_index].gx, g_seq[g_seq_index].gy, g_seq[g_seq_index].gz,
+                   st == 2 ? "done" : st == 3 ? "NOT DONE: not in this build" : "GAVE UP (no player)", g_seq_run, nvn_front_frame_next());
+            seq_begin(g_seq_index + 1);
+            return;
+        }
         g_seq_run++;
         return;
     }
