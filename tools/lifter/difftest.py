@@ -12,6 +12,11 @@ state: once by Unicorn, once by the C code recomp.py generates. Final registers,
     python tools/lifter/difftest.py all      sample + gen + build + check
 Working files live in build/difftest/.
 
+Without a dump (macOS port, docs/macos-port.md): RECOMP_ELF=none DIFFTEST_MODULES=macho:<arm64 library>[,macho:...]
+samples the code section of arm64 macOS libraries instead. They are compiled for newer cores than the console's (atomics, rcpc, ...):
+from them only words the lifter translates are kept (a word it turns into the console's undefined-instruction trap is
+left out, as Unicorn may run it), so they test what the lifter translates, not what it refuses.
+
 Test kinds (column `kind`):
   straight  data processing, loads/stores, FP/SIMD: registers + NZCV + a memory window must match (ssbu-recomp's test)
   special   FP instructions again from states made of NaN / signed zero / subnormal / half-tie operands (ssbu-recomp)
@@ -41,14 +46,17 @@ WORK = T.build('difftest')
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(recomp._REPO, 'runtime', 'core')
 LLVM = os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0')
-HOST_EXE = os.environ.get('DIFFTEST_EXE') or os.path.join(WORK, 'difftest.exe')
+MAC = sys.platform == 'darwin'
+HOST_EXE = os.environ.get('DIFFTEST_EXE') or os.path.join(WORK, 'difftest' if MAC else 'difftest.exe')
 
-REGION, REGION_SIZE = 0x7200000000, 0x400000
+# the test region, as difftest_host.c maps it: on macOS 0x10_0000_0000 higher, as the guest layout (tools/target.py)
+REGION, REGION_SIZE = 0x7200000000 + T.LAYOUT_SHIFT, 0x400000
 CODE, DATA = REGION + 0x200000, REGION + 0x300000
 WIN_LO, WIN_HI = DATA - 0x1000, DATA + 0x12000
 M64 = (1 << 64) - 1
 PER_SHAPE = 3
 COND_BRANCH = ('b.', 'cbz', 'cbnz', 'tbz', 'tbnz')
+TRAP_WORDS = [0xe7ffdefe, 0x00000000]     # sead's Halt / DebugBreak word (see recomp.py) and UDF #0: undefined on the A57
 
 
 class Rng:
@@ -160,6 +168,9 @@ def module_words(spec):
     """Every instruction word inside the listed functions of a module of the dump. spec "sdk:lifted" keeps only the
     functions sdklift.py lifted (the SDK code that runs); plain "sdk" would take all of them."""
     module, _, only = spec.partition(':')
+    if module == 'macho':
+        yield from macho_words(only)
+        return
     keep = None
     if only == 'lifted':
         gen = T.build('gen', 'sdklift_gen.c')
@@ -183,16 +194,41 @@ def cmd_sample():
     seen = set()
     shapes = collections.defaultdict(list)
     per_module = collections.Counter()
+    fn = None
+    refused, refused_mn = collections.Counter(), collections.Counter()
     for module in os.environ.get('DIFFTEST_MODULES', 'main,sdk:lifted').split(','):
+        macho = module.startswith('macho:')
         for w in module_words(module):
             if w in seen:
                 continue
             seen.add(w)
             key = shape_key(md, w)
+            if len(shapes.get(key, ())) >= PER_SHAPE:
+                continue
+            if macho:                                     # only what the lifter translates (see the top of the file)
+                if fn is None:
+                    env = recomp.Env()
+                    env.imports = set()
+                    fn = recomp.Fn(CODE - 0x200000, CODE + 0x200000, env)
+                try:
+                    stmt = fn.lift(w, CODE)
+                except recomp.Unimpl:
+                    refused['untranslated'] += 1
+                    refused_mn[key.split()[0]] += 1
+                    continue
+                if stmt.startswith('guest_trap("undefined instruction"'):
+                    refused['undefined on the console'] += 1
+                    refused_mn[key.split()[0]] += 1
+                    continue
             if key not in shapes:
-                per_module[module] += 1
-            if len(shapes[key]) < PER_SHAPE:
-                shapes[key].append(w)
+                per_module[module.rpartition('/')[2]] += 1
+            shapes[key].append(w)
+    if fn is not None:                                    # macOS sources give no trap words: two known ones
+        for w in TRAP_WORDS:
+            shapes[shape_key(md, w)].append(w)
+    if refused:
+        print('words of macOS libraries left out: %s' % ', '.join('%s %d' % kv for kv in sorted(refused.items())))
+        print('  by mnemonic: %s' % ', '.join('%s %d' % kv for kv in refused_mn.most_common()))
     json.dump(shapes, open('samples.json', 'w'))
     print('shapes: %d (%s)   sample words: %d   distinct words: %d'
           % (len(shapes), ', '.join('first seen in %s: %d' % kv for kv in per_module.items()),
@@ -221,7 +257,7 @@ def classify(fn, w, key):
         if not recomp.bits(w, 23, 23):                    # o2 = 0: exclusive (LDXR / STXR family)
             return None, 'exclusive access (the single-threaded reference cannot model the monitor)'
         # o2 = 1: LDAR / STLR, ordered but not exclusive: an ordinary load/store for a single thread -> tested
-    if any(t in stmt for t in ('goto', 'return', 'call_indirect', 'guest_', 'f_7')):
+    if any(t in stmt for t in ('goto', 'return', 'call_indirect', 'guest_', 'f_7', 'f_8')):     # f_8...: macOS layout
         return None, 'leaves straight-line code'
     return 'straight', stmt
 
@@ -297,10 +333,42 @@ def cmd_gen():
         print('  UNTRANSLATED %08x %s (%s)' % (w, key, why))
 
 
-def cmd_build():
-    clang = os.path.join(LLVM, 'bin', 'clang.exe')
+def macho_words(path):
+    """Every instruction word of the __TEXT,__text section of a thin arm64 Mach-O file (a macOS library)."""
+    data = open(path, 'rb').read()
+    magic, cputype, _, _, ncmds, _, _, _ = struct.unpack_from('<IiiIIIII', data, 0)
+    if magic != 0xfeedfacf or cputype != 0x0100000c:
+        sys.exit('%s: not a thin arm64 Mach-O file (lipo -thin arm64 makes one)' % path)
+    at = 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', data, at)
+        if cmd == 0x19:                                   # LC_SEGMENT_64
+            nsects = struct.unpack_from('<I', data, at + 64)[0]
+            for k in range(nsects):
+                s = at + 72 + 80 * k
+                sect, seg = data[s:s + 16].rstrip(b'\0'), data[s + 16:s + 32].rstrip(b'\0')
+                if seg == b'__TEXT' and sect == b'__text':
+                    sz, off = struct.unpack_from('<Q', data, s + 40)[0], struct.unpack_from('<I', data, s + 48)[0]
+                    for a in range(off, off + sz - 3, 4):
+                        yield struct.unpack_from('<I', data, a)[0]
+                    return
+        at += size
+    sys.exit('%s: no __TEXT,__text section' % path)
+
+
+def host_build_cmd(gen_c, out):
+    """The command that builds the host half from a generated file (difftest_mutation.py builds its mutant with it)."""
     host = os.path.join(HERE, 'difftest_host.c')
-    cmd = [clang, '-O0', '-w', '-fno-strict-aliasing', '-I', RUNTIME, 'difftest_gen.c', host, '-o', HOST_EXE]
+    if MAC:                                               # Apple clang; the Win32 calls of the harness from the shim
+        compat = os.path.join(recomp._REPO, 'runtime', 'compat')
+        return ['clang', '-O0', '-w', '-fno-strict-aliasing', '-I', RUNTIME, '-I', compat, gen_c, host,
+                os.path.join(compat, 'win32_posix.c'), '-framework', 'CoreFoundation', '-framework', 'AudioToolbox',
+                '-framework', 'CoreGraphics', '-o', out]
+    return [os.path.join(LLVM, 'bin', 'clang.exe'), '-O0', '-w', '-fno-strict-aliasing', '-I', RUNTIME, gen_c, host, '-o', out]
+
+
+def cmd_build():
+    cmd = host_build_cmd('difftest_gen.c', HOST_EXE)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stdout[-3000:], r.stderr[-3000:])

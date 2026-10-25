@@ -30,7 +30,10 @@ FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.
 BASE = int(os.environ.get('RECOMP_BASE', hex(_T.GUEST_BASE)), 16)
 FILE_OFF = 0x1000
 
-IMG = open(ELF, 'rb').read()
+# RECOMP_ELF=none: no module (tools/lifter/difftest.py with DIFFTEST_MODULES=macho:..., run without a dump): Fn.lift of
+# single words works, anything that reads the image does not
+NO_ELF = ELF == 'none'
+IMG = b'' if NO_ELF else open(ELF, 'rb').read()
 
 
 def _elf_layout(img):
@@ -50,7 +53,7 @@ def _elf_layout(img):
     return sec, dt
 
 
-_SEC, _DT = _elf_layout(IMG)
+_SEC, _DT = ({'.text': (0, 0)}, {5: 0, 6: 0, 7: 0, 8: 0}) if NO_ELF else _elf_layout(IMG)
 TEXT_SIZE = _SEC['.text'][1]
 RELA, RELASZ = _DT[7], _DT[8]
 JMPREL, PLTRELSZ = _DT.get(23, 0), _DT.get(2, 0)
