@@ -17,6 +17,13 @@
 #include <mach-o/dyld.h>
 #include <crt_externs.h>
 #include <os/os_sync_wait_on_address.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <fnmatch.h>
+#include <signal.h>
+#include <copyfile.h>
+#include <sys/stat.h>
+#include <sys/file.h>
 
 /* ---------------------------------------------------------------- C runtime */
 int __argc;
@@ -77,6 +84,27 @@ static int res_find(uintptr_t a) {
     return -1;
 }
 
+#define MAX_WIN 8
+static struct { uintptr_t base; size_t size; } g_win[MAX_WIN];
+static int g_nwin;
+int recomp_reserve_window(uint64_t base, uint64_t size) {
+    if (g_nwin == MAX_WIN) return 0;
+    size = page_up(size);
+    void *p = mmap((void *)(uintptr_t)base, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    if (p != (void *)(uintptr_t)base) { munmap(p, size); return 0; }
+    g_win[g_nwin].base = (uintptr_t)base; g_win[g_nwin].size = size; g_nwin++;
+    return 1;
+}
+static int in_window(uintptr_t a, size_t n) {
+    for (int i = 0; i < g_nwin; i++) if (a >= g_win[i].base && a + n <= g_win[i].base + g_win[i].size) return 1;
+    return 0;
+}
+static int res_overlaps(uintptr_t a, size_t n) {
+    for (int i = 0; i < g_nres; i++) if (a < g_res[i].base + g_res[i].size && g_res[i].base < a + n) return 1;
+    return 0;
+}
+
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect) {
     if (!size) return NULL;
     if (!(type & MEM_RESERVE)) {                     /* commit inside a reservation */
@@ -87,7 +115,15 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect) {
     }
     size = page_up(size);
     int prot = type & MEM_COMMIT ? prot_of(protect) : PROT_NONE;
-    void *p = mmap(addr, size, prot, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    int fixed = 0;
+    if (addr && in_window((uintptr_t)addr, size)) {         /* ours: map over the reservation unless already given out */
+        os_unfair_lock_lock(&g_res_lock);
+        int taken = res_overlaps((uintptr_t)addr, size);
+        os_unfair_lock_unlock(&g_res_lock);
+        if (taken) { SetLastError(487); return NULL; }        /* ERROR_INVALID_ADDRESS, as Windows says */
+        fixed = MAP_FIXED;
+    }
+    void *p = mmap(addr, size, prot, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | fixed, -1, 0);
     if (p == MAP_FAILED) return NULL;
     if (addr && p != addr) { munmap(p, size); return NULL; }      /* a fixed address that is taken fails, as on Windows */
     os_unfair_lock_lock(&g_res_lock);
@@ -103,6 +139,8 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
         size_t n = i >= 0 ? g_res[i].size : 0;
         if (i >= 0) g_res[i] = g_res[--g_nres];
         os_unfair_lock_unlock(&g_res_lock);
+        if (n && in_window((uintptr_t)addr, n))                 /* back to the reservation */
+            return mmap(addr, n, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED;
         return n && !munmap(addr, n);
     }
     if (type & MEM_DECOMMIT) {                       /* back to reserved; the pages read zero when committed again */
@@ -236,6 +274,11 @@ BOOL SwitchToThread(void) { sched_yield(); return TRUE; }
 
 /* ---------------------------------------------------------------- handles: threads and events */
 enum { H_THREAD = 0x54485244, H_EVENT = 0x45564e54 };
+/* every handle starts with its kind */
+typedef struct { uint32_t kind; int fd; } FileObj;
+enum { H_FILE = 0x46494c45, H_FIND = 0x46494e44, H_MUTEX = 0x4d555458, H_PROCESS = 0x50524f43 };
+typedef struct { uint32_t kind; int name_fd, own_fd, owned; } MutexObj;
+typedef struct { uint32_t kind; pid_t pid; } ProcObj;
 typedef struct {
     uint32_t kind;
     volatile int refs;
@@ -385,7 +428,14 @@ static void deadline_of(DWORD ms, struct timespec *ts) {
     ts->tv_nsec += (long)(ms % 1000) * 1000000l;
     if (ts->tv_nsec >= 1000000000l) { ts->tv_sec++; ts->tv_nsec -= 1000000000l; }
 }
+static DWORD mutex_wait(MutexObj *o, DWORD ms);
+static DWORD process_wait(ProcObj *o, DWORD ms);
 DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
+    if (h && h != PSEUDO_THREAD && h != PSEUDO_PROCESS) {
+        uint32_t kind = *(const uint32_t *)h;
+        if (kind == H_MUTEX) return mutex_wait(h, ms);
+        if (kind == H_PROCESS) return process_wait(h, ms);
+    }
     Obj *o = obj_of(h);
     if (!o || (o->kind != H_THREAD && o->kind != H_EVENT)) return WAIT_FAILED;
     struct timespec ts;
@@ -414,9 +464,14 @@ DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     }
 }
 BOOL CloseHandle(HANDLE h) {
-    if (!h || h == PSEUDO_THREAD || h == PSEUDO_PROCESS) return TRUE;
-    obj_release(h);
-    return TRUE;
+    if (!h || h == INVALID_HANDLE_VALUE || h == PSEUDO_THREAD || h == PSEUDO_PROCESS) return TRUE;
+    switch (*(const uint32_t *)h) {
+    case H_FILE: close(((FileObj *)h)->fd); free(h); return TRUE;
+    case H_MUTEX: { MutexObj *m = h; if (m->name_fd >= 0) close(m->name_fd); if (m->own_fd >= 0) close(m->own_fd); free(m); return TRUE; }
+    case H_PROCESS: free(h); return TRUE;
+    case H_FIND: return FindClose(h);
+    default: obj_release(h); return TRUE;
+    }
 }
 void ExitProcess(UINT code) { fflush(NULL); exit((int)code); }
 
@@ -478,6 +533,478 @@ BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb) {
     pmc->PagefileUsage = pmc->PrivateUsage = (SIZE_T)vi.phys_footprint;
     return TRUE;
 }
+
+/* ---------------------------------------------------------------- C runtime, strings */
+int recomp_putenv(const char *kv) {
+    const char *eq = strchr(kv, '=');
+    if (!eq) return -1;
+    char name[256];
+    size_t n = (size_t)(eq - kv) < sizeof name - 1 ? (size_t)(eq - kv) : sizeof name - 1;
+    memcpy(name, kv, n); name[n] = 0;
+    return eq[1] ? setenv(name, eq + 1, 1) : unsetenv(name);
+}
+int _write(int fd, const void *p, unsigned n) { return (int)write(fd, p, n); }
+int _fileno(FILE *f) { return fileno(f); }
+
+/* UTF-8 <-> UTF-32 (WCHAR is wchar_t, 32 bits). n / wn of -1: up to and with the terminating zero. As on Windows the
+ * return value counts the zero when it was part of the input, and a NULL or 0-sized output asks for the size. */
+int MultiByteToWideChar(UINT cp, DWORD flags, const char *s, int n, WCHAR *w, int wn) {
+    (void)cp; (void)flags;
+    const uint8_t *p = (const uint8_t *)s, *e = n < 0 ? NULL : p + n;
+    int out = 0;
+    for (;;) {
+        if (e ? p >= e : 0) break;
+        uint32_t c = *p, len = c < 0x80 ? 1 : c >> 5 == 6 ? 2 : c >> 4 == 14 ? 3 : c >> 3 == 30 ? 4 : 1;
+        if (len > 1) {
+            c &= 0x3f >> (len - 1);
+            for (uint32_t k = 1; k < len; k++) {
+                if ((e && p + k >= e) || (p[k] & 0xc0) != 0x80) { c = 0xfffd; len = k; break; }
+                c = c << 6 | (p[k] & 0x3f);
+            }
+        } else if (c >= 0x80) c = 0xfffd;
+        if (w && wn) { if (out >= wn) { SetLastError(122); return 0; } w[out] = (WCHAR)c; }
+        out++;
+        p += len;
+        if (!e && c == 0) break;
+    }
+    return out;
+}
+int WideCharToMultiByte(UINT cp, DWORD flags, const WCHAR *w, int wn, char *s, int n, const char *def, BOOL *used) {
+    (void)cp; (void)flags; (void)def;
+    if (used) *used = FALSE;
+    int out = 0;
+    for (int i = 0; wn < 0 || i < wn; i++) {
+        uint32_t c = (uint32_t)w[i];
+        uint8_t b[4];
+        int len = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+        if (c >= 0x110000) { c = 0xfffd; len = 3; }
+        if (len == 1) b[0] = (uint8_t)c;
+        else {
+            for (int k = len - 1; k > 0; k--) { b[k] = (uint8_t)(0x80 | (c & 0x3f)); c >>= 6; }
+            b[0] = (uint8_t)((0xf00 >> len) | c);
+        }
+        if (s && n) { if (out + len > n) { SetLastError(122); return 0; } memcpy(s + out, b, (size_t)len); }
+        out += len;
+        if (wn < 0 && w[i] == 0) break;
+    }
+    return out;
+}
+
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID arg, PVOID *ctx) {
+    for (;;) {
+        int st = __atomic_load_n(&once->state, __ATOMIC_ACQUIRE);
+        if (st == 2) return TRUE;
+        if (st == 0 && __sync_bool_compare_and_swap(&once->state, 0, 1)) {
+            BOOL ok = fn(once, arg, ctx);
+            __atomic_store_n(&once->state, ok ? 2 : 0, __ATOMIC_RELEASE);
+            return ok;
+        }
+        sched_yield();
+    }
+}
+
+/* ---------------------------------------------------------------- last error */
+static _Thread_local DWORD t_last_error;
+DWORD GetLastError(void) { return t_last_error; }
+void SetLastError(DWORD e) { t_last_error = e; }
+static DWORD win_error_of(int e) {
+    switch (e) {
+    case 0: return ERROR_SUCCESS;
+    case ENOENT: return ERROR_FILE_NOT_FOUND;
+    case ENOTDIR: return ERROR_PATH_NOT_FOUND;
+    case EACCES: case EPERM: case EROFS: case EISDIR: return ERROR_ACCESS_DENIED;
+    case EBADF: return ERROR_INVALID_HANDLE;
+    case ENOMEM: return ERROR_NOT_ENOUGH_MEMORY;
+    case EEXIST: return ERROR_ALREADY_EXISTS;
+    case ENOTEMPTY: return ERROR_DIR_NOT_EMPTY;
+    case ENOSPC: return ERROR_DISK_FULL;
+    case EBUSY: case ETXTBSY: return ERROR_SHARING_VIOLATION;
+    default: return ERROR_INVALID_PARAMETER;
+    }
+}
+static BOOL fail_errno(void) { SetLastError(win_error_of(errno)); return FALSE; }
+
+/* ---------------------------------------------------------------- files */
+void recomp_path(char *out, size_t n, const char *in) {
+    size_t i = 0;
+    for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
+    out[i] = 0;
+}
+static int access_ok(const char *p) { return access(p, F_OK) == 0; }
+#undef fopen
+FILE *recomp_fopen(const char *path, const char *mode) {
+    char p[4096];
+    recomp_path(p, sizeof p, path);
+    return fopen(p, mode);
+}
+
+
+HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *sa, DWORD disposition, DWORD attrs, HANDLE tmpl) {
+    (void)share; (void)sa; (void)attrs; (void)tmpl;
+    char p[4096];
+    recomp_path(p, sizeof p, path);
+    int fl = (access & GENERIC_WRITE) ? ((access & GENERIC_READ) ? O_RDWR : O_WRONLY) : O_RDONLY;
+    switch (disposition) {
+    case CREATE_NEW: fl |= O_CREAT | O_EXCL; break;
+    case CREATE_ALWAYS: fl |= O_CREAT | O_TRUNC; break;
+    case OPEN_ALWAYS: fl |= O_CREAT; break;
+    case TRUNCATE_EXISTING: fl |= O_TRUNC; break;
+    default: break;
+    }
+    int existed = disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS ? access_ok(p) : 0;
+    int fd = open(p, fl | O_CLOEXEC, 0644);
+    if (fd < 0) { fail_errno(); return INVALID_HANDLE_VALUE; }
+    FileObj *o = calloc(1, sizeof *o);
+    o->kind = H_FILE; o->fd = fd;
+    SetLastError(existed ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+    return o;
+}
+static FileObj *file_of(HANDLE h) { FileObj *o = h; return o && h != INVALID_HANDLE_VALUE && o->kind == H_FILE ? o : NULL; }
+BOOL ReadFile(HANDLE h, LPVOID buf, DWORD n, DWORD *got, void *overlapped) {
+    (void)overlapped;
+    FileObj *o = file_of(h);
+    if (got) *got = 0;
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = read(o->fd, (uint8_t *)buf + done, n - done);
+        if (r < 0) { if (errno == EINTR) continue; return fail_errno(); }
+        if (r == 0) break;
+        done += (size_t)r;
+    }
+    if (got) *got = (DWORD)done;
+    return TRUE;
+}
+BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD n, DWORD *put, void *overlapped) {
+    (void)overlapped;
+    FileObj *o = file_of(h);
+    if (put) *put = 0;
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = write(o->fd, (const uint8_t *)buf + done, n - done);
+        if (r < 0) { if (errno == EINTR) continue; return fail_errno(); }
+        done += (size_t)r;
+    }
+    if (put) *put = (DWORD)done;
+    return TRUE;
+}
+BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER to, LARGE_INTEGER *now, DWORD method) {
+    FileObj *o = file_of(h);
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    off_t r = lseek(o->fd, (off_t)to.QuadPart, method == FILE_END ? SEEK_END : method == FILE_CURRENT ? SEEK_CUR : SEEK_SET);
+    if (r < 0) return fail_errno();
+    if (now) now->QuadPart = (LONGLONG)r;
+    return TRUE;
+}
+BOOL GetFileSizeEx(HANDLE h, LARGE_INTEGER *size) {
+    FileObj *o = file_of(h);
+    struct stat st;
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (fstat(o->fd, &st)) return fail_errno();
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
+}
+BOOL SetEndOfFile(HANDLE h) {
+    FileObj *o = file_of(h);
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    off_t at = lseek(o->fd, 0, SEEK_CUR);
+    return at >= 0 && !ftruncate(o->fd, at) ? TRUE : fail_errno();
+}
+/* F_FULLFSYNC: the data on the disk itself, which is what FlushFileBuffers promises (fsync stops at the drive's cache). */
+BOOL FlushFileBuffers(HANDLE h) {
+    FileObj *o = file_of(h);
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    return !fcntl(o->fd, F_FULLFSYNC) || !fsync(o->fd) ? TRUE : fail_errno();
+}
+intptr_t _get_osfhandle(int fd) {
+    static _Thread_local FileObj wrap[4];     /* a few at once, as FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f))) needs */
+    static _Thread_local int next;
+    FileObj *o = &wrap[next++ & 3];
+    o->kind = H_FILE; o->fd = fd;
+    return (intptr_t)o;
+}
+#define PATH_ARG(var, in) char var[4096]; recomp_path(var, sizeof var, (in))
+BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; PATH_ARG(p, path); return !mkdir(p, 0755) ? TRUE : fail_errno(); }
+BOOL RemoveDirectoryA(LPCSTR path) { PATH_ARG(p, path); return !rmdir(p) ? TRUE : fail_errno(); }
+BOOL DeleteFileA(LPCSTR path) { PATH_ARG(p, path); return !unlink(p) ? TRUE : fail_errno(); }
+BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
+    PATH_ARG(a, from); PATH_ARG(b, to);
+    if (!(flags & MOVEFILE_REPLACE_EXISTING) && access_ok(b)) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
+    if (rename(a, b)) return fail_errno();
+    if (flags & MOVEFILE_WRITE_THROUGH) {      /* the rename itself on disk: sync the folder that holds it */
+        char dir[4096];
+        snprintf(dir, sizeof dir, "%s", b);
+        char *sl = strrchr(dir, '/');
+        if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
+        int fd = open(dir, O_RDONLY);
+        if (fd >= 0) { fcntl(fd, F_FULLFSYNC); close(fd); }
+    }
+    return TRUE;
+}
+BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
+    PATH_ARG(a, from); PATH_ARG(b, to);
+    return !copyfile(a, b, NULL, COPYFILE_DATA | (fail_if_exists ? COPYFILE_EXCL : 0)) ? TRUE : fail_errno();
+}
+static DWORD attrs_of(const struct stat *st, const char *name) {
+    DWORD a = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+    if (!(st->st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
+    const char *base = strrchr(name, '/');
+    if ((base ? base[1] : name[0]) == '.') a |= FILE_ATTRIBUTE_HIDDEN;
+    return a;
+}
+DWORD GetFileAttributesA(LPCSTR path) {
+    PATH_ARG(p, path);
+    struct stat st;
+    if (stat(p, &st)) { fail_errno(); return INVALID_FILE_ATTRIBUTES; }
+    return attrs_of(&st, p);
+}
+BOOL SetFileAttributesA(LPCSTR path, DWORD attrs) {
+    PATH_ARG(p, path);
+    struct stat st;
+    if (stat(p, &st)) return fail_errno();
+    mode_t m = attrs & FILE_ATTRIBUTE_READONLY ? st.st_mode & ~(mode_t)0222 : st.st_mode | S_IWUSR;
+    return !chmod(p, m) ? TRUE : fail_errno();
+}
+static void ft_of_timespec(FILETIME *f, struct timespec t) {
+    uint64_t v = ((uint64_t)t.tv_sec + 11644473600ull) * 10000000ull + (uint64_t)t.tv_nsec / 100;
+    f->dwLowDateTime = (DWORD)v; f->dwHighDateTime = (DWORD)(v >> 32);
+}
+BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, void *out) {
+    (void)level;
+    PATH_ARG(p, path);
+    struct stat st;
+    WIN32_FILE_ATTRIBUTE_DATA *a = out;
+    if (stat(p, &st)) return fail_errno();
+    a->dwFileAttributes = attrs_of(&st, p);
+    ft_of_timespec(&a->ftCreationTime, st.st_birthtimespec);
+    ft_of_timespec(&a->ftLastAccessTime, st.st_atimespec);
+    ft_of_timespec(&a->ftLastWriteTime, st.st_mtimespec);
+    a->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32); a->nFileSizeLow = (DWORD)st.st_size;
+    return TRUE;
+}
+DWORD GetTempPathA(DWORD n, LPSTR out) {
+    const char *t = getenv("TMPDIR");
+    char buf[4096];
+    snprintf(buf, sizeof buf, "%s%s", t && t[0] ? t : "/tmp/", t && t[0] && t[strlen(t) - 1] != '/' ? "/" : "");
+    size_t len = strlen(buf);
+    if (len + 1 > n) return (DWORD)(len + 1);
+    memcpy(out, buf, len + 1);
+    return (DWORD)len;
+}
+DWORD GetFullPathNameA(LPCSTR path, DWORD n, LPSTR out, LPSTR *file_part) {
+    PATH_ARG(p, path);
+    char buf[4096];
+    if (p[0] == '/') snprintf(buf, sizeof buf, "%s", p);
+    else { char cwd[2048]; if (!getcwd(cwd, sizeof cwd)) return 0; snprintf(buf, sizeof buf, "%s/%s", cwd, p); }
+    size_t len = strlen(buf);
+    if (len + 1 > n) return (DWORD)(len + 1);
+    memcpy(out, buf, len + 1);
+    if (file_part) { char *sl = strrchr(out, '/'); *file_part = sl ? sl + 1 : out; }
+    return (DWORD)len;
+}
+DWORD GetModuleFileNameW(HMODULE m, LPWSTR out, DWORD size) {
+    char u[4096];
+    if (!GetModuleFileNameA(m, u, sizeof u)) return 0;
+    int n = MultiByteToWideChar(CP_UTF8, 0, u, -1, out, (int)size);
+    return n ? (DWORD)(n - 1) : 0;
+}
+
+/* FindFirstFile over opendir: the folder part of the pattern is listed, the last part matched with fnmatch. */
+typedef struct { uint32_t kind; DIR *d; char dir[4096], pat[256]; } FindObj;
+static int find_next(FindObj *o, WIN32_FIND_DATAA *fd) {
+    struct dirent *e;
+    while ((e = readdir(o->d))) {
+        if (fnmatch(o->pat, e->d_name, 0)) continue;
+        char full[8192];
+        struct stat st;
+        snprintf(full, sizeof full, "%s/%s", o->dir, e->d_name);
+        memset(fd, 0, sizeof *fd);
+        if (!stat(full, &st)) {
+            fd->dwFileAttributes = attrs_of(&st, e->d_name);
+            ft_of_timespec(&fd->ftCreationTime, st.st_birthtimespec);
+            ft_of_timespec(&fd->ftLastAccessTime, st.st_atimespec);
+            ft_of_timespec(&fd->ftLastWriteTime, st.st_mtimespec);
+            fd->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32); fd->nFileSizeLow = (DWORD)st.st_size;
+        }
+        snprintf(fd->cFileName, sizeof fd->cFileName, "%s", e->d_name);
+        return 1;
+    }
+    return 0;
+}
+HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
+    FindObj *o = calloc(1, sizeof *o);
+    o->kind = H_FIND;
+    recomp_path(o->dir, sizeof o->dir, pattern);
+    char *sl = strrchr(o->dir, '/');
+    if (sl) { snprintf(o->pat, sizeof o->pat, "%s", sl + 1); if (sl == o->dir) sl[1] = 0; else *sl = 0; }
+    else { snprintf(o->pat, sizeof o->pat, "%s", o->dir); snprintf(o->dir, sizeof o->dir, "."); }
+    if (!strcmp(o->pat, "*.*")) snprintf(o->pat, sizeof o->pat, "*");
+    o->d = opendir(o->dir);
+    if (!o->d) { fail_errno(); free(o); return INVALID_HANDLE_VALUE; }
+    if (!find_next(o, fd)) { closedir(o->d); free(o); SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    return o;
+}
+BOOL FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd) {
+    FindObj *o = h;
+    if (!o || h == INVALID_HANDLE_VALUE || o->kind != H_FIND) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (find_next(o, fd)) return TRUE;
+    SetLastError(ERROR_NO_MORE_FILES);
+    return FALSE;
+}
+static void find_widen(WIN32_FIND_DATAW *w, const WIN32_FIND_DATAA *a) {
+    memcpy(w, a, offsetof(WIN32_FIND_DATAW, cFileName));
+    MultiByteToWideChar(CP_UTF8, 0, a->cFileName, -1, w->cFileName, MAX_PATH);
+    w->cAlternateFileName[0] = 0;
+}
+HANDLE FindFirstFileW(LPCWSTR pattern, WIN32_FIND_DATAW *fd) {
+    char p[4096];
+    WIN32_FIND_DATAA a;
+    if (!WideCharToMultiByte(CP_UTF8, 0, pattern, -1, p, sizeof p, NULL, NULL)) { SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+    HANDLE h = FindFirstFileA(p, &a);
+    if (h != INVALID_HANDLE_VALUE) find_widen(fd, &a);
+    return h;
+}
+BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd) {
+    WIN32_FIND_DATAA a;
+    if (!FindNextFileA(h, &a)) return FALSE;
+    find_widen(fd, &a);
+    return TRUE;
+}
+BOOL FindClose(HANDLE h) {
+    FindObj *o = h;
+    if (!o || h == INVALID_HANDLE_VALUE || o->kind != H_FIND) return FALSE;
+    closedir(o->d);
+    free(o);
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------- named mutexes and processes
+ * A named mutex is two lock files in $TMPDIR: "<name>.name", held shared by every open handle (a create that cannot
+ * take it exclusively finds the name in use: ERROR_ALREADY_EXISTS), and "<name>.own", held exclusively by the owner. */
+static int lock_file(const char *name, const char *ext) {
+    char tmp[1024], path[2048], clean[512];
+    size_t k = 0;
+    for (const char *s = name; *s && k + 1 < sizeof clean; s++) clean[k++] = (*s == '/' || *s == '\\' || *s == ':') ? '_' : *s;
+    clean[k] = 0;
+    GetTempPathA(sizeof tmp, tmp);
+    snprintf(path, sizeof path, "%ssmo-mutex-%s.%s", tmp, clean, ext);
+    return open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+}
+HANDLE CreateMutexA(SECURITY_ATTRIBUTES *sa, BOOL owned, LPCSTR name) {
+    (void)sa;
+    MutexObj *o = calloc(1, sizeof *o);
+    o->kind = H_MUTEX; o->name_fd = o->own_fd = -1;
+    DWORD err = ERROR_SUCCESS;
+    if (name) {
+        o->name_fd = lock_file(name, "name");
+        o->own_fd = lock_file(name, "own");
+        if (o->name_fd < 0 || o->own_fd < 0) { fail_errno(); free(o); return NULL; }
+        if (flock(o->name_fd, LOCK_EX | LOCK_NB)) err = ERROR_ALREADY_EXISTS;
+        flock(o->name_fd, LOCK_SH);
+    }
+    if (owned && o->own_fd >= 0) { flock(o->own_fd, LOCK_EX); o->owned = 1; }
+    SetLastError(err);
+    return o;
+}
+BOOL ReleaseMutex(HANDLE h) {
+    MutexObj *o = h;
+    if (!o || o->kind != H_MUTEX || !o->owned) return FALSE;
+    o->owned = 0;
+    return o->own_fd < 0 || !flock(o->own_fd, LOCK_UN);
+}
+static DWORD mutex_wait(MutexObj *o, DWORD ms) {
+    if (o->own_fd < 0) { o->owned = 1; return WAIT_OBJECT_0; }
+    uint64_t end = ms == INFINITE ? UINT64_MAX : now_ns() + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        if (!flock(o->own_fd, LOCK_EX | (ms == INFINITE ? 0 : LOCK_NB))) { o->owned = 1; return WAIT_OBJECT_0; }
+        if (now_ns() >= end) return WAIT_TIMEOUT;
+        Sleep(1);
+    }
+}
+
+DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
+HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
+    (void)access; (void)inherit;
+    if (kill((pid_t)pid, 0) && errno == ESRCH) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    ProcObj *o = calloc(1, sizeof *o);
+    o->kind = H_PROCESS; o->pid = (pid_t)pid;
+    return o;
+}
+static DWORD process_wait(ProcObj *o, DWORD ms) {
+    uint64_t end = ms == INFINITE ? UINT64_MAX : now_ns() + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        if (kill(o->pid, 0) && errno == ESRCH) return WAIT_OBJECT_0;
+        if (now_ns() >= end) return WAIT_TIMEOUT;
+        Sleep(5);
+    }
+}
+BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value) { return !(value ? setenv(name, value, 1) : unsetenv(name)); }
+DWORD GetCurrentProcessorNumber(void) {
+    size_t n = 0;
+    return pthread_cpu_number_np(&n) ? 0 : (DWORD)n;
+}
+BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
+    (void)p;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    DWORD_PTR m = n >= 64 ? ~(DWORD_PTR)0 : (((DWORD_PTR)1 << n) - 1);
+    if (proc) *proc = m;
+    if (sys) *sys = m;
+    return TRUE;
+}
+BOOL SetPriorityClass(HANDLE p, DWORD cls) { (void)p; return !setpriority(PRIO_PROCESS, 0, cls == ABOVE_NORMAL_PRIORITY_CLASS || cls == HIGH_PRIORITY_CLASS ? -5 : 0) || TRUE; }
+BOOL SetThreadPriorityBoost(HANDLE h, BOOL disable) { (void)h; (void)disable; return TRUE; }
+
+/* ---------------------------------------------------------------- memory probes */
+BOOL IsBadReadPtr(const void *p, uintptr_t n) {
+    uint8_t b;
+    if (!n) return FALSE;
+    return !host_try_read(p, &b, 1) || !host_try_read((const uint8_t *)p + n - 1, &b, 1);
+}
+BOOL IsBadWritePtr(void *p, uintptr_t n) {
+    MEMORY_BASIC_INFORMATION mi;
+    for (uintptr_t a = (uintptr_t)p, e = (uintptr_t)p + (n ? n : 1); a < e; ) {
+        if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) return TRUE;
+        a = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------- time */
+static void systemtime_of(SYSTEMTIME *t, const struct tm *tm, long ns) {
+    t->wYear = (WORD)(tm->tm_year + 1900); t->wMonth = (WORD)(tm->tm_mon + 1); t->wDayOfWeek = (WORD)tm->tm_wday;
+    t->wDay = (WORD)tm->tm_mday; t->wHour = (WORD)tm->tm_hour; t->wMinute = (WORD)tm->tm_min; t->wSecond = (WORD)tm->tm_sec;
+    t->wMilliseconds = (WORD)(ns / 1000000);
+}
+void GetSystemTime(SYSTEMTIME *t) { struct timespec ts; struct tm tm; clock_gettime(CLOCK_REALTIME, &ts); gmtime_r(&ts.tv_sec, &tm); systemtime_of(t, &tm, ts.tv_nsec); }
+void GetLocalTime(SYSTEMTIME *t) { struct timespec ts; struct tm tm; clock_gettime(CLOCK_REALTIME, &ts); localtime_r(&ts.tv_sec, &tm); systemtime_of(t, &tm, ts.tv_nsec); }
+void GetSystemTimeAsFileTime(FILETIME *t) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ft_of_timespec(t, ts); }
+
+BOOLEAN SystemFunction036(PVOID buf, ULONG n) { arc4random_buf(buf, n); return 1; }
+
+/* ---------------------------------------------------------------- dynamic libraries */
+HMODULE LoadLibraryA(LPCSTR name) {
+    size_t n = strlen(name);
+    if (n > 4 && !strcasecmp(name + n - 4, ".dll")) { SetLastError(ERROR_FILE_NOT_FOUND); return NULL; }
+    void *h = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+    if (!h) SetLastError(ERROR_FILE_NOT_FOUND);
+    return h;
+}
+HMODULE LoadLibraryW(LPCWSTR name) {
+    char u[4096];
+    if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, u, sizeof u, NULL, NULL)) return NULL;
+    return LoadLibraryA(u);
+}
+/* m is a dlopen handle (LoadLibrary) or an image base (GetModuleHandle, GetModuleHandleEx): the latter is reopened by
+ * its path, which finds the image already loaded. */
+FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
+    Dl_info di;
+    void *h = m;
+    if (m && dladdr(m, &di) && di.dli_fbase == m && di.dli_fname) h = dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = RTLD_DEFAULT;
+    return (FARPROC)dlsym(h, name);
+}
+BOOL FreeLibrary(HMODULE m) { return m && !dlclose(m); }
 
 /* ---------------------------------------------------------------- frames
  * Every arm64 macOS binary keeps frame pointers (the platform ABI requires them): [fp] is the caller's fp, [fp + 8]

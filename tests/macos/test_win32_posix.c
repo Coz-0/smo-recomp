@@ -8,13 +8,22 @@ static int g_fail, g_pass;
 
 /* ---- the fixed guest ranges hostrt.c and sdklift_rt.c map */
 static void test_guest_ranges(void) {
-    static const uint64_t bases[] = {0x7100000000ull, 0x7300000000ull, 0x7400000000ull, 0x7500000000ull};
+    /* hostrt.h's macOS layout, inside the window hostrt.c reserves at load (0x7100000000.. on Windows collides with
+     * macOS's malloc heap range in about half of all launches: measured, docs/macos-port.md) */
+    static const uint64_t bases[] = {0x8100000000ull, 0x8300000000ull, 0x8400000000ull, 0x8500000000ull};
+    CHECK(recomp_reserve_window(0x8100000000ull, 0x500000000ull), "reserve the guest window");
     for (int i = 0; i < 4; i++) {
         void *p = VirtualAlloc((void *)(uintptr_t)bases[i], 0x6000000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         CHECK(p == (void *)(uintptr_t)bases[i], "map at 0x%llx gave %p", (unsigned long long)bases[i], p);
     }
     void *again = VirtualAlloc((void *)(uintptr_t)bases[0], 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     CHECK(again == NULL, "a second map at a taken address must fail, got %p", again);
+    void *outside = VirtualAlloc((void *)(uintptr_t)0x9000000000ull, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(outside == (void *)(uintptr_t)0x9000000000ull, "a free fixed address outside the window maps too");
+    void *tmp = VirtualAlloc((void *)(uintptr_t)0x8200000000ull, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(tmp && VirtualFree(tmp, 0, MEM_RELEASE), "map and release inside the window");
+    MEMORY_BASIC_INFORMATION wi;
+    CHECK(VirtualQuery(tmp, &wi, sizeof wi) && wi.State == MEM_RESERVE, "released inside the window: reserved again, not free (0x%x)", wi.State);
     uint8_t *g = (uint8_t *)(uintptr_t)bases[0];
     CHECK(g[0x5fffff0] == 0, "fresh pages read zero");
     g[0x123] = 0x5a;
@@ -186,12 +195,127 @@ static void test_misc(void) {
     CHECK(GetSystemTimes(&i0, &k0, &u0) && GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) && pmc.WorkingSetSize > 0, "system times and memory counters");
 }
 
+
+/* ---- part 2: files, folders, strings, named mutexes, processes, loader */
+__attribute__((visibility("default"))) int test_exported_symbol(void) { return 7; }
+static BOOL CALLBACK once_fn(PINIT_ONCE o, PVOID arg, PVOID *ctx) { (void)o; (void)ctx; (*(int *)arg)++; return TRUE; }
+
+static void test_files(void) {
+    char tmp[1024], dir[1100], path[1200], path2[1200];
+    GetTempPathA(sizeof tmp, tmp);
+    CHECK(tmp[strlen(tmp) - 1] == '/', "temp path ends with a separator (%s)", tmp);
+    snprintf(dir, sizeof dir, "%ssmo_shim_test_%lu", tmp, (unsigned long)GetCurrentProcessId());
+    CHECK(CreateDirectoryA(dir, NULL), "create folder");
+    CHECK(!CreateDirectoryA(dir, NULL) && GetLastError() == ERROR_ALREADY_EXISTS, "create an existing folder: ERROR_ALREADY_EXISTS (%u)", GetLastError());
+    snprintf(path, sizeof path, "%s\\a.bin", dir);                  /* a Windows-style separator */
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE, "create a file through a backslash path");
+    DWORD n = 0;
+    CHECK(WriteFile(h, "hello world", 11, &n, NULL) && n == 11, "write");
+    LARGE_INTEGER to = {.QuadPart = 6}, now, size;
+    CHECK(SetFilePointerEx(h, to, &now, FILE_BEGIN) && now.QuadPart == 6, "seek");
+    char buf[32] = {0};
+    CHECK(ReadFile(h, buf, sizeof buf, &n, NULL) && n == 5 && !memcmp(buf, "world", 5), "read to the end gives the rest (%u bytes)", n);
+    to.QuadPart = 5;
+    SetFilePointerEx(h, to, NULL, FILE_BEGIN);
+    CHECK(SetEndOfFile(h) && GetFileSizeEx(h, &size) && size.QuadPart == 5, "truncate at the file pointer");
+    CHECK(FlushFileBuffers(h), "flush to disk");
+    CloseHandle(h);
+    FILE *f = fopen(path, "rb");
+    CHECK(f && fread(buf, 1, 5, f) == 5 && !memcmp(buf, "hello", 5), "fopen takes the backslash path too");
+    if (f) { CHECK(FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f))), "FlushFileBuffers through _get_osfhandle"); fclose(f); }
+    CHECK(GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && !(GetFileAttributesA(path) & FILE_ATTRIBUTE_DIRECTORY), "file attributes");
+    CHECK(GetFileAttributesA(dir) & FILE_ATTRIBUTE_DIRECTORY, "folder attributes");
+    CHECK(GetFileAttributesA("/nonexistent/x") == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND, "missing file: ERROR_FILE_NOT_FOUND");
+    WIN32_FILE_ATTRIBUTE_DATA ad;
+    CHECK(GetFileAttributesExA(path, GetFileExInfoStandard, &ad) && ad.nFileSizeLow == 5 && ad.ftLastWriteTime.dwHighDateTime > 0x01d00000u, "attributes with size and a 1601-based write time");
+    snprintf(path2, sizeof path2, "%s\\b.bin", dir);
+    CHECK(CopyFileA(path, path2, TRUE) && !CopyFileA(path, path2, TRUE), "copy, and refuse to replace when asked");
+    CHECK(!MoveFileExA(path, path2, 0) && MoveFileExA(path, path2, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "move: replaces only when asked");
+    snprintf(path, sizeof path, "%s\\c.txt", dir);
+    CloseHandle(CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL));
+    CHECK(CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL) == INVALID_HANDLE_VALUE, "CREATE_NEW fails on an existing file");
+    char pat[1200];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    int files = 0, dots = 0;
+    HANDLE fh = FindFirstFileA(pat, &fd);
+    CHECK(fh != INVALID_HANDLE_VALUE, "find in a folder");
+    if (fh != INVALID_HANDLE_VALUE) { do { if (fd.cFileName[0] == '.') dots++; else files++; } while (FindNextFileA(fh, &fd)); FindClose(fh); }
+    CHECK(files == 2 && dots == 2 && GetLastError() == ERROR_NO_MORE_FILES, "\"*\" lists the two files, . and .. (%d files, %d dots)", files, dots);
+    snprintf(pat, sizeof pat, "%s\\*.txt", dir);
+    WCHAR wpat[1200];
+    WIN32_FIND_DATAW wfd;
+    MultiByteToWideChar(CP_ACP, 0, pat, -1, wpat, 1200);
+    fh = FindFirstFileW(wpat, &wfd);
+    CHECK(fh != INVALID_HANDLE_VALUE && !wcscmp(wfd.cFileName, L"c.txt") && !FindNextFileW(fh, &wfd), "wide find with an extension pattern");
+    if (fh != INVALID_HANDLE_VALUE) FindClose(fh);
+    DeleteFileA(path); snprintf(path, sizeof path, "%s/b.bin", dir); DeleteFileA(path);
+    CHECK(RemoveDirectoryA(dir), "remove the emptied folder");
+}
+
+static void test_strings_and_misc(void) {
+    const char *u = "Mario \xc3\xa9t\xc3\xa9 \xf0\x9f\x8d\x84";        /* é and a mushroom emoji */
+    WCHAR w[64];
+    char back[64];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, u, -1, w, 64);
+    CHECK(wn == 12 && w[6] == 0xe9 && w[10] == 0x1f344 && w[11] == 0, "UTF-8 to wide counts the zero (%d)", wn);
+    CHECK(MultiByteToWideChar(CP_UTF8, 0, u, -1, NULL, 0) == wn, "size query");
+    int bn = WideCharToMultiByte(CP_UTF8, 0, w, -1, back, sizeof back, NULL, NULL);
+    CHECK(bn == (int)strlen(u) + 1 && !strcmp(back, u), "and back (%d)", bn);
+    CHECK(!_stricmp("StageData", "stagedata") && _strnicmp("ABc", "abd", 2) == 0, "_stricmp / _strnicmp");
+    _putenv("SMO_SHIM_TEST=1");
+    CHECK(getenv("SMO_SHIM_TEST") && !strcmp(getenv("SMO_SHIM_TEST"), "1"), "_putenv sets");
+    _putenv("SMO_SHIM_TEST=");
+    CHECK(!getenv("SMO_SHIM_TEST"), "_putenv with nothing after = removes");
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    int runs = 0;
+    InitOnceExecuteOnce(&once, once_fn, &runs, NULL);
+    InitOnceExecuteOnce(&once, once_fn, &runs, NULL);
+    CHECK(runs == 1, "InitOnceExecuteOnce runs once");
+
+    HANDLE m1 = CreateMutexA(NULL, FALSE, "Local\\smo_shim_test");
+    CHECK(m1 && GetLastError() == ERROR_SUCCESS, "first named mutex is new (%u)", GetLastError());
+    HANDLE m2 = CreateMutexA(NULL, FALSE, "Local\\smo_shim_test");
+    CHECK(m2 && GetLastError() == ERROR_ALREADY_EXISTS, "second one finds the name in use (%u)", GetLastError());
+    CHECK(WaitForSingleObject(m1, 100) == WAIT_OBJECT_0, "take the mutex");
+    CHECK(WaitForSingleObject(m2, 50) == WAIT_TIMEOUT, "another handle waits while it is owned");
+    CHECK(ReleaseMutex(m1) && WaitForSingleObject(m2, 100) == WAIT_OBJECT_0, "released, the other handle takes it");
+    ReleaseMutex(m2);
+    CloseHandle(m1); CloseHandle(m2);
+    HANDLE m3 = CreateMutexA(NULL, FALSE, "Local\\smo_shim_test");
+    CHECK(m3 && GetLastError() == ERROR_SUCCESS, "with every handle closed the name is free again (%u)", GetLastError());
+    CloseHandle(m3);
+
+    HANDLE me = OpenProcess(SYNCHRONIZE, FALSE, GetCurrentProcessId());
+    CHECK(me && WaitForSingleObject(me, 0) == WAIT_TIMEOUT, "this process is alive");
+    CloseHandle(me);
+    CHECK(OpenProcess(SYNCHRONIZE, FALSE, 999999) == NULL, "no process 999999");
+
+    FARPROC fp = GetProcAddress(GetModuleHandleA(NULL), "test_exported_symbol");
+    CHECK(fp && ((int (*)(void))fp)() == 7, "GetProcAddress in the executable");
+    CHECK(LoadLibraryA("xinput1_4.dll") == NULL, "a Windows DLL is not found");
+    static const int ro = 5;
+    static int rw = 5;
+    CHECK(IsBadWritePtr((void *)&ro, sizeof ro) && !IsBadWritePtr(&rw, sizeof rw) && !IsBadReadPtr(&ro, sizeof ro) && IsBadReadPtr((void *)(uintptr_t)8, 4),
+          "IsBadReadPtr / IsBadWritePtr");
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    CHECK(st.wYear >= 2026 && st.wMonth >= 1 && st.wMonth <= 12, "system time (%u-%u)", st.wYear, st.wMonth);
+    uint8_t r1[16] = {0}, r2[16] = {0};
+    CHECK(SystemFunction036(r1, 16) && SystemFunction036(r2, 16) && memcmp(r1, r2, 16), "random bytes differ");
+    DWORD_PTR pm = 0, sm = 0;
+    CHECK(GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm && GetCurrentProcessorNumber() < 64, "processor mask %llx, processor %u", (unsigned long long)pm, GetCurrentProcessorNumber());
+}
+
 int main(void) {
     test_guest_ranges();
     test_reserve_commit_query();
     test_interlocked();
     test_threads();
     test_misc();
+    test_files();
+    test_strings_and_misc();
     printf("win32_posix: %d of %d checks passed\n", g_pass, g_pass + g_fail);
     return g_fail != 0;
 }

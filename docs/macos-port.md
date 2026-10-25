@@ -55,7 +55,14 @@ Each step builds and is checked before the next one starts.
 - **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.4.1 that is
   0x4f16000, which is 4 KB aligned but not 16 KB aligned. Protection stops at the 16 KB page below it, so up to 12 KB
   of read-only data stays writable. Rounding up instead would make the start of `.data` read-only.
-- **Fixed addresses.** `mmap` is given the guest bases (0x7100000000, 0x7300000000, 0x7400000000, 0x7500000000) as a
-  hint and the result is checked, as `VirtualAlloc`'s is on Windows. `tests/macos/check_core.sh` maps all four.
+- **Fixed addresses: the guest layout is 0x10_0000_0000 higher.** macOS keeps 0x70_0000_0000..0x80_0000_0000 for
+  malloc's heap range and reserves 24 GB of it around its small-allocation region at a random place on every launch;
+  below it, 0x10_0000_0000..0x70_0000_0000 is a guard reservation. Measured over 60 launches of a test program (every
+  region of the process listed with `mach_vm_region_recurse`): the console's addresses 0x71/0x73/0x74/0x75 × 2³² were
+  taken in 10 of 20 launches of the shim's test. Above 0x80_0000_0000 nothing was mapped in any launch. So on macOS
+  the game image is at 0x8100000000, the import placeholders at 0x8300000000, the host functions at 0x8400000000 and
+  the SDK module at 0x8500000000 (`hostrt.h`, `tools/target.py`; the lifted code is made for these bases, and
+  `image.h` says which bases it was made for, so a mismatch stops the build). `hostrt.c` reserves the whole window
+  when the program loads. `tests/macos/check_core.sh` launches the mapping test 20 times.
 - **No core affinity.** macOS has no `SetThreadAffinityMask`. The three-core model keeps its own run queue and does
   not need it.

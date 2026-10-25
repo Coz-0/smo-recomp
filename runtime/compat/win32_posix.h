@@ -80,6 +80,9 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type);
 BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD protect, DWORD *old);
 SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T len);
 size_t recomp_page_size(void);
+/* Reserves [base, base + size) with no access, so nothing else of the process is placed there. VirtualAlloc at a fixed
+ * address inside it then maps over the reservation, and MEM_RELEASE gives the range back to it. 0 if it is taken. */
+int recomp_reserve_window(uint64_t base, uint64_t size);
 /* Copies n bytes from p into out; 0 when any of them is not readable. No signal is raised: this is the macOS form of
  * the runtime's __try { read } __except (1) { ... } probes. */
 int host_try_read(const void *p, void *out, size_t n);
@@ -170,6 +173,166 @@ BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);    /* ker
 BOOL GetProcessTimes(HANDLE p, FILETIME *creation, FILETIME *exit, FILETIME *kernel, FILETIME *user);
 typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, PagefileUsage, PrivateUsage; } PROCESS_MEMORY_COUNTERS;
 BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb);
+
+/* ---- C runtime and string spellings */
+#include <strings.h>
+#include <stdio.h>
+#include <wchar.h>
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#define _wcsicmp wcscasecmp
+#define _strdup strdup
+#define _strtoui64 strtoull
+#define _strtoi64 strtoll
+#define _putenv(s) recomp_putenv(s)
+#define _putenv_s(k, v) setenv((k), (v), 1)
+int recomp_putenv(const char *kv);               /* "NAME=value", "NAME=" removes it (as the MSVC runtime does) */
+int _write(int fd, const void *p, unsigned n);
+int _fileno(FILE *f);
+intptr_t _get_osfhandle(int fd);                 /* a file HANDLE over the descriptor (FlushFileBuffers takes it) */
+typedef uint8_t BOOLEAN;
+typedef int16_t SHORT;
+typedef wchar_t WCHAR;                           /* 32-bit here: text goes through MultiByteToWideChar and back, never to disk */
+typedef WCHAR *LPWSTR;
+typedef const WCHAR *LPCWSTR;
+#define NTAPI
+#define CALLBACK
+#define CP_ACP 0u                                /* the ANSI code page is UTF-8 here */
+#define CP_UTF8 65001u
+int MultiByteToWideChar(UINT cp, DWORD flags, const char *s, int n, WCHAR *w, int wn);
+int WideCharToMultiByte(UINT cp, DWORD flags, const WCHAR *w, int wn, char *s, int n, const char *def, BOOL *used);
+
+/* ---- once */
+typedef struct { volatile int state; } INIT_ONCE, *PINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT {0}
+typedef BOOL (*PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID *);
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID arg, PVOID *ctx);
+
+/* ---- last error: set by the calls of this file that fail, from errno */
+#define ERROR_SUCCESS 0u
+#define ERROR_FILE_NOT_FOUND 2u
+#define ERROR_PATH_NOT_FOUND 3u
+#define ERROR_ACCESS_DENIED 5u
+#define ERROR_INVALID_HANDLE 6u
+#define ERROR_NOT_ENOUGH_MEMORY 8u
+#define ERROR_NO_MORE_FILES 18u
+#define ERROR_SHARING_VIOLATION 32u
+#define ERROR_FILE_EXISTS 80u
+#define ERROR_INVALID_PARAMETER 87u
+#define ERROR_DISK_FULL 112u
+#define ERROR_DIR_NOT_EMPTY 145u
+#define ERROR_ALREADY_EXISTS 183u
+#define ERROR_DEVICE_NOT_CONNECTED 1167u
+DWORD GetLastError(void);
+void SetLastError(DWORD e);
+
+/* ---- files. Paths may use backslashes (the runtime builds Windows paths): every path taken here, and fopen's,
+ * has them turned into slashes. */
+#define GENERIC_READ 0x80000000u
+#define GENERIC_WRITE 0x40000000u
+#define FILE_SHARE_READ 1u
+#define FILE_SHARE_WRITE 2u
+#define FILE_SHARE_DELETE 4u
+#define CREATE_NEW 1u
+#define CREATE_ALWAYS 2u
+#define OPEN_EXISTING 3u
+#define OPEN_ALWAYS 4u
+#define TRUNCATE_EXISTING 5u
+#define FILE_ATTRIBUTE_READONLY 0x1u
+#define FILE_ATTRIBUTE_HIDDEN 0x2u
+#define FILE_ATTRIBUTE_DIRECTORY 0x10u
+#define FILE_ATTRIBUTE_ARCHIVE 0x20u
+#define FILE_ATTRIBUTE_NORMAL 0x80u
+#define FILE_ATTRIBUTE_TEMPORARY 0x100u
+#define INVALID_FILE_ATTRIBUTES 0xFFFFFFFFu
+#define FILE_BEGIN 0u
+#define FILE_CURRENT 1u
+#define FILE_END 2u
+#define MOVEFILE_REPLACE_EXISTING 1u
+#define MOVEFILE_COPY_ALLOWED 2u
+#define MOVEFILE_WRITE_THROUGH 8u
+typedef struct { DWORD nLength; LPVOID lpSecurityDescriptor; BOOL bInheritHandle; } SECURITY_ATTRIBUTES;
+typedef struct { uintptr_t Internal, InternalHigh; DWORD Offset, OffsetHigh; HANDLE hEvent; } OVERLAPPED;
+HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *sa, DWORD disposition, DWORD attrs, HANDLE tmpl);
+BOOL ReadFile(HANDLE h, LPVOID buf, DWORD n, DWORD *got, void *overlapped);
+BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD n, DWORD *put, void *overlapped);
+BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER to, LARGE_INTEGER *now, DWORD method);
+BOOL GetFileSizeEx(HANDLE h, LARGE_INTEGER *size);
+BOOL SetEndOfFile(HANDLE h);
+BOOL FlushFileBuffers(HANDLE h);
+BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa);
+BOOL RemoveDirectoryA(LPCSTR path);
+BOOL DeleteFileA(LPCSTR path);
+BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags);
+BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists);
+DWORD GetFileAttributesA(LPCSTR path);
+BOOL SetFileAttributesA(LPCSTR path, DWORD attrs);
+typedef enum { GetFileExInfoStandard } GET_FILEEX_INFO_LEVELS;
+typedef struct { DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime; DWORD nFileSizeHigh, nFileSizeLow; } WIN32_FILE_ATTRIBUTE_DATA;
+BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, void *out);
+DWORD GetTempPathA(DWORD n, LPSTR out);          /* $TMPDIR, with a trailing separator */
+DWORD GetFullPathNameA(LPCSTR path, DWORD n, LPSTR out, LPSTR *file_part);
+DWORD GetModuleFileNameW(HMODULE m, LPWSTR out, DWORD size);
+typedef struct {
+    DWORD dwFileAttributes;
+    FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+    DWORD nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1;
+    char cFileName[MAX_PATH], cAlternateFileName[14];
+} WIN32_FIND_DATAA;
+typedef struct {
+    DWORD dwFileAttributes;
+    FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+    DWORD nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1;
+    WCHAR cFileName[MAX_PATH], cAlternateFileName[14];
+} WIN32_FIND_DATAW;
+/* The pattern is a folder and a last part with * and ? (as the runtime uses it: "dir\\*", "dir\\*.ext"). */
+HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd);
+BOOL FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd);
+HANDLE FindFirstFileW(LPCWSTR pattern, WIN32_FIND_DATAW *fd);
+BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
+BOOL FindClose(HANDLE h);
+FILE *recomp_fopen(const char *path, const char *mode);
+#define fopen(p, m) recomp_fopen((p), (m))
+void recomp_path(char *out, size_t n, const char *in);     /* a Windows-style path as a macOS one */
+
+/* ---- named mutexes (across processes: lock files in $TMPDIR) and processes */
+#define SYNCHRONIZE 0x00100000u
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000u
+HANDLE CreateMutexA(SECURITY_ATTRIBUTES *sa, BOOL owned, LPCSTR name);   /* ERROR_ALREADY_EXISTS when another handle has the name */
+BOOL ReleaseMutex(HANDLE h);
+DWORD GetCurrentProcessId(void);
+HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid);              /* WaitForSingleObject: signalled once it has ended */
+BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value);
+DWORD GetCurrentProcessorNumber(void);
+BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys);   /* every processor, as one bit each */
+#define NORMAL_PRIORITY_CLASS 0x20u
+#define ABOVE_NORMAL_PRIORITY_CLASS 0x8000u
+#define HIGH_PRIORITY_CLASS 0x80u
+BOOL SetPriorityClass(HANDLE p, DWORD cls);
+BOOL SetThreadPriorityBoost(HANDLE h, BOOL disable);
+#define THREAD_PRIORITY_LOWEST (-2)
+#define THREAD_PRIORITY_BELOW_NORMAL (-1)
+#define THREAD_PRIORITY_IDLE (-15)
+
+/* ---- memory probes */
+BOOL IsBadReadPtr(const void *p, uintptr_t n);
+BOOL IsBadWritePtr(void *p, uintptr_t n);
+
+/* ---- time */
+typedef struct { WORD wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond, wMilliseconds; } SYSTEMTIME;
+void GetSystemTime(SYSTEMTIME *t);
+void GetLocalTime(SYSTEMTIME *t);
+void GetSystemTimeAsFileTime(FILETIME *t);       /* 100 ns since 1601-01-01 UTC */
+
+/* ---- random */
+BOOLEAN SystemFunction036(PVOID buf, ULONG n);   /* RtlGenRandom */
+
+/* ---- dynamic libraries (Windows DLL names are not found: callers take their fallback) */
+HMODULE LoadLibraryA(LPCSTR name);
+HMODULE LoadLibraryW(LPCWSTR name);
+typedef void (*FARPROC)(void);
+FARPROC GetProcAddress(HMODULE m, LPCSTR name);
+BOOL FreeLibrary(HMODULE m);
 
 /* ---- macOS only: a thread's frames, for the crash report and the samplers (pcs[0] = where it is) */
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max);           /* suspends and resumes the thread */

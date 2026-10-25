@@ -34,8 +34,8 @@ import target as T                                        # noqa: E402
 
 DUMP = os.path.join(T.DUMP, 'elf')
 OUT = T.build('gen')
-GUEST_BASE = 0x7100000000
-SDK_BASE = 0x7500000000
+GUEST_BASE = T.GUEST_BASE
+SDK_BASE = T.SDK_BASE
 # game functions the runtime calls by name (the console's own allocator lives in main for this game)
 GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
              '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
@@ -358,6 +358,8 @@ def main():
          '#define GAME_ELF_DEFAULT "%s"      /* main.elf from the exe\'s folder (sdk.elf beside it) */'
          % elf_from_bin.replace('\\', '\\\\'),
          '#define GAME_BUILD_ID "%s"' % build_id,
+         '#define GEN_GUEST_BASE 0x%xULL      /* the bases the lifted code was made for (tools/target.py) */' % GUEST_BASE,
+         '#define GEN_SDK_BASE 0x%xULL' % SDK_BASE,
          '#define GUEST_FILE_IMAGE 0x%xULL      /* bytes of the image stored in main.elf (text .. end of data) */' % file_image,
          '#define GUEST_IMAGE_SIZE 0x%xULL      /* mapped size: up to the end of .bss, page aligned */' % image_size,
          '#define GUEST_RO_END 0x%xULL          /* start of the data segment: text + read-only data end here */' % ro_end,

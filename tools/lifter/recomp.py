@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(_REPO, 'tools'))
 import target as _T  # noqa: E402
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
-BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
+BASE = int(os.environ.get('RECOMP_BASE', hex(_T.GUEST_BASE)), 16)
 FILE_OFF = 0x1000
 
 IMG = open(ELF, 'rb').read()

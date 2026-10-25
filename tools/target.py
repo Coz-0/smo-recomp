@@ -7,6 +7,7 @@ goes under build/:
                         relative to its exe (..\\romfs, ..\\manual, ..\\userdata) work
 """
 import os
+import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION = '1.4.1'                                       # the game version this project builds
@@ -15,6 +16,12 @@ DUMP = os.path.join(BUILD, 'dump', 'update')
 RUNTIME = os.path.join(REPO, 'runtime')
 # the host runtime's subsystem folders (runtime/<folder>); every one is an include directory of the runtime's code
 RUNTIME_DIRS = ['core', 'libc', 'os', 'fs', 'gfx', 'audio', 'input', 'services', 'game']
+# Where the guest's modules are mapped (runtime/core/hostrt.h has the same numbers; image.h carries them so the runtime
+# checks they agree). On Windows at the console's own addresses; on macOS 0x10_0000_0000 higher, because macOS keeps
+# 0x70_0000_0000..0x80_0000_0000 for malloc's heap range (docs/macos-port.md).
+LAYOUT_SHIFT = 0x1000000000 if sys.platform == 'darwin' else 0
+GUEST_BASE = 0x7100000000 + LAYOUT_SHIFT
+SDK_BASE = 0x7500000000 + LAYOUT_SHIFT
 
 
 def runtime(folder, name):

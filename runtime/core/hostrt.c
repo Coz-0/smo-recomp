@@ -234,7 +234,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
         host_import(c, (int)((addr - IMPORT_BASE) / IMPORT_SLOT));
         return;
     }
-    if (addr >= 0x7500000000ULL && addr < 0x7500000000ULL + SDK_IMAGE_SIZE_GEN) { sdk_dispatch(c, addr); return; }   /* lifted SDK code (sdklift_rt.c), e.g. a vtable entry of an SDK object */
+    if (addr >= SDK_BASE && addr < SDK_BASE + SDK_IMAGE_SIZE_GEN) { sdk_dispatch(c, addr); return; }   /* lifted SDK code (sdklift_rt.c), e.g. a vtable entry of an SDK object */
     void (*fn)(Ctx *) = lookup_guest(addr);
     if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
     fn(c);
@@ -712,6 +712,16 @@ static void crash_handlers_install(void) {
     sigemptyset(&sa.sa_mask);
     static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT};
     for (int i = 0; i < (int)(sizeof sigs / sizeof sigs[0]); i++) sigaction(sigs[i], &sa, NULL);
+}
+/* The guest window, from the game image to the end of the SDK module's 4 GB (20 GB of address space, no memory), is
+ * taken when the program is loaded, before anything else of it allocates. VirtualAlloc maps the image, the import
+ * placeholders and the SDK module into it later. */
+__attribute__((constructor)) static void guest_window_reserve(void) {
+    if (!recomp_reserve_window(GUEST_BASE, SDK_BASE + 0x100000000ULL - GUEST_BASE)) {
+        fprintf(stderr, "cannot reserve the guest address range 0x%llx..0x%llx: something else of the process is there\n",
+                GUEST_BASE, SDK_BASE + 0x100000000ULL);
+        exit(1);
+    }
 }
 #endif
 
