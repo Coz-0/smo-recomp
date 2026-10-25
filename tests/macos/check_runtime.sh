@@ -1,13 +1,13 @@
 #!/bin/bash
 # The macOS port's checks beyond runtime/core (docs/macos-port.md, step 2): check_core.sh, then every file of the
-# folders ported so far compiled with -Wall -Werror against the stand-in image.h, then nntime.c's time zone rule
-# against localtime_r in zones of every kind. Usage: tests/macos/check_runtime.sh
+# folders ported so far compiled with -Wall -Werror against the stand-in image.h, then the self-tests that run without
+# a dump: nntime.c's time zone rule against localtime_r in zones of every kind, nnfs.c's save data journal. Usage: tests/macos/check_runtime.sh
 set -u
 cd "$(dirname "$0")/../.."
 OUT=build/macos-check
 mkdir -p "$OUT"
 CC=${CC:-clang}
-FOLDERS=(libc os)
+FOLDERS=(libc os fs)
 INC=(-Iruntime/compat -Itests/macos/stub -I/opt/homebrew/include)
 for d in runtime/*/; do INC+=("-I${d%/}"); done
 fail=0
@@ -33,6 +33,12 @@ for z in America/New_York Europe/Berlin Australia/Sydney Asia/Kolkata Pacific/Ch
     r=$?
     step $r "time zone $z: $(grep -o '[0-9]* conversions.*' <<<"$line" | head -1)"
 done
+
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" runtime/fs/nnfs.c runtime/fs/nnfsdir.c runtime/compat/win32_posix.c \
+    tests/macos/test_nnfs.c -framework CoreFoundation -framework AudioToolbox -o "$OUT/test_nnfs"
+step $? "link nnfs.c's and nnfsdir.c's self-tests (test_nnfs)"
+"$OUT/test_nnfs" > "$OUT/nnfs.txt" 2>&1
+step $? "save data journal, mount table, directory listing: $(tail -1 "$OUT/nnfs.txt")"
 
 [ $fail -eq 0 ] && echo "check_runtime: all passed" || echo "check_runtime: FAILED (logs in $OUT)"
 exit $fail

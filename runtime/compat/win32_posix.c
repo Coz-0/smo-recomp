@@ -24,6 +24,7 @@
 #include <copyfile.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <pwd.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <AudioToolbox/AudioServices.h>
 
@@ -940,6 +941,15 @@ static DWORD process_wait(ProcObj *o, DWORD ms) {
         if (now_ns() >= end) return WAIT_TIMEOUT;
         Sleep(5);
     }
+}
+BOOL GetUserNameW(LPWSTR out, DWORD *n) {
+    struct passwd *pw = getpwuid(getuid());
+    const char *name = pw && pw->pw_name ? pw->pw_name : getenv("USER");
+    if (!name) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    int need = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
+    if ((DWORD)need > *n) { *n = (DWORD)need; SetLastError(122); return FALSE; }
+    *n = (DWORD)MultiByteToWideChar(CP_UTF8, 0, name, -1, out, (int)*n);
+    return TRUE;
 }
 BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value) { return !(value ? setenv(name, value, 1) : unsetenv(name)); }
 DWORD GetCurrentProcessorNumber(void) {

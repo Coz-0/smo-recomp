@@ -305,6 +305,7 @@ BOOL ReleaseMutex(HANDLE h);
 DWORD GetCurrentProcessId(void);
 HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid);              /* WaitForSingleObject: signalled once it has ended */
 BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value);
+BOOL GetUserNameW(LPWSTR out, DWORD *n);       /* the login name; *n in characters with the zero, as on Windows */
 DWORD GetCurrentProcessorNumber(void);
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys);   /* every processor, as one bit each */
 #define NORMAL_PRIORITY_CLASS 0x20u
