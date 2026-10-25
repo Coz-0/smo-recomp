@@ -746,32 +746,45 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *
     return o;
 }
 static FileObj *file_of(HANDLE h) { FileObj *o = h; return o && h != INVALID_HANDLE_VALUE && o->kind == H_FILE ? o : NULL; }
+/* With an OVERLAPPED, Windows reads or writes at its Offset/OffsetHigh (a positional transfer, independent of the file
+ * pointer and of other threads on the same handle; the file pointer then stands after it): pread/pwrite here. Without
+ * one, at the file pointer. nnfs.c's read_at reads every game file this way (it used to be ignored here, and each read
+ * took the bytes after the previous one: the sound archive's INFO block came out holding its string table, found with
+ * the first real dump on macOS). */
+static int64_t ov_offset(const void *overlapped) {
+    const OVERLAPPED *ov = overlapped;
+    return (int64_t)(((uint64_t)ov->OffsetHigh << 32) | ov->Offset);
+}
 BOOL ReadFile(HANDLE h, LPVOID buf, DWORD n, DWORD *got, void *overlapped) {
-    (void)overlapped;
     FileObj *o = file_of(h);
     if (got) *got = 0;
     if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
     size_t done = 0;
+    int64_t at = overlapped ? ov_offset(overlapped) : -1;
     while (done < n) {
-        ssize_t r = read(o->fd, (uint8_t *)buf + done, n - done);
+        ssize_t r = at >= 0 ? pread(o->fd, (uint8_t *)buf + done, n - done, (off_t)(at + (int64_t)done))
+                            : read(o->fd, (uint8_t *)buf + done, n - done);
         if (r < 0) { if (errno == EINTR) continue; return fail_errno(); }
         if (r == 0) break;
         done += (size_t)r;
     }
+    if (at >= 0) lseek(o->fd, (off_t)(at + (int64_t)done), SEEK_SET);
     if (got) *got = (DWORD)done;
     return TRUE;
 }
 BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD n, DWORD *put, void *overlapped) {
-    (void)overlapped;
     FileObj *o = file_of(h);
     if (put) *put = 0;
     if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
     size_t done = 0;
+    int64_t at = overlapped ? ov_offset(overlapped) : -1;
     while (done < n) {
-        ssize_t r = write(o->fd, (const uint8_t *)buf + done, n - done);
+        ssize_t r = at >= 0 ? pwrite(o->fd, (const uint8_t *)buf + done, n - done, (off_t)(at + (int64_t)done))
+                            : write(o->fd, (const uint8_t *)buf + done, n - done);
         if (r < 0) { if (errno == EINTR) continue; return fail_errno(); }
         done += (size_t)r;
     }
+    if (at >= 0) lseek(o->fd, (off_t)(at + (int64_t)done), SEEK_SET);
     if (put) *put = (DWORD)done;
     return TRUE;
 }

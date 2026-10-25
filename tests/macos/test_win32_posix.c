@@ -223,6 +223,22 @@ static void test_files(void) {
     CHECK(SetFilePointerEx(h, to, &now, FILE_BEGIN) && now.QuadPart == 6, "seek");
     char buf[32] = {0};
     CHECK(ReadFile(h, buf, sizeof buf, &n, NULL) && n == 5 && !memcmp(buf, "world", 5), "read to the end gives the rest (%u bytes)", n);
+    /* positional transfers through an OVERLAPPED: at its offset whatever the file pointer says (nnfs.c reads every
+     * game file this way, from several threads on one handle), and the file pointer stands after the transfer */
+    OVERLAPPED ov = {0};
+    ov.Offset = 6;
+    memset(buf, 0, sizeof buf);
+    CHECK(ReadFile(h, buf, 3, &n, &ov) && n == 3 && !memcmp(buf, "wor", 3), "a read at OVERLAPPED offset 6 at the end of the file gives \"wor\" (%u bytes: %.3s)", n, buf);
+    ov.Offset = 0;
+    CHECK(ReadFile(h, buf, 5, &n, &ov) && n == 5 && !memcmp(buf, "hello", 5), "a read at OVERLAPPED offset 0 gives \"hello\"");
+    LARGE_INTEGER zero = {.QuadPart = 0}, after;
+    CHECK(SetFilePointerEx(h, zero, &after, FILE_CURRENT) && after.QuadPart == 5, "the file pointer stands after the positional read (%lld)", (long long)after.QuadPart);
+    ov.Offset = 6;
+    CHECK(WriteFile(h, "WORLD", 5, &n, &ov) && n == 5, "a write at OVERLAPPED offset 6");
+    ov.Offset = 0;
+    CHECK(ReadFile(h, buf, 11, &n, &ov) && n == 11 && !memcmp(buf, "hello WORLD", 11), "the write landed at its offset (%.11s)", buf);
+    ov.Offset = 6;
+    WriteFile(h, "world", 5, &n, &ov);                            /* back to "hello world" for the checks below */
     to.QuadPart = 5;
     SetFilePointerEx(h, to, NULL, FILE_BEGIN);
     CHECK(SetEndOfFile(h) && GetFileSizeEx(h, &size) && size.QuadPart == 5, "truncate at the file pointer");
