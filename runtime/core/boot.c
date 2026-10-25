@@ -3,9 +3,15 @@
  * other modules it asks for, in order. Unimplemented imports return 0. */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <math.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -127,9 +133,17 @@ static DWORD WINAPI profiler(LPVOID arg) {
         return 0;
     }
     while (GetTickCount64() < end) {
-        CONTEXT ctx;
         uint64_t chain[64];
         int k = 0;
+#ifndef _WIN32
+        uint64_t pcs[400];
+        int npc = host_thread_backtrace(g_prof_target, pcs, 400);
+        for (int depth = 0; depth < npc && k < 64; depth++) {
+            uint64_t g = guest_function_of(pcs[depth]);
+            if (g && (k == 0 || chain[k - 1] != g)) chain[k++] = g;
+        }
+#else
+        CONTEXT ctx;
         memset(&ctx, 0, sizeof ctx);
         ctx.ContextFlags = CONTEXT_FULL;
         SuspendThread(g_prof_target);
@@ -145,6 +159,7 @@ static DWORD WINAPI profiler(LPVOID arg) {
             if (!ctx.Rip) break;
         }
         ResumeThread(g_prof_target);
+#endif
         samples++;
         for (int i = 0; i < k; i++) {
             uint64_t callee = chain[i], caller = i + 1 < k ? chain[i + 1] : 0;
@@ -308,6 +323,18 @@ int main(int argc, char **argv) {
             /* where is the main host thread really? sample its instruction pointer and unwind */
             for (int s = 0; s < 3; s++) {
                 Sleep(50);
+#ifndef _WIN32
+                uint64_t pcs[200];
+                int npc = host_thread_backtrace(t, pcs, 200);
+                printf("  host pc sample %d: pc=%p -> f_%llx |", s, npc ? (void *)(uintptr_t)pcs[0] : NULL, (unsigned long long)(npc ? guest_function_of(pcs[0]) : 0));
+                uint64_t last = 0;
+                for (int depth = 0, shown = 0; depth < npc && shown < 12; depth++) {
+                    uint64_t g = guest_function_of(pcs[depth]);
+                    if (g && g != last) { printf(" f_%llx", (unsigned long long)g); shown++; last = g; }
+                    else if (!g && depth == 0) printf(" [host %p]", (void *)(uintptr_t)pcs[0]);
+                }
+                printf("\n");
+#else
                 CONTEXT ctx;
                 memset(&ctx, 0, sizeof ctx);
                 ctx.ContextFlags = CONTEXT_FULL;
@@ -328,6 +355,7 @@ int main(int argc, char **argv) {
                 }
                 printf("\n");
                 ResumeThread(t);
+#endif
             }
             for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
                 Sleep(37);
