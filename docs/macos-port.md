@@ -8,7 +8,7 @@ Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew Mo
 
 | What the renderer asks for | KosmicKrisp (SDK 1.4.363) | MoltenVK 1.4.2 |
 |---|---|---|
-| `VK_EXT_vertex_input_dynamic_state` (required, `nvn_vk_draw.c` stops without it) | no | no |
+| `VK_EXT_vertex_input_dynamic_state` (required on Windows; on macOS the layout is in the pipeline key) | no | no |
 | `VK_EXT_graphics_pipeline_library`, `VK_EXT_shader_object` | no | no |
 | `VK_EXT_extended_dynamic_state3`: blend enable/equation, write mask, sample mask, alpha to coverage | no (the renderer keys them instead) | no |
 | `logicOp` | yes | no |
@@ -18,8 +18,8 @@ Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew Mo
 | `geometryShader`, `wideLines` | no | no |
 | BC and ASTC textures | yes | yes |
 
-KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so the vertex layout
-has to become part of the pipeline key on both.
+KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so on macOS the vertex
+layout is part of the pipeline key ("The vertex layout in the pipeline key").
 
 ## Order of work
 
@@ -89,7 +89,8 @@ Each step builds and is checked before the next one starts.
    the renderer is always Vulkan. Graphics memory pools that show heap pages at a second address (virtual pools,
    `nvnMemoryPoolMapVirtual`): `nvn_stub.c` makes its views with `mach_vm_remap` without copying where Windows uses
    `MapViewOfFile3`, with the same 64 KB granularity and the same refusals; `tests/macos/test_vpool.c` (20 checks, in
-   `check_runtime.sh`) drives the real entry points. To do: the vertex layout in the pipeline key.
+   `check_runtime.sh`) drives the real entry points. The vertex layout is in the pipeline key (below, "The vertex layout
+   in the pipeline key"). To do: a fallback for custom border colours, the geometry stage.
 6. **Audio, video, Help**: audio through SDL3, H.264 through VideoToolbox, the Action Guide in WKWebView.
    Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
    audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
@@ -145,7 +146,7 @@ on core 0), the shim's blocking waits (`recomp_set_block_hooks`), and safe point
 the game reaches a safe point, and so whether the preemption latency is good enough or signals are needed; host-side
 blocking outside the shim (file reads) still holds a core.
 
-## The vertex layout in the pipeline key (design)
+## The vertex layout in the pipeline key
 
 Neither Mac driver has `VK_EXT_vertex_input_dynamic_state`, so a pipeline must be made with its vertex input state, and a
 draw must find the pipeline of its own layout. On macOS (`#ifndef _WIN32`: the Windows key, records and behaviour stay
