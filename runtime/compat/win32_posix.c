@@ -27,6 +27,9 @@
 #include <pwd.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <AudioToolbox/AudioServices.h>
+#include <CoreGraphics/CoreGraphics.h>
+
+static void win_path(char *p);
 
 /* ---------------------------------------------------------------- C runtime */
 int __argc;
@@ -496,7 +499,8 @@ DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD size) {
     if (!size) return 0;
     if (!m) m = GetModuleHandleA(NULL);
     if (!dladdr(m, &di) || !di.dli_fname) { out[0] = 0; return 0; }
-    snprintf(out, size, "%s", di.dli_fname);
+    if (!realpath(di.dli_fname, out) || strlen(out) + 1 > size) snprintf(out, size, "%s", di.dli_fname);
+    win_path(out);
     return (DWORD)strlen(out);
 }
 
@@ -632,6 +636,29 @@ void recomp_path(char *out, size_t n, const char *in) {
     size_t i = 0;
     for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
     out[i] = 0;
+}
+static void win_path(char *p) { for (; *p; p++) if (*p == '/') *p = '\\'; }      /* a path given to the runtime */
+char *_fullpath(char *out, const char *path, size_t n) {
+    char in[4096], buf[4096];
+    recomp_path(in, sizeof in, path);
+    if (in[0] == '/') snprintf(buf, sizeof buf, "%s", in);
+    else { char cwd[2048]; if (!getcwd(cwd, sizeof cwd)) return NULL; snprintf(buf, sizeof buf, "%s/%s", cwd, in); }
+    char *parts[512], *save = NULL;
+    int np = 0;
+    for (char *t = strtok_r(buf, "/", &save); t; t = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(t, ".")) continue;
+        if (!strcmp(t, "..")) { if (np) np--; continue; }
+        if (np < 512) parts[np++] = t;
+    }
+    char res[4096] = "";
+    size_t len = 0;
+    for (int i = 0; i < np; i++) len += (size_t)snprintf(res + len, sizeof res - len, "/%s", parts[i]);
+    if (!np) snprintf(res, sizeof res, "/");
+    if (!out) out = malloc(strlen(res) + 1), n = strlen(res) + 1;
+    if (strlen(res) + 1 > n) return NULL;
+    memcpy(out, res, strlen(res) + 1);
+    win_path(out);
+    return out;
 }
 static int access_ok(const char *p) { return access(p, F_OK) == 0; }
 #undef fopen
@@ -790,20 +817,19 @@ DWORD GetTempPathA(DWORD n, LPSTR out) {
     const char *t = getenv("TMPDIR");
     char buf[4096];
     snprintf(buf, sizeof buf, "%s%s", t && t[0] ? t : "/tmp/", t && t[0] && t[strlen(t) - 1] != '/' ? "/" : "");
+    win_path(buf);
     size_t len = strlen(buf);
     if (len + 1 > n) return (DWORD)(len + 1);
     memcpy(out, buf, len + 1);
     return (DWORD)len;
 }
 DWORD GetFullPathNameA(LPCSTR path, DWORD n, LPSTR out, LPSTR *file_part) {
-    PATH_ARG(p, path);
     char buf[4096];
-    if (p[0] == '/') snprintf(buf, sizeof buf, "%s", p);
-    else { char cwd[2048]; if (!getcwd(cwd, sizeof cwd)) return 0; snprintf(buf, sizeof buf, "%s/%s", cwd, p); }
+    if (!_fullpath(buf, path, sizeof buf)) return 0;
     size_t len = strlen(buf);
     if (len + 1 > n) return (DWORD)(len + 1);
     memcpy(out, buf, len + 1);
-    if (file_part) { char *sl = strrchr(out, '/'); *file_part = sl ? sl + 1 : out; }
+    if (file_part) { char *sl = strrchr(out, '\\'); *file_part = sl ? sl + 1 : out; }
     return (DWORD)len;
 }
 DWORD GetModuleFileNameW(HMODULE m, LPWSTR out, DWORD size) {
@@ -1017,6 +1043,37 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
     return (FARPROC)dlsym(h, name);
 }
 BOOL FreeLibrary(HMODULE m) { return m && !dlclose(m); }
+
+/* ---------------------------------------------------------------- the keyboard */
+int recomp_mac_keycode(int vk) {
+    /* kVK_ANSI_A.. of HIToolbox/Events.h: the keys of the US layout's positions */
+    static const signed char letters[26] = {0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E,
+                                            0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06};
+    static const signed char digits[10] = {0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19};
+    static const signed char numpad[10] = {0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C};
+    static const signed char fkeys[12] = {0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F};
+    if (vk >= 'A' && vk <= 'Z') return letters[vk - 'A'];
+    if (vk >= '0' && vk <= '9') return digits[vk - '0'];
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) return numpad[vk - VK_NUMPAD0];
+    if (vk >= VK_F1 && vk < VK_F1 + 12) return fkeys[vk - VK_F1];
+    switch (vk) {
+    case VK_BACK: return 0x33; case VK_TAB: return 0x30; case VK_RETURN: return 0x24; case VK_SHIFT: return 0x38;
+    case VK_CONTROL: return 0x3B; case VK_MENU: return 0x3A; case VK_ESCAPE: return 0x35; case VK_SPACE: return 0x31;
+    case VK_LEFT: return 0x7B; case VK_UP: return 0x7E; case VK_RIGHT: return 0x7C; case VK_DOWN: return 0x7D;
+    default: return -1;
+    }
+}
+static int (*g_key_source)(int vk);
+void recomp_set_key_source(int (*down)(int vk)) { g_key_source = down; }
+SHORT GetAsyncKeyState(int vk) {
+    if (g_key_source) return g_key_source(vk) ? (SHORT)0x8000 : 0;
+    int k = recomp_mac_keycode(vk);
+    if (k < 0) return 0;
+    int down = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)k);
+    if (!down && (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU))   /* the right-hand modifier too, as Windows' generic code */
+        down = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)(vk == VK_SHIFT ? 0x3C : vk == VK_CONTROL ? 0x3E : 0x3D));
+    return down ? (SHORT)0x8000 : 0;
+}
 
 /* ---------------------------------------------------------------- message boxes */
 int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {

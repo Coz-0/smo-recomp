@@ -673,7 +673,7 @@ static void host_module_line(const char *indent, uint64_t pc) {
     HMODULE m = NULL;
     char mod[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)(uintptr_t)pc, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
-    const char *bn = strrchr(mod, '/');
+    const char *bn = strrchr(mod, '\\');
     printf("%s%s+0x%llx\n", indent, bn ? bn + 1 : mod, (unsigned long long)(pc - (uintptr_t)m));
 }
 static void crash_signal(int sig, siginfo_t *si, void *ucv) {

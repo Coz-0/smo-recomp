@@ -22,8 +22,11 @@
 typedef int BOOL;
 typedef unsigned char BYTE;
 typedef unsigned short WORD;
-typedef uint32_t DWORD, UINT, ULONG;
-typedef int32_t LONG;
+typedef uint32_t DWORD, UINT;
+/* LONG / ULONG are 32 bits on Windows and long here: the runtime only counts with them, and prints them with %ld, which
+ * would read 8 bytes of a variadic 4-byte int on Apple arm64. DWORD keeps 32 bits (layouts); its prints cast. */
+typedef long LONG;
+typedef unsigned long ULONG;
 typedef int64_t LONG64, LONGLONG;
 typedef uint64_t ULONG64, ULONGLONG, DWORD64, DWORD_PTR;
 typedef size_t SIZE_T;
@@ -231,8 +234,9 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID arg, PVOID *ct
 DWORD GetLastError(void);
 void SetLastError(DWORD e);
 
-/* ---- files. Paths may use backslashes (the runtime builds Windows paths): every path taken here, and fopen's,
- * has them turned into slashes. */
+/* ---- files. The runtime builds Windows paths ("%s\\..\\config", strrchr(path, '\\')), so the paths given to it
+ * here (GetModuleFileName, GetTempPath, GetFullPathName, _fullpath) are written with backslashes, and every path taken
+ * here, and fopen's, has its backslashes turned back into slashes. "\\Users\\x" is "/Users/x". */
 #define GENERIC_READ 0x80000000u
 #define GENERIC_WRITE 0x40000000u
 #define FILE_SHARE_READ 1u
@@ -297,6 +301,7 @@ HANDLE FindFirstFileW(LPCWSTR pattern, WIN32_FIND_DATAW *fd);
 BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
 BOOL FindClose(HANDLE h);
 FILE *recomp_fopen(const char *path, const char *mode);
+char *_fullpath(char *out, const char *path, size_t n);      /* absolute, "." and ".." resolved, backslashes; need not exist */
 #define fopen(p, m) recomp_fopen((p), (m))
 void recomp_path(char *out, size_t n, const char *in);     /* a Windows-style path as a macOS one */
 
@@ -339,6 +344,28 @@ HMODULE LoadLibraryW(LPCWSTR name);
 typedef void (*FARPROC)(void);
 FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 BOOL FreeLibrary(HMODULE m);
+
+/* ---- the keyboard: GetAsyncKeyState with Windows virtual-key codes (the runtime's key names and remapping files use
+ * them). The display sets where key states come from (its window's keys); before that, the system's key state. */
+#define VK_BACK 0x08
+#define VK_TAB 0x09
+#define VK_RETURN 0x0D
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_ESCAPE 0x1B
+#define VK_SPACE 0x20
+#define VK_LEFT 0x25
+#define VK_UP 0x26
+#define VK_RIGHT 0x27
+#define VK_DOWN 0x28
+#define VK_NUMPAD0 0x60
+#define VK_F1 0x70
+#define VK_F11 0x7A
+#define VK_F12 0x7B
+SHORT GetAsyncKeyState(int vk);                   /* 0x8000 while the key is down */
+int recomp_mac_keycode(int vk);                   /* the macOS key code (kVK_*) of a virtual key, -1 if none */
+void recomp_set_key_source(int (*down)(int vk));  /* display: key states from its window (NULL: the system's) */
 
 /* ---- message boxes: a CoreFoundation alert, modal and blocking on any thread as on Windows. Without a user to
  * answer (no window server) it returns at once with the default button. */

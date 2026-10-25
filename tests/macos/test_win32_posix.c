@@ -203,7 +203,7 @@ static BOOL CALLBACK once_fn(PINIT_ONCE o, PVOID arg, PVOID *ctx) { (void)o; (vo
 static void test_files(void) {
     char tmp[1024], dir[1100], path[1200], path2[1200];
     GetTempPathA(sizeof tmp, tmp);
-    CHECK(tmp[strlen(tmp) - 1] == '/', "temp path ends with a separator (%s)", tmp);
+    CHECK(tmp[strlen(tmp) - 1] == '\\' && tmp[0] == '\\', "temp path is given Windows-style, with a final separator (%s)", tmp);
     snprintf(dir, sizeof dir, "%ssmo_shim_test_%lu", tmp, (unsigned long)GetCurrentProcessId());
     CHECK(CreateDirectoryA(dir, NULL), "create folder");
     CHECK(!CreateDirectoryA(dir, NULL) && GetLastError() == ERROR_ALREADY_EXISTS, "create an existing folder: ERROR_ALREADY_EXISTS (%u)", GetLastError());
@@ -297,6 +297,10 @@ static void test_strings_and_misc(void) {
     CHECK(LoadLibraryA("xinput1_4.dll") == NULL, "a Windows DLL is not found");
     static const int ro = 5;
     static int rw = 5;
+    char full[512];
+    CHECK(_fullpath(full, "/Users\\x/./a/../b\\c", sizeof full) && !strcmp(full, "\\Users\\x\\b\\c"), "_fullpath resolves . and .. (%s)", full);
+    CHECK(recomp_mac_keycode('A') == 0x00 && recomp_mac_keycode(VK_RETURN) == 0x24 && recomp_mac_keycode(VK_F1 + 11) == 0x6F && recomp_mac_keycode(0x5D) == -1,
+          "virtual keys to macOS key codes");
     CHECK(IsBadWritePtr((void *)&ro, sizeof ro) && !IsBadWritePtr(&rw, sizeof rw) && !IsBadReadPtr(&ro, sizeof ro) && IsBadReadPtr((void *)(uintptr_t)8, 4),
           "IsBadReadPtr / IsBadWritePtr");
     SYSTEMTIME st;

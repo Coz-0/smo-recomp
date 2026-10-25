@@ -1,13 +1,14 @@
 #!/bin/bash
 # The macOS port's checks beyond runtime/core (docs/macos-port.md, step 2): check_core.sh, then every file of the
 # folders ported so far compiled with -Wall -Werror against the stand-in image.h, then the self-tests that run without
-# a dump: nntime.c's time zone rule against localtime_r in zones of every kind, nnfs.c's save data journal. Usage: tests/macos/check_runtime.sh
+# a dump: nntime.c's time zone rule against localtime_r in zones of every kind, nnfs.c's save data journal, the
+# controller self-test with SDL3's virtual pads. Usage: tests/macos/check_runtime.sh
 set -u
 cd "$(dirname "$0")/../.."
 OUT=build/macos-check
 mkdir -p "$OUT"
 CC=${CC:-clang}
-FOLDERS=(libc os fs game)
+FOLDERS=(libc os fs game input)
 INC=(-Iruntime/compat -Itests/macos/stub -I/opt/homebrew/include)
 for d in runtime/*/; do INC+=("-I${d%/}"); done
 fail=0
@@ -18,13 +19,13 @@ tests/macos/check_core.sh || fail=1
 for d in "${FOLDERS[@]}"; do
     for f in runtime/$d/*.c; do
         log="$OUT/$(basename "$f" .c).log"
-        "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Werror "${INC[@]}" -c "$f" -o "$OUT/$(basename "$f" .c).o" >"$log" 2>&1
+        "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable -Werror "${INC[@]}" -c "$f" -o "$OUT/$(basename "$f" .c).o" >"$log" 2>&1
         r=$?; step $r "compile $f"; [ $r -ne 0 ] && sed 's/^/      /' "$log" | head -20
     done
 done
 
 "$CC" -std=gnu11 -O1 -Wall -Wno-unused-function "${INC[@]}" tests/macos/test_nntime.c runtime/compat/win32_posix.c \
-    -framework CoreFoundation -framework AudioToolbox -o "$OUT/test_nntime"
+    -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_nntime"
 step $? "link nntime.c's self-test (test_nntime)"
 # northern and southern daylight time, a half-hour and a 45-minute offset, daylight time abolished (2019), a zone whose
 # rule is in its footer only (Casablanca), UTC
@@ -35,10 +36,17 @@ for z in America/New_York Europe/Berlin Australia/Sydney Asia/Kolkata Pacific/Ch
 done
 
 "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" runtime/fs/nnfs.c runtime/fs/nnfsdir.c runtime/compat/win32_posix.c \
-    tests/macos/test_nnfs.c -framework CoreFoundation -framework AudioToolbox -o "$OUT/test_nnfs"
+    tests/macos/test_nnfs.c -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_nnfs"
 step $? "link nnfs.c's and nnfsdir.c's self-tests (test_nnfs)"
 "$OUT/test_nnfs" > "$OUT/nnfs.txt" 2>&1
 step $? "save data journal, mount table, directory listing: $(tail -1 "$OUT/nnfs.txt")"
+
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable "${INC[@]}" runtime/input/nnhid.c runtime/input/nnpad_sdl.c \
+    runtime/compat/win32_posix.c tests/macos/test_pad.c -L/opt/homebrew/lib -lSDL3 -framework CoreFoundation -framework AudioToolbox \
+    -framework CoreGraphics -o "$OUT/test_pad"
+step $? "link the controller self-test with SDL3 (test_pad)"
+"$OUT/test_pad" > "$OUT/pad.txt" 2>&1
+step $? "controllers through SDL3 virtual pads: $(grep -o 'pad self-test: .*' "$OUT/pad.txt" | tail -1)"
 
 [ $fail -eq 0 ] && echo "check_runtime: all passed" || echo "check_runtime: FAILED (logs in $OUT)"
 exit $fail
