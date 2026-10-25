@@ -129,7 +129,9 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
                !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
     }
     if (!D.f13.dynamicRendering || !D.f13.synchronization2) vkd_fail("the device lacks dynamicRendering / synchronization2");
-    if (!D.has_vids) nvn_vk_missing("a GPU without VK_EXT_vertex_input_dynamic_state (the vertex layout is not yet part of the pipeline key)");
+#ifdef _WIN32
+    if (!D.has_vids) nvn_vk_missing("a GPU without VK_EXT_vertex_input_dynamic_state (the vertex layout is part of the pipeline key on macOS only)");
+#endif
     if (!D.f2.features.textureCompressionBC) nvn_vk_missing("a GPU without BC texture compression");
     di->enabledExtensionCount = D.next; di->ppEnabledExtensionNames = D.exts; di->pNext = &D.f2;
     printf("nvn_vk: features: vertex input dynamic %d, custom border colour %d, provoking vertex last %d, 8-bit indices %d, list restart %d, ASTC %d, depth clamp %d, wide lines %d, robust buffers %d\n",
@@ -531,6 +533,7 @@ static VkFormat vertex_vkfmt(int nf) {
     }
     return VK_FORMAT_UNDEFINED;
 }
+#include "nvn_vk_vlayout.c"                        /* the vertex input of a draw: dynamic, or part of the pipeline key */
 
 /* ---------------------------------------------------------------- images */
 typedef struct VView { EView e; int vtype, attach; VkImageView view; struct VView *next; } VView;
@@ -2127,11 +2130,22 @@ static int draw_prepare(unsigned prim) {
             }
         }
     }
+    for (int i = 0; i < 16 && i < R.nattr; i++) {
+        int nf = (int)(R.vattr[i] & 0xff);
+        if (nf && !vertex_vkfmt(nf)) { static char msg[64]; snprintf(msg, sizeof msg, "vertex attribute format 0x%x", nf); nvn_vk_missing(msg); }
+    }
     /* 3. pass and pipeline */
     if (!pass_begin()) return 0;
     PKey k;
     memset(&k, 0, sizeof k);
     k.vs = vs->id; k.fs = fs ? fs->id : 0; k.topo_class = tclass[prim]; k.logic = R.logic; k.sshade = fs ? (uint8_t)R.prog[1]->sample_shading : 0;
+#ifndef _WIN32
+    if (!D.has_vids) {                             /* no dynamic vertex input (both Mac drivers): the layout is part of the key */
+        uint32_t bound = 0;
+        for (int i = 0; i < 16; i++) if (voff[i] != ~0ull) bound |= 1u << i;
+        vl_of(&k.vl, R.nattr, R.vattr, ints, sints, (const VStream *)R.vstream, bound);
+    }
+#endif
     if (!D.has_eds3) {                             /* without extended dynamic state 3 this state is part of the key */
         k.chanmask = R.chanmask; k.sample_mask = R.sample_mask; k.poly = R.poly[2] < 3 ? R.poly[2] : 2;
         k.a2c = R.ms[1] != 0; k.dclamp = R.depth_clamp && D.f2.features.depthClamp; k.blend_on = R.blend_on;
@@ -2148,42 +2162,24 @@ static int draw_prepare(unsigned prim) {
     if (gs && g_gs_dbg_fs) { vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); R.dyn_dirty = 1; }      /* SMO_VK_GS_DEBUG=3 (gs_pipe_get) */
     vkCmdSetPrimitiveTopology(R.cmd, (VkPrimitiveTopology)topo[prim]);
     vkCmdSetPrimitiveRestartEnable(R.cmd, R.restart && (D.has_plr || prim == 3 || prim == 5 || prim == 6));
-    /* 4. vertex input */
+    /* 4. vertex input (nvn_vk_vlayout.c) */
     {
         VkVertexInputBindingDescription2EXT bd[17];
         VkVertexInputAttributeDescription2EXT ad[16];
         VkBuffer vb[17];
         VkDeviceSize vo[17];
-        uint32_t nb = 0, na = 0, bmap[32], need_const = 0;
-        memset(bmap, 0xff, sizeof bmap);
-        for (int i = 0; i < 16; i++) {
-            uint32_t a = i < R.nattr ? R.vattr[i] : 0;
-            int nf = (int)(a & 0xff), stream = (int)((a >> 8) & 31);
-            VkFormat f = nf ? vertex_vkfmt(nf) : VK_FORMAT_UNDEFINED;
-            if (nf && !f) { static char msg[64]; snprintf(msg, sizeof msg, "vertex attribute format 0x%x", nf); nvn_vk_missing(msg); }
-            memset(&ad[na], 0, sizeof ad[na]);
-            ad[na].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT; ad[na].location = (uint32_t)i;
-            if (f && stream < 16 && voff[stream] != ~0ull) {
-                if (bmap[stream] == 0xffffffffu) {
-                    bmap[stream] = nb;
-                    memset(&bd[nb], 0, sizeof bd[nb]);
-                    bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = R.vstream[stream].stride;
-                    bd[nb].inputRate = R.vstream[stream].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX; bd[nb].divisor = R.vstream[stream].divisor ? R.vstream[stream].divisor : 1;
-                    vb[nb] = vbufs[stream]; vo[nb] = voff[stream]; nb++;
-                }
-                ad[na].binding = bmap[stream]; ad[na].format = f; ad[na].offset = a >> 14; na++;
-            } else if (vs->dep >> i & 1 || 1) {       /* not supplied: (0, 0, 0, 1), as OpenGL's current attribute value; integer inputs take the integer copy */
-                ad[na].binding = 16; ad[na].format = (ints >> i & 1) ? ((sints >> i & 1) ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT) : VK_FORMAT_R32G32B32A32_SFLOAT; ad[na].offset = (ints >> i & 1) ? 16 : 0;
-                need_const = 1; na++;
-            }
+        uint32_t nb = 0, na = 0;
+        if (D.has_vids) {
+            vin_dynamic(R.nattr, R.vattr, ints, sints, (const VStream *)R.vstream, vbufs, voff, R.zero, bd, ad, vb, vo, &nb, &na);
+            vkCmdSetVertexInputEXT(R.cmd, nb, bd, na, ad);
         }
-        if (need_const) {
-            memset(&bd[nb], 0, sizeof bd[nb]);
-            bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = 0; bd[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; bd[nb].divisor = 1;
-            for (uint32_t i = 0; i < na; i++) if (ad[i].binding == 16) ad[i].binding = nb;
-            vb[nb] = R.zero; vo[nb] = 65536; nb++;
+#ifndef _WIN32
+        else {                                     /* the pipeline holds the layout: only the buffers, in its binding order */
+            int bstream[17];
+            vl_descs(&k.vl, bd, ad, bstream, &nb, &na);
+            for (uint32_t b = 0; b < nb; b++) { if (bstream[b] < 0) { vb[b] = R.zero; vo[b] = 65536; } else { vb[b] = vbufs[bstream[b]]; vo[b] = voff[bstream[b]]; } }
         }
-        vkCmdSetVertexInputEXT(R.cmd, nb, bd, na, ad);
+#endif
         if (nb) vkCmdBindVertexBuffers(R.cmd, 0, nb, vb, vo);
     }
     /* 5. descriptors */
@@ -2313,7 +2309,7 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
     vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); vkCmdSetDepthWriteEnable(R.cmd, VK_FALSE); vkCmdSetDepthCompareOp(R.cmd, VK_COMPARE_OP_ALWAYS); vkCmdSetStencilTestEnable(R.cmd, VK_TRUE);
     vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS);
     vkCmdSetDepthBiasEnable(R.cmd, VK_FALSE); vkCmdSetPrimitiveRestartEnable(R.cmd, VK_FALSE); vkCmdSetRasterizerDiscardEnable(R.cmd, VK_FALSE);
-    vkCmdSetVertexInputEXT(R.cmd, 0, NULL, 0, NULL);
+    if (D.has_vids) vkCmdSetVertexInputEXT(R.cmd, 0, NULL, 0, NULL);   /* else: the key's layout is empty (no vertex input) */
     vkCmdDraw(R.cmd, 3, 1, 0, 0);
     R.pipe_bound = NULL; R.dyn_dirty = 1;
 }

@@ -19,13 +19,13 @@ before=$(git status --porcelain --untracked-files=all | sort)
 tests/macos/check_core.sh || fail=1
 
 # gfx/ and audio/ carry style warnings of their own (unused variables, && within ||, switches over part of an enum),
-# hidden in the real build (-w); these folders are compiled without them. nvn_vk_draw.c, nvn_vk_pipelines.c and
-# nvn_vk_watchdog.c are part of nvn_vk.c.
+# hidden in the real build (-w); these folders are compiled without them. nvn_vk_draw.c, nvn_vk_pipelines.c,
+# nvn_vk_vlayout.c and nvn_vk_watchdog.c are part of nvn_vk.c.
 RELAXED=(-Wno-unused-variable -Wno-logical-op-parentheses -Wno-switch -Wno-misleading-indentation -Wno-unknown-pragmas)
 INC+=(-I"$HOME/VulkanSDK/1.4.363.0/macOS/include")
 for d in "${FOLDERS[@]}" gfx audio compat; do
     for f in runtime/$d/*.c; do
-        case "$f" in */nvn_vk_draw.c|*/nvn_vk_pipelines.c|*/nvn_vk_watchdog.c) continue ;; esac
+        case "$f" in */nvn_vk_draw.c|*/nvn_vk_pipelines.c|*/nvn_vk_vlayout.c|*/nvn_vk_watchdog.c) continue ;; esac
         extra=(); case "$d" in gfx|audio) extra=("${RELAXED[@]}") ;; esac
         log="$OUT/$(basename "$f" .c).log"
         "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable ${extra[@]+"${extra[@]}"} -Werror "${INC[@]}" -c "$f" -o "$OUT/$(basename "$f" .c).o" >"$log" 2>&1
@@ -71,6 +71,17 @@ step $? "sockets, resolver, ssl, nsd on BSD sockets: $(grep -o '[0-9]* cases, [0
 step $? "link the console core model's self-test (test_core_model)"
 "$OUT/test_core_model" > "$OUT/core_model.txt" 2>&1
 step $? "console core model (core tokens): $(grep -o 'core model: .*' "$OUT/core_model.txt" | tail -1); $(grep -o 'every 20 us: .*' "$OUT/core_model.txt" | sed 's/.*ready to running: //')"
+
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" runtime/gfx/nvn_stub.c runtime/compat/win32_posix.c tests/macos/test_vpool.c \
+    -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_vpool"
+step $? "link the virtual memory pool test (test_vpool)"
+"$OUT/test_vpool" > "$OUT/vpool.txt" 2>&1
+step $? "virtual memory pools on Mach VM (mach_vm_remap views of heap pages): $(grep -o 'vpool: .*' "$OUT/vpool.txt" | tail -1)"
+
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" tests/macos/test_vlayout.c -o "$OUT/test_vlayout"
+step $? "link the vertex layout test (test_vlayout)"
+"$OUT/test_vlayout" > "$OUT/vlayout.txt" 2>&1
+step $? "vertex layout in the pipeline key equals the dynamic vertex input: $(grep -o 'vlayout: .*' "$OUT/vlayout.txt" | tail -1)"
 
 "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -DFONTLL_TEST "${INC[@]}" runtime/services/nnfontll.c runtime/compat/win32_posix.c \
     -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework AudioToolbox -o "$OUT/fonttest"
