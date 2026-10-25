@@ -92,6 +92,14 @@ Each step builds and is checked before the next one starts.
    Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
    audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
    counted).
+   Movies done (not seen in the game yet): `nnmovie_mf.c`'s `movie::` protocol is shared, and the reader under it is
+   `nnmovie_src.h`: Media Foundation's source reader on Windows, an `AVAssetReader` on macOS (`nnmovie_av.m`): NV12
+   (video range, as Media Foundation's H.264 decoder gives) and 16-bit PCM in blocks of at most 1024 frames. The movie
+   goes to a temporary file (an `AVURLAsset` reads a URL), removed when the extractor is destroyed. A seek, or a track
+   selected or unselected while reading, makes a new reader; each track drops what it already delivered.
+   `tests/macos/test_movie.m` (24 checks, in `check_runtime.sh`) writes an H.264 + AAC movie whose every frame says
+   its own number and reads it through the reader and through the real `movie::Extractor` / `Decoder` objects as the
+   game drives them: every frame once and in order, the whole sound, the seek, the track changes, the events.
 
 ## The console core model on macOS
 

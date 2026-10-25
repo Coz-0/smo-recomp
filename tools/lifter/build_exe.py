@@ -58,6 +58,7 @@ LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid
 if T.MAC:
     HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
     HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
+    HOST_SOURCES['services'] = HOST_SOURCES['services'] + ['nnmovie_av.m']      # nnmovie_mf.c's reader on AVFoundation
     LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
 
 
@@ -98,7 +99,8 @@ def build_game_dll(force):
 
 def compile_host(job):
     src, obj = job
-    r = subprocess.run([CLANG, '-c'] + HOST_FLAGS + [src, '-o', obj], capture_output=True, text=True)
+    arc = ['-fobjc-arc'] if src.endswith('.m') else []          # Objective-C (macOS): ARC, as nnmovie_av.m requires
+    r = subprocess.run([CLANG, '-c'] + HOST_FLAGS + arc + [src, '-o', obj], capture_output=True, text=True)
     return src, r.returncode, (r.stdout + r.stderr)
 
 
