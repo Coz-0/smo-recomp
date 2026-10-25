@@ -1,6 +1,6 @@
 """Where the build's files are (used by the tools, scripts and tests).
 
-The game is Super Mario Odyssey 1.4.1: the base game with its 1.4.1 update applied. Everything derived from your dump
+The game is Super Mario Odyssey 1.3.0: the base game with its 1.3.0 update applied. Everything derived from your dump
 goes under build/:
     build/dump/update   the program's modules (ExeFS, ELF conversions) and its control data
     build/<the rest>    romfs, manual, functions, lift, obj, gen, bin, run, ... laid out so that the runtime's paths
@@ -10,7 +10,7 @@ import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = '1.4.1'                                       # the game version this project builds
+VERSION = '1.3.0'                                       # the game version this project builds
 BUILD = os.environ.get('SMO_BUILD_DIR') or os.path.join(REPO, 'build')     # SMO_BUILD_DIR: a build folder elsewhere (tests)
 DUMP = os.path.join(BUILD, 'dump', 'update')
 RUNTIME = os.path.join(REPO, 'runtime')
