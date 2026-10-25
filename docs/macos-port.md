@@ -8,7 +8,7 @@ Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew Mo
 
 | What the renderer asks for | KosmicKrisp (SDK 1.4.363) | MoltenVK 1.4.2 |
 |---|---|---|
-| `VK_EXT_vertex_input_dynamic_state` (required, `nvn_vk_draw.c` stops without it) | no | no |
+| `VK_EXT_vertex_input_dynamic_state` (required on Windows; on macOS the layout is in the pipeline key) | no | no |
 | `VK_EXT_graphics_pipeline_library`, `VK_EXT_shader_object` | no | no |
 | `VK_EXT_extended_dynamic_state3`: blend enable/equation, write mask, sample mask, alpha to coverage | no (the renderer keys them instead) | no |
 | `logicOp` | yes | no |
@@ -18,8 +18,8 @@ Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew Mo
 | `geometryShader`, `wideLines` | no | no |
 | BC and ASTC textures | yes | yes |
 
-KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so the vertex layout
-has to become part of the pipeline key on both.
+KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so on macOS the vertex
+layout is part of the pipeline key ("The vertex layout in the pipeline key").
 
 ## Order of work
 
@@ -86,8 +86,11 @@ Each step builds and is checked before the next one starts.
    and driver choice (KosmicKrisp by default, `SMO_VK_DRIVER=moltenvk`), the freeze watchdog's thread report (Mach
    threads, `dladdr` names), the index scan in NEON (200,000 random buffers equal to the scalar rule). The OpenGL
    renderer cannot run on macOS (OpenGL 4.6 and NVIDIA extensions): its file compiles against `compat/GL/gl.h` and
-   the renderer is always Vulkan. To do: the vertex layout in the pipeline key; graphics memory pools that show heap
-   pages at a second address (`nvn_stub.c` uses `MapViewOfFile3`: `mach_vm_remap` here).
+   the renderer is always Vulkan. Graphics memory pools that show heap pages at a second address (virtual pools,
+   `nvnMemoryPoolMapVirtual`): `nvn_stub.c` makes its views with `mach_vm_remap` without copying where Windows uses
+   `MapViewOfFile3`, with the same 64 KB granularity and the same refusals; `tests/macos/test_vpool.c` (20 checks, in
+   `check_runtime.sh`) drives the real entry points. The vertex layout is in the pipeline key (below, "The vertex layout
+   in the pipeline key"). To do: a fallback for custom border colours, the geometry stage.
 6. **Audio, video, Help**: audio through SDL3, H.264 through VideoToolbox, the Action Guide in WKWebView.
    Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
    audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
@@ -156,6 +159,35 @@ on core 0), the shim's blocking waits (`recomp_set_block_hooks`), and safe point
 (hostrt.c). The real program runs with it on (`check_link.sh`). **Still open, to be measured with the game:** how often
 the game reaches a safe point, and so whether the preemption latency is good enough or signals are needed; host-side
 blocking outside the shim (file reads) still holds a core.
+
+## The vertex layout in the pipeline key
+
+Neither Mac driver has `VK_EXT_vertex_input_dynamic_state`, so a pipeline must be made with its vertex input state, and a
+draw must find the pipeline of its own layout. On macOS (`#ifndef _WIN32`: the Windows key, records and behaviour stay
+byte for byte as they are) the pipeline key `PKey` gains `vl`, the layout as the draw derives it today:
+
+- per attribute location 0..15: not supplied (a constant (0, 0, 0, 1), float, unsigned or signed: three codes), or
+  supplied: the NVN vertex format, the stream and the offset;
+- per stream 0..15 an attribute reads: the stride and the instance divisor (0: per vertex). The stride is in the key, not
+  dynamic: a dynamic stride (`vkCmdBindVertexBuffers2`) must be 0 or cover every attribute of its binding, a rule the
+  extension's path does not have and the game's meshes are not known to keep.
+
+The Vulkan bindings are numbered from `vl` alone, in attribute order, as the draw numbers them now. One function makes
+the binding and attribute descriptions from `vl` (`nvn_vk_vlayout.c`), used both where the pipeline is made and at the
+draw, so the two can't disagree. Where the key is built:
+
+- at a draw (`draw_prepare`): from the bound attributes, streams and buffers, before `pipe_get`;
+- in the look-ahead (`scan_draw`): the same, from the stream and buffer state the scan follows (`OP_VBUF`,
+  `OP_VSTREAM`, as it already follows `OP_VATTR`);
+- in `pipes.bin`: the record holds the key, so a pipeline made from a record has its layout.
+
+Not covered: prediction (`SMO_VK_PREDICT`, which needs extended dynamic state 3 that neither Mac driver has) and pipeline
+libraries (`D.has_gpl` needs dynamic vertex input). Both are already off on the Mac. **To be measured with the game:** how
+many more pipelines there are per vertex stage, and how many are made at a draw.
+
+**Checked by** `tests/macos/test_vlayout.c`: for random attribute, stream and buffer states, the descriptions made from
+the key equal those the dynamic path (the Windows one) gives for the same state, and states that differ only in stride
+give different keys only through the stride.
 
 ## Things the Mac does differently
 
