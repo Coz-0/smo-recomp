@@ -222,15 +222,15 @@ BOOL TryAcquireSRWLockExclusive(SRWLOCK *l) { return os_unfair_lock_trylock(&l->
 void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs); }
 void DeleteCriticalSection(CRITICAL_SECTION *cs) { (void)cs; }
 void EnterCriticalSection(CRITICAL_SECTION *cs) {
-    DWORD me = GetCurrentThreadId();
-    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
+    DWORD me = GetCurrentThreadId();                      /* never 0 (thread_start); 0 means free below */
+    if (me && (DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
     lock_slow(&cs->l);
     __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
 }
 BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
     DWORD me = GetCurrentThreadId();
-    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
+    if (me && (DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
     if (!os_unfair_lock_trylock(&cs->l)) return FALSE;
     __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
@@ -350,6 +350,12 @@ static Obj *self_obj(void) {
 static void *thread_start(void *p) {
     Obj *o = p;
     t_self = o;
+    /* The thread's own id, before anything else runs on it. CreateThread also stores it after pthread_create, but
+     * the thread can be here first: it then saw 0 as its id, and EnterCriticalSection's owner check (OwningThread 0 =
+     * free, equal to "me" 0) took a free lock for its own and only counted the depth; the later Leave unlocked an
+     * os_unfair_lock the thread had never taken (_os_unfair_lock_unowned_abort, found with the pipeline workers at
+     * start-up). */
+    o->port = pthread_mach_thread_np(pthread_self());
     pthread_mutex_lock(&o->m);
     while (o->gate) pthread_cond_wait(&o->cv, &o->m);
     pthread_mutex_unlock(&o->m);
