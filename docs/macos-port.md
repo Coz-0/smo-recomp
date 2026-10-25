@@ -64,6 +64,13 @@ Each step builds and is checked before the next one starts.
   the SDK module at 0x8500000000 (`hostrt.h`, `tools/target.py`; the lifted code is made for these bases, and
   `image.h` says which bases it was made for, so a mismatch stops the build). `hostrt.c` reserves the whole window
   when the program loads. `tests/macos/check_core.sh` launches the mapping test 20 times.
+- **No code patching.** `smo_fast.c` makes one hot game function (the sampler list sort, 1-2 ms of the main thread a
+  frame at Cascade Kingdom on Windows) call a host version by rewriting a `call` in the loaded game code. The game's
+  code on macOS is a signed library, and a written code page fails its signature check, so on macOS the sort runs as
+  lifted until the lifter itself can emit the call to the host version.
+- **`__try` probes.** The runtime reads memory that may not be readable inside `__try { } __except (1) { }`. On macOS
+  the shim gives that form with `sigsetjmp` and the SIGSEGV/SIGBUS handler. As with `setjmp`, a local changed in the
+  block and read after a fault must be `volatile`; none of the runtime's blocks does that.
 - **No core affinity: the console core model must be rebuilt.** On Windows `os_threads.c` keeps the game's threads to
   the console's three cores by pinning each to one of three host processors (`SetThreadAffinityMask`) with Windows
   priorities in six levels, so that, as on the console, only the highest-priority ready thread of a core runs. Its

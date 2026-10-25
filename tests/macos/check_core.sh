@@ -56,5 +56,9 @@ grep -q '^GUEST TRAP: test trap (0x8100000104), on thread test' "$OUT/trap.txt" 
     grep -A3 'guest call stack' "$OUT/trap.txt" | grep -q 'f_8100000100'
 step $(( ($? != 0) | (r != 4) )) "guest trap: the message, then the report, exit code 4 (got $r)"
 
+"$OUT/test_hostrt" "$OUT/image.bin" probe > "$OUT/probe.txt" 2>&1
+r=$?; grep -q '^probe: caught' "$OUT/probe.txt" && ! grep -q 'HOST EXCEPTION' "$OUT/probe.txt"
+step $(( r | $? )) "a __try probe of unreadable guest memory under hostrt.c's crash handler goes to __except"
+
 [ $fail -eq 0 ] && echo "check_core: all passed" || echo "check_core: FAILED (logs in $OUT)"
 exit $fail

@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../.."
 OUT=build/macos-check
 mkdir -p "$OUT"
 CC=${CC:-clang}
-FOLDERS=(libc os fs)
+FOLDERS=(libc os fs game)
 INC=(-Iruntime/compat -Itests/macos/stub -I/opt/homebrew/include)
 for d in runtime/*/; do INC+=("-I${d%/}"); done
 fail=0

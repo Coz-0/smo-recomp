@@ -1042,6 +1042,35 @@ int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
 }
 BOOL MessageBeep(UINT type) { (void)type; AudioServicesPlayAlertSound(kSystemSoundID_UserPreferredAlert); return TRUE; }
 
+/* ---------------------------------------------------------------- __try / __except (1) */
+_Thread_local RecompTry *recomp_try_top;
+void recomp_try_push(RecompTry *t) { recomp_try_install(); t->prev = recomp_try_top; recomp_try_top = t; }
+void recomp_try_pop(RecompTry *t) { if (recomp_try_top == t) recomp_try_top = t->prev; }
+void recomp_try_catch(void) {
+    RecompTry *t = recomp_try_top;
+    if (!t) return;
+    recomp_try_top = t->prev;                     /* a fault in the __except block goes to the block around this one */
+    siglongjmp(t->jb, 1);
+}
+static void try_signal(int sig, siginfo_t *si, void *uc) {
+    (void)si; (void)uc;
+    recomp_try_catch();
+    signal(sig, SIG_DFL);                         /* not in a block: the fault as it would be without this handler */
+}
+void recomp_try_install(void) {
+    static volatile int done;
+    if (done || __atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST)) return;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = try_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (int s = SIGBUS; s <= SIGSEGV; s += SIGSEGV - SIGBUS) {       /* keep a handler installed before (hostrt.c's) */
+        sigaction(s, NULL, &old);
+        if (!(old.sa_flags & SA_SIGINFO) && old.sa_handler == SIG_DFL) sigaction(s, &sa, NULL);
+    }
+}
+
 /* ---------------------------------------------------------------- frames
  * Every arm64 macOS binary keeps frame pointers (the platform ABI requires them): [fp] is the caller's fp, [fp + 8]
  * the return address. Reads go through host_try_read, so a broken chain ends the walk instead of faulting. */

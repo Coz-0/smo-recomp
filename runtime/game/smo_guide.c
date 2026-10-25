@@ -28,8 +28,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <shlwapi.h>
+#else
+#include "win32_posix.h"
+#endif
+#ifndef _WIN32
+/* macOS: no in-window page yet (a WKWebView over the game window is step 6 of docs/macos-port.md). guide_show answers 0,
+ * so nnapplet.c opens the page in the web browser, as it does on Windows without WebView2. */
+int guide_show(const char *url, const char *script, char *callback, size_t cap) {
+    (void)url; (void)script; (void)callback; (void)cap;
+    printf("guide: the page is not shown in the game window on macOS yet: it goes to the web browser instead\n");
+    return 0;
+}
+void guide_on_size(void) {}
+#else
 #include "WebView2.h"
 
 void display_menu_hold(int on);                     /* display.c */
@@ -359,3 +373,4 @@ int guide_show(const char *url, const char *script, char *callback, size_t cap) 
     fflush(stdout);
     return 1;
 }
+#endif

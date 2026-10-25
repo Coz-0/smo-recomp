@@ -308,6 +308,43 @@ static void test_strings_and_misc(void) {
     CHECK(GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm && GetCurrentProcessorNumber() < 64, "processor mask %llx, processor %u", (unsigned long long)pm, GetCurrentProcessorNumber());
 }
 
+/* ---- __try / __except (1) */
+#pragma clang diagnostic ignored "-Wreturn-type"      /* as in smo_nerve.c: both branches return */
+static int probe(const volatile int *p) {
+    __try {
+        return *p;
+    } __except (1) { return -1; }
+}
+static int nested(const volatile int *bad, const volatile int *good) {
+    volatile int r = 0;                     /* changed in the block and read after a fault: volatile (see win32_posix.h) */
+    __try {
+        r = probe(bad);                     /* the inner block catches its own fault */
+        r += *good;
+        (void)*bad;                         /* this one is the outer block's */
+        r = 1000;
+    } __except (1) { r += 100; }
+    return r;
+}
+static int fault_in_handler(const volatile int *bad) {
+    volatile int r = 0;
+    __try {
+        __try { (void)*bad; } __except (1) { r = 1; (void)*bad; }      /* a fault in an __except goes to the block around it */
+    } __except (1) { r += 10; }
+    return r;
+}
+static void test_try(void) {
+    static int x = 41;
+    const volatile int *bad = (const volatile int *)(uintptr_t)0x10;
+    CHECK(probe(&x) == 41, "a readable probe returns from inside __try");
+    CHECK(probe(bad) == -1, "a fault goes to __except");
+    CHECK(recomp_try_top == NULL, "no block left behind after a return or a fault");
+    CHECK(nested(bad, &x) == 140, "nested blocks: the inner fault inside, the outer one outside (%d)", nested(bad, &x));
+    CHECK(fault_in_handler(bad) == 11, "a fault in __except goes to the block around it (%d)", fault_in_handler(bad));
+    int n = 0;
+    for (int i = 0; i < 100000; i++) n += probe(i & 1 ? bad : &x) < 0;
+    CHECK(n == 50000 && recomp_try_top == NULL, "100000 probes, half of them faulting (%d faults)", n);
+}
+
 int main(void) {
     test_guest_ranges();
     test_reserve_commit_query();
@@ -316,6 +353,7 @@ int main(void) {
     test_misc();
     test_files();
     test_strings_and_misc();
+    test_try();
     printf("win32_posix: %d of %d checks passed\n", g_pass, g_pass + g_fail);
     return g_fail != 0;
 }

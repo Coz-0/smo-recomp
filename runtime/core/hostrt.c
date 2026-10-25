@@ -678,6 +678,7 @@ static void host_module_line(const char *indent, uint64_t pc) {
 }
 static void crash_signal(int sig, siginfo_t *si, void *ucv) {
     static volatile int in_report;
+    if (sig == SIGSEGV || sig == SIGBUS) recomp_try_catch();        /* a fault inside a __try probe goes to its __except */
     if (__atomic_exchange_n(&in_report, 1, __ATOMIC_SEQ_CST)) _exit(4);     /* a fault inside the report */
     ucontext_t *uc = ucv;
     uint64_t pc = arm_thread_state64_get_pc(uc->uc_mcontext->__ss), lr = arm_thread_state64_get_lr(uc->uc_mcontext->__ss);

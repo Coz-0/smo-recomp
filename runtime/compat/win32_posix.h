@@ -51,6 +51,7 @@ typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
 #define RECOMP_DECLSPEC_dllimport
 #define RECOMP_DECLSPEC_noinline __attribute__((noinline))
 #define RECOMP_DECLSPEC_noreturn __attribute__((noreturn))
+#define RECOMP_DECLSPEC_align(n) __attribute__((aligned(n)))
 void *_aligned_malloc(size_t size, size_t align);
 void *_aligned_realloc(void *p, size_t size, size_t align);
 void _aligned_free(void *p);
@@ -174,7 +175,9 @@ DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD size);
 BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);    /* kernel includes idle, as on Windows */
 BOOL GetProcessTimes(HANDLE p, FILETIME *creation, FILETIME *exit, FILETIME *kernel, FILETIME *user);
 typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, PagefileUsage, PrivateUsage; } PROCESS_MEMORY_COUNTERS;
+typedef PROCESS_MEMORY_COUNTERS PROCESS_MEMORY_COUNTERS_EX;     /* PrivateUsage is already in it here */
 BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb);
+#define K32GetProcessMemoryInfo GetProcessMemoryInfo
 
 /* ---- C runtime and string spellings */
 #include <strings.h>
@@ -357,6 +360,23 @@ typedef void *HWND;
 int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type);
 int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type);
 BOOL MessageBeep(UINT type);
+
+/* ---- __try { ... } __except (1) { ... }: the runtime's probes of memory that may not be readable. A fault (SIGSEGV,
+ * SIGBUS) inside the block goes to the __except block, as with structured exception handling; only that form (the
+ * filter always 1) is supported. The block is a loop of one pass: a break or continue in it, outside an inner loop,
+ * would leave the block, not the loop around it (none of the runtime's blocks has one). A return from it is fine.
+ * As with setjmp, a local variable changed inside the block and read after a fault must be volatile (structured
+ * exception handling keeps it; none of the runtime's blocks reads one). */
+#include <setjmp.h>
+typedef struct RecompTry { sigjmp_buf jb; struct RecompTry *prev; int pass; } RecompTry;
+extern _Thread_local RecompTry *recomp_try_top;
+void recomp_try_push(RecompTry *t);
+void recomp_try_pop(RecompTry *t);                    /* the cleanup of the block's frame */
+void recomp_try_catch(void);                          /* in a SIGSEGV / SIGBUS handler: to the innermost block, if any */
+void recomp_try_install(void);                        /* a handler that does only that (hostrt.c's crash handler calls it too) */
+#define __try for (RecompTry _recomp_try __attribute__((cleanup(recomp_try_pop))) = {.pass = 0}; !_recomp_try.pass; _recomp_try.pass = 1) \
+                  if (recomp_try_push(&_recomp_try), sigsetjmp(_recomp_try.jb, 1) == 0)
+#define __except(filter) else
 
 /* ---- macOS only: a thread's frames, for the crash report and the samplers (pcs[0] = where it is) */
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max);           /* suspends and resumes the thread */

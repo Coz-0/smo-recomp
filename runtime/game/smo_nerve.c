@@ -34,8 +34,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#else
+#include "win32_posix.h"
+/* every path of the __try / __except probes below returns; the one-pass loop of the macOS __try hides that */
+#pragma clang diagnostic ignored "-Wreturn-type"
+#endif
 #include "hostrt.h"
 
 long long nvn_front_frame_next(void);                     /* nvn_gl.c: the number the frame being made will get */

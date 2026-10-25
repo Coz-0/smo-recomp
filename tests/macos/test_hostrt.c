@@ -2,7 +2,8 @@
  * stand-in lifted functions, and crashes on purpose so check_core.sh can read the crash report.
  *   test_hostrt <image file> dispatch   indirect call through the hash table; exit 0
  *   test_hostrt <image file> write-ro   a write into the read-only text: the report names the fault and both functions
- *   test_hostrt <image file> trap       guest_trap from lifted code: GUEST TRAP, then the report */
+ *   test_hostrt <image file> trap       guest_trap from lifted code: GUEST TRAP, then the report
+ *   test_hostrt <image file> probe      a __try probe of unreadable memory with hostrt.c's crash handler installed: caught */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,12 @@ int main(int argc, char **argv) {
     g_mode = !strcmp(argv[2], "write-ro") ? 1 : !strcmp(argv[2], "trap") ? 2 : 0;
     setvbuf(stdout, NULL, _IONBF, 0);
     runtime_init(argv[1], "/dev/null");
+    if (!strcmp(argv[2], "probe")) {
+        volatile int got = 0;
+        __try { got = *(volatile int *)(uintptr_t)(GUEST_BASE + 0x40000000ull); } __except (1) { got = -1; }   /* reserved, not mapped */
+        printf("probe: %s\n", got == -1 ? "caught" : "NOT caught");
+        return got != -1;
+    }
     static Ctx c;
     call_guest(&c, GUEST_BASE + 0x100);
     printf("dispatch: x0=%llu x1=%llu\n", (unsigned long long)c.x[0], (unsigned long long)c.x[1]);
