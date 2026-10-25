@@ -72,6 +72,23 @@ step $? "link the console core model's self-test (test_core_model)"
 "$OUT/test_core_model" > "$OUT/core_model.txt" 2>&1
 step $? "console core model (core tokens): $(grep -o 'core model: .*' "$OUT/core_model.txt" | tail -1); $(grep -o 'every 20 us: .*' "$OUT/core_model.txt" | sed 's/.*ready to running: //')"
 
+# movies: AVFoundation under nnmovie_mf.c's movie:: protocol, on a movie the test writes itself (H.264 + AAC)
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" -c runtime/services/nnmovie_mf.c -o "$OUT/movie_mf.o" &&
+"$CC" -std=gnu11 -O1 -g -w "${INC[@]}" -c runtime/compat/win32_posix.c -o "$OUT/movie_w32.o" &&
+"$CC" -fobjc-arc -O1 -g -Wall -Wno-unused-function -Werror "${INC[@]}" runtime/services/nnmovie_av.m tests/macos/test_movie.m "$OUT/movie_mf.o" "$OUT/movie_w32.o" \
+    -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation -framework CoreFoundation -framework AudioToolbox \
+    -framework CoreGraphics -o "$OUT/test_movie"
+step $? "link the movie test with AVFoundation (test_movie)"
+"$OUT/test_movie" > "$OUT/movie.txt" 2>&1
+step $? "movies on AVFoundation through movie::Extractor / Decoder: $(grep -o 'movie test: .*' "$OUT/movie.txt" | tail -1)"
+
+# the Help in the game window: WKWebView over a hidden SDL window, a page laid out as the manual is, pads from a thread
+"$CC" -fobjc-arc -O1 -g -Wall -Werror "${INC[@]}" runtime/game/smo_guide_mac.m tests/macos/test_guide.m -L/opt/homebrew/lib -lSDL3 \
+    -framework AppKit -framework WebKit -o "$OUT/test_guide"
+step $? "link the Help page test with WebKit (test_guide)"
+"$OUT/test_guide" > "$OUT/guide.txt" 2>&1
+step $? "the Help in the game window (WKWebView): $(grep -o 'guide test: .*' "$OUT/guide.txt" | tail -1)"
+
 "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" runtime/gfx/nvn_stub.c runtime/compat/win32_posix.c tests/macos/test_vpool.c \
     -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_vpool"
 step $? "link the virtual memory pool test (test_vpool)"

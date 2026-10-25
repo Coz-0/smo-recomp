@@ -233,6 +233,7 @@ static SDL_MetalView g_metal_view;
 static void *g_metal_layer;
 static int g_win_full;
 void *display_hwnd(void) { return g_metal_layer; }   /* what the renderer makes its surface from: the window's CAMetalLayer */
+void *display_cocoa_window(void) { return g_win ? SDL_GetPointerProperty(SDL_GetWindowProperties(g_win), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL) : NULL; }   /* smo_guide_mac.m: its NSWindow */
 void display_toggle_fullscreen(void);
 void display_pixel_size(int *w, int *h) { if (!g_win || !SDL_GetWindowSizeInPixels(g_win, w, h)) { *w = WIDTH; *h = HEIGHT; } }
 int display_window_foreground(void) { return g_win && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS) != 0; }
