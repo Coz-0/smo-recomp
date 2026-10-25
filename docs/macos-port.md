@@ -145,6 +145,35 @@ on core 0), the shim's blocking waits (`recomp_set_block_hooks`), and safe point
 the game reaches a safe point, and so whether the preemption latency is good enough or signals are needed; host-side
 blocking outside the shim (file reads) still holds a core.
 
+## The vertex layout in the pipeline key (design)
+
+Neither Mac driver has `VK_EXT_vertex_input_dynamic_state`, so a pipeline must be made with its vertex input state, and a
+draw must find the pipeline of its own layout. On macOS (`#ifndef _WIN32`: the Windows key, records and behaviour stay
+byte for byte as they are) the pipeline key `PKey` gains `vl`, the layout as the draw derives it today:
+
+- per attribute location 0..15: not supplied (a constant (0, 0, 0, 1), float, unsigned or signed: three codes), or
+  supplied: the NVN vertex format, the stream and the offset;
+- per stream 0..15 an attribute reads: the stride and the instance divisor (0: per vertex). The stride is in the key, not
+  dynamic: a dynamic stride (`vkCmdBindVertexBuffers2`) must be 0 or cover every attribute of its binding, a rule the
+  extension's path does not have and the game's meshes are not known to keep.
+
+The Vulkan bindings are numbered from `vl` alone, in attribute order, as the draw numbers them now. One function makes
+the binding and attribute descriptions from `vl` (`nvn_vk_vlayout.c`), used both where the pipeline is made and at the
+draw, so the two can't disagree. Where the key is built:
+
+- at a draw (`draw_prepare`): from the bound attributes, streams and buffers, before `pipe_get`;
+- in the look-ahead (`scan_draw`): the same, from the stream and buffer state the scan follows (`OP_VBUF`,
+  `OP_VSTREAM`, as it already follows `OP_VATTR`);
+- in `pipes.bin`: the record holds the key, so a pipeline made from a record has its layout.
+
+Not covered: prediction (`SMO_VK_PREDICT`, which needs extended dynamic state 3 that neither Mac driver has) and pipeline
+libraries (`D.has_gpl` needs dynamic vertex input). Both are already off on the Mac. **To be measured with the game:** how
+many more pipelines there are per vertex stage, and how many are made at a draw.
+
+**Checked by** `tests/macos/test_vlayout.c`: for random attribute, stream and buffer states, the descriptions made from
+the key equal those the dynamic path (the Windows one) gives for the same state, and states that differ only in stride
+give different keys only through the stride.
+
 ## Things the Mac does differently
 
 - **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.4.1 that is
