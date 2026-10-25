@@ -425,6 +425,18 @@ static void test_thread_id_from_start(void) {
     DeleteCriticalSection(&g_race_cs);
 }
 
+/* ---- a thread made with stack size 0 has room to recurse as on Windows (the shader compiler recurses per basic
+ * block; macOS's pthread default of 512 KB overflowed on one of the game's shaders) */
+static volatile int g_deep_sink;
+static int deep(int n) { volatile char frame[64 << 10]; frame[0] = (char)n; frame[sizeof frame - 1] = 1; g_deep_sink += frame[0]; return n ? deep(n - 1) + frame[sizeof frame - 1] : 0; }
+static DWORD WINAPI deep_thread(LPVOID arg) { *(int *)arg = deep(64) == 64; return 0; }      /* 64 frames of 64 KB: 4 MB of stack */
+static void test_thread_stack(void) {
+    int ok = 0;
+    HANDLE h = CreateThread(NULL, 0, deep_thread, &ok, 0, NULL);
+    CHECK(h && WaitForSingleObject(h, 10000) == WAIT_OBJECT_0 && ok, "a thread with the default stack recursed 4 MB deep (%d)", ok);
+    if (h) CloseHandle(h);
+}
+
 int main(void) {
     test_guest_ranges();
     test_reserve_commit_query();
@@ -432,6 +444,7 @@ int main(void) {
     test_threads();
     test_condvar();
     test_thread_id_from_start();
+    test_thread_stack();
     test_misc();
     test_files();
     test_strings_and_misc();
