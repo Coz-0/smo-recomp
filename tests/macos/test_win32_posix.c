@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "win32_posix.h"
+#include <unistd.h>
 
 static int g_fail, g_pass;
 #define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -198,6 +199,7 @@ static void test_misc(void) {
 
 /* ---- part 2: files, folders, strings, named mutexes, processes, loader */
 __attribute__((visibility("default"))) int test_exported_symbol(void) { return 7; }
+static const char *tmp_dir(void) { static char t[1024]; GetTempPathA(sizeof t, t); return t; }
 static BOOL CALLBACK once_fn(PINIT_ONCE o, PVOID arg, PVOID *ctx) { (void)o; (void)ctx; (*(int *)arg)++; return TRUE; }
 
 static void test_files(void) {
@@ -286,6 +288,13 @@ static void test_strings_and_misc(void) {
     HANDLE m3 = CreateMutexA(NULL, FALSE, "Local\\smo_shim_test");
     CHECK(m3 && GetLastError() == ERROR_SUCCESS, "with every handle closed the name is free again (%u)", GetLastError());
     CloseHandle(m3);
+    char lockf[1200], lockh[1200];
+    snprintf(lockf, sizeof lockf, "%ssmo-mutex-Local_smo_shim_test.name", tmp_dir());
+    recomp_path(lockh, sizeof lockh, lockf);
+    CHECK(access(lockh, F_OK) == 0, "the mutex's lock file is in the temp folder (%s)", lockh);
+    FILE *nul = fopen("NUL", "w");
+    CHECK(nul && fputs("x", nul) >= 0 && access("NUL", F_OK) != 0, "\"NUL\" is the null device, not a file");
+    if (nul) fclose(nul);
 
     HANDLE me = OpenProcess(SYNCHRONIZE, FALSE, GetCurrentProcessId());
     CHECK(me && WaitForSingleObject(me, 0) == WAIT_TIMEOUT, "this process is alive");

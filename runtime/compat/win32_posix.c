@@ -634,6 +634,7 @@ static BOOL fail_errno(void) { SetLastError(win_error_of(errno)); return FALSE; 
 /* ---------------------------------------------------------------- files */
 void recomp_path(char *out, size_t n, const char *in) {
     size_t i = 0;
+    if (!strcasecmp(in, "NUL")) { snprintf(out, n, "/dev/null"); return; }     /* Windows' null device */
     for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
     out[i] = 0;
 }
@@ -912,13 +913,14 @@ BOOL FindClose(HANDLE h) {
  * A named mutex is two lock files in $TMPDIR: "<name>.name", held shared by every open handle (a create that cannot
  * take it exclusively finds the name in use: ERROR_ALREADY_EXISTS), and "<name>.own", held exclusively by the owner. */
 static int lock_file(const char *name, const char *ext) {
-    char tmp[1024], path[2048], clean[512];
+    char tmp[1024], path[2048], clean[512], host[2048];
     size_t k = 0;
     for (const char *s = name; *s && k + 1 < sizeof clean; s++) clean[k++] = (*s == '/' || *s == '\\' || *s == ':') ? '_' : *s;
     clean[k] = 0;
     GetTempPathA(sizeof tmp, tmp);
     snprintf(path, sizeof path, "%ssmo-mutex-%s.%s", tmp, clean, ext);
-    return open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    recomp_path(host, sizeof host, path);                                   /* GetTempPath gives the runtime's form */
+    return open(host, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 }
 HANDLE CreateMutexA(SECURITY_ATTRIBUTES *sa, BOOL owned, LPCSTR name) {
     (void)sa;

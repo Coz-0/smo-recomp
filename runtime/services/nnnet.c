@@ -25,13 +25,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <wincrypt.h>
+#else
+#include "win32_posix.h"
+#include "winsock_posix.h"
+#endif
 #include "sdklift.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])

@@ -43,6 +43,19 @@ Each step builds and is checked before the next one starts.
 2. **The rest of the runtime builds**: `os/` (threads, the three-core scheduling, the heap that shows the same pages
    at two addresses: `mach_vm_remap` instead of a pagefile-backed section), `fs/`, `libc/`, `services/`, `game/`
    (`__try`/`__except` probes become a guarded read), `input/` (SDL3 already).
+   **Done for `libc/ os/ fs/ game/ input/ services/`** (2026-10-25; `gfx/` is step 5, `audio/` step 6). Every file
+   compiles with `-Wall -Werror`; `tests/macos/check_runtime.sh` runs, without a dump, the runtime's own self-tests that
+   do not need one:
+   - time zones: the macOS rule equals `localtime_r` in 199,798 conversions of 1970..2037 in each of 8 zones;
+   - save data: mount table, journal, two-phase commit, roll-forward, directory listing: 0 failures;
+   - controllers with SDL3's virtual pads: 51 of 51, as on Windows;
+   - network: 16 of 17 (UDP and TCP on loopback, Poll, the console's error numbers, resolver, ssl, nsd); the 17th
+     reads a table of `sdk.elf` and needs a dump;
+   - glyphs from CoreText outlines (TrueType and CFF), plain and outlined.
+   On macOS for now: the software keyboard is a CoreFoundation alert with a text field (its self-test answers it, the
+   alert itself is not driven); the Help page opens in the web browser; movies keep the failing placeholder; the
+   shared fonts fall back to macOS's own (Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo), not yet seen
+   in the game.
 3. **The build scripts run on macOS**: `setup.py`, `build_main.py`, `build_exe.py` with Apple clang, a dylib instead
    of `smo_game.dll`, Homebrew SDL3 and the Vulkan SDK.
 4. **Boot without a picture**: the game reaches `nnMain` and its threads run (`SMO_GFX` off).

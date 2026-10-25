@@ -345,6 +345,17 @@ typedef void (*FARPROC)(void);
 FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 BOOL FreeLibrary(HMODULE m);
 
+/* ---- BMP headers: file layouts, so with fixed widths (LONG is long here) */
+#pragma pack(push, 2)
+typedef struct { WORD bfType; DWORD bfSize; WORD bfReserved1, bfReserved2; DWORD bfOffBits; } BITMAPFILEHEADER;
+#pragma pack(pop)
+typedef struct {
+    DWORD biSize; int32_t biWidth, biHeight; WORD biPlanes, biBitCount; DWORD biCompression, biSizeImage;
+    int32_t biXPelsPerMeter, biYPelsPerMeter; DWORD biClrUsed, biClrImportant;
+} BITMAPINFOHEADER;
+_Static_assert(sizeof(BITMAPFILEHEADER) == 14 && sizeof(BITMAPINFOHEADER) == 40, "BMP header layouts");
+#define BI_RGB 0u
+
 /* ---- the keyboard: GetAsyncKeyState with Windows virtual-key codes (the runtime's key names and remapping files use
  * them). The display sets where key states come from (its window's keys); before that, the system's key state. */
 #define VK_BACK 0x08
