@@ -24,6 +24,8 @@
 #include <copyfile.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <AudioToolbox/AudioServices.h>
 
 /* ---------------------------------------------------------------- C runtime */
 int __argc;
@@ -204,22 +206,22 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs)
 void DeleteCriticalSection(CRITICAL_SECTION *cs) { (void)cs; }
 void EnterCriticalSection(CRITICAL_SECTION *cs) {
     DWORD me = GetCurrentThreadId();
-    if (__atomic_load_n(&cs->owner, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
+    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
     os_unfair_lock_lock(&cs->l);
-    __atomic_store_n(&cs->owner, me, __ATOMIC_RELAXED);
+    __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
 }
 BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
     DWORD me = GetCurrentThreadId();
-    if (__atomic_load_n(&cs->owner, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
+    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
     if (!os_unfair_lock_trylock(&cs->l)) return FALSE;
-    __atomic_store_n(&cs->owner, me, __ATOMIC_RELAXED);
+    __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
     return TRUE;
 }
 void LeaveCriticalSection(CRITICAL_SECTION *cs) {
     if (--cs->depth) return;
-    __atomic_store_n(&cs->owner, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&cs->OwningThread, (HANDLE)0, __ATOMIC_RELAXED);
     os_unfair_lock_unlock(&cs->l);
 }
 
@@ -1006,6 +1008,30 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
 }
 BOOL FreeLibrary(HMODULE m) { return m && !dlclose(m); }
 
+/* ---------------------------------------------------------------- message boxes */
+int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {
+    (void)owner;
+    CFStringRef t = CFStringCreateWithCString(NULL, text ? text : "", kCFStringEncodingUTF8);
+    CFStringRef h = CFStringCreateWithCString(NULL, caption ? caption : "", kCFStringEncodingUTF8);
+    CFOptionFlags level = (type & 0xf0) == MB_ICONERROR ? kCFUserNotificationStopAlertLevel
+                        : (type & 0xf0) == MB_ICONWARNING ? kCFUserNotificationCautionAlertLevel
+                        : (type & 0xf0) == MB_ICONINFORMATION ? kCFUserNotificationNoteAlertLevel : kCFUserNotificationPlainAlertLevel;
+    int yesno = (type & 0xf) == MB_YESNO, okcancel = (type & 0xf) == MB_OKCANCEL;
+    CFOptionFlags answer = kCFUserNotificationDefaultResponse;
+    SInt32 r = CFUserNotificationDisplayAlert(0, level, NULL, NULL, NULL, h, t, yesno ? CFSTR("Yes") : CFSTR("OK"),
+                                              yesno ? CFSTR("No") : okcancel ? CFSTR("Cancel") : NULL, NULL, &answer);
+    CFRelease(t); CFRelease(h);
+    int first = r != 0 || (answer & 3) == kCFUserNotificationDefaultResponse;
+    return yesno ? (first ? IDYES : IDNO) : okcancel ? (first ? IDOK : IDCANCEL) : IDOK;
+}
+int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
+    char t[4096], h[512];
+    if (!WideCharToMultiByte(CP_UTF8, 0, text, -1, t, sizeof t, NULL, NULL)) t[0] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, caption, -1, h, sizeof h, NULL, NULL)) h[0] = 0;
+    return MessageBoxA(owner, t, h, type);
+}
+BOOL MessageBeep(UINT type) { (void)type; AudioServicesPlayAlertSound(kSystemSoundID_UserPreferredAlert); return TRUE; }
+
 /* ---------------------------------------------------------------- frames
  * Every arm64 macOS binary keeps frame pointers (the platform ABI requires them): [fp] is the caller's fp, [fp + 8]
  * the return address. Reads go through host_try_read, so a broken chain ends the walk instead of faulting. */
@@ -1022,6 +1048,11 @@ int host_frames_from(uint64_t pc, uint64_t lr, uint64_t fp, uint64_t *pcs, int m
         fp = rec[0];
     }
     return n;
+}
+__attribute__((noinline)) int host_backtrace_here(uint64_t *pcs, int max) {
+    uint64_t fp = (uint64_t)(uintptr_t)__builtin_frame_address(0), rec[2];
+    if (!host_try_read((const void *)(uintptr_t)fp, rec, sizeof rec)) return 0;
+    return host_frames_from(rec[1] & 0x0000ffffffffffffull, 0, rec[0], pcs, max);
 }
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max) {
     Obj *o = obj_of(h);

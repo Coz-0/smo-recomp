@@ -64,5 +64,11 @@ Each step builds and is checked before the next one starts.
   the SDK module at 0x8500000000 (`hostrt.h`, `tools/target.py`; the lifted code is made for these bases, and
   `image.h` says which bases it was made for, so a mismatch stops the build). `hostrt.c` reserves the whole window
   when the program loads. `tests/macos/check_core.sh` launches the mapping test 20 times.
-- **No core affinity.** macOS has no `SetThreadAffinityMask`. The three-core model keeps its own run queue and does
-  not need it.
+- **No core affinity: the console core model must be rebuilt.** On Windows `os_threads.c` keeps the game's threads to
+  the console's three cores by pinning each to one of three host processors (`SetThreadAffinityMask`) with Windows
+  priorities in six levels, so that, as on the console, only the highest-priority ready thread of a core runs. Its
+  comments record what free scheduling costs: 4 of 6 boots failed in the game's heap code, and a stage-entry crash in 2
+  of 91 stress runs. macOS has no processor affinity (thread affinity tags are hints, and Apple silicon ignores them).
+  Until a model of its own exists (a token per console core that a guest thread holds while it runs and gives up when
+  it blocks in an SDK call, handed over in priority order), macOS prints that the model is off. This is the first thing
+  step 4 has to settle.

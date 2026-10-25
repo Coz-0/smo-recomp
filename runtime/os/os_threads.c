@@ -6,8 +6,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -84,18 +88,30 @@ static void sleep_ns(int64_t ns) {
     static __declspec(thread) int no_timer;
     LARGE_INTEGER due;
     if (ns <= 0) { SwitchToThread(); return; }
+#ifdef _WIN32
     if (!timer && !no_timer) {
         timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!timer) no_timer = 1;
     }
+#else
+    (void)no_timer;
+#endif
     due.QuadPart = -((ns + 99) / 100);
     /* SMO_SLEEP_LOG=1: a line for every sleep that lasted 2 ms longer than asked (first 200). */
     static int lg = -1; static LONG nl;
     if (lg < 0) lg = getenv("SMO_SLEEP_LOG") && atoi(getenv("SMO_SLEEP_LOG"));
     LARGE_INTEGER q0, q1, fq;
     if (lg) QueryPerformanceCounter(&q0);
+#ifdef _WIN32
     if (!timer || !SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) Sleep(ns_to_ms(ns));
     else WaitForSingleObject(timer, INFINITE);
+#else
+    {   /* macOS: nanosleep is good to tens of microseconds, no timer object needed */
+        struct timespec ts = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
+        (void)due;
+        while (nanosleep(&ts, &ts) && errno == EINTR) {}
+    }
+#endif
     if (lg) {
         extern long long nvn_front_frame_next(void);
         QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
@@ -104,12 +120,12 @@ static void sleep_ns(int64_t ns) {
             static __declspec(thread) long long fr0, cnt; static __declspec(thread) double a_sum, s_sum, a_max; static LONG nf;
             long long fr = nvn_front_frame_next();
             if (fr != fr0) {
-                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
+                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, (unsigned long)GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
                 fr0 = fr; cnt = 0; a_sum = s_sum = a_max = 0;
             }
             cnt++; a_sum += asked; s_sum += ms; if (asked > a_max) a_max = asked;
         }
-        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
+        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), (unsigned long)GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
     }
 }
 
@@ -167,6 +183,13 @@ static DWORD_PTR core_slot(DWORD_PTR proc) {           /* the first free slot of
     return proc;
 }
 static int console_cores(void) {
+#ifndef _WIN32
+    /* macOS has no processor affinity, so the model as built here (three pinned processors) cannot be had: the game's
+     * threads run where macOS puts them, which on Windows failed 4 of 6 boots. A model of its own for macOS is step 4 of
+     * docs/macos-port.md. */
+    if (g_cc < 0) { g_cc = 0; printf("nn::os: console core model NOT available on macOS (no processor affinity): the game's threads are not kept to three cores\n"); }
+    return g_cc;
+#endif
     if (g_cc < 0) {
         int n = 0, on = 0;
         const char *cc = getenv("SMO_OS_CONSOLE_CORES"), *cpus = getenv("SMO_OS_HOST_CPUS");
@@ -630,7 +653,7 @@ int host_fixed_random(void *buffer, uint64_t size, const char *who, uint64_t lr)
     }
     LONG n = ++calls;
     InterlockedExchange(&lock, 0);
-    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, n, (unsigned long long)size, (unsigned long long)lr);
+    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, (long)n, (unsigned long long)size, (unsigned long long)lr);
     return 1;
 }
 static void os_GenerateRandomBytes(Ctx *c) {

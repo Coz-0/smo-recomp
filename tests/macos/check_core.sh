@@ -19,7 +19,7 @@ for f in runtime/compat/win32_posix.c runtime/core/*.c; do
     r=$?; step $r "compile $f"; [ $r -ne 0 ] && sed 's/^/      /' "$log" | head -20
 done
 
-"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/compat/win32_posix.c tests/macos/test_win32_posix.c -o "$OUT/test_win32_posix" &&
+"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/compat/win32_posix.c tests/macos/test_win32_posix.c -framework CoreFoundation -framework AudioToolbox -o "$OUT/test_win32_posix" &&
     "$OUT/test_win32_posix" | sed 's/^/      /'
 step "${PIPESTATUS[0]}" "Win32 shim (test_win32_posix)"
 
@@ -29,7 +29,7 @@ for o in -O1 -O2; do
     step "${PIPESTATUS[0]}" "do-nothing handler check on AArch64, handlers at $o (test_audit_a64)"
 done
 
-"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/core/hostrt.c runtime/compat/win32_posix.c tests/macos/test_hostrt.c -o "$OUT/test_hostrt"
+"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/core/hostrt.c runtime/compat/win32_posix.c tests/macos/test_hostrt.c -framework CoreFoundation -framework AudioToolbox -o "$OUT/test_hostrt"
 step $? "link hostrt.c with stand-ins (test_hostrt)"
 head -c $((0x11000)) /dev/zero > "$OUT/image.bin"     # file offset 0x1000 + GUEST_FILE_IMAGE of the stand-in
 

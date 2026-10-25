@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <os/lock.h>
+#include <errno.h>
+#include <time.h>
 
 /* ---- types */
 typedef int BOOL;
@@ -108,7 +110,7 @@ int host_try_read(const void *p, void *out, size_t n);
 /* ---- locks and condition variables */
 typedef struct { os_unfair_lock l; } SRWLOCK;
 #define SRWLOCK_INIT {OS_UNFAIR_LOCK_INIT}
-typedef struct { os_unfair_lock l; volatile uint32_t owner; int depth; } CRITICAL_SECTION;
+typedef struct { os_unfair_lock l; HANDLE volatile OwningThread; int depth; } CRITICAL_SECTION;   /* OwningThread: the owner's thread id, as on Windows */
 typedef struct { volatile uint64_t seq; } CONDITION_VARIABLE;     /* waits on the address of seq */
 #define CONDITION_VARIABLE_INIT {0}
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 1u
@@ -334,9 +336,31 @@ typedef void (*FARPROC)(void);
 FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 BOOL FreeLibrary(HMODULE m);
 
+/* ---- message boxes: a CoreFoundation alert, modal and blocking on any thread as on Windows. Without a user to
+ * answer (no window server) it returns at once with the default button. */
+typedef void *HWND;
+#define MB_OK 0x0u
+#define MB_OKCANCEL 0x1u
+#define MB_YESNO 0x4u
+#define MB_ICONERROR 0x10u
+#define MB_ICONQUESTION 0x20u
+#define MB_ICONWARNING 0x30u
+#define MB_ICONINFORMATION 0x40u
+#define MB_TASKMODAL 0x2000u
+#define MB_SETFOREGROUND 0x10000u
+#define MB_TOPMOST 0x40000u
+#define IDOK 1
+#define IDCANCEL 2
+#define IDYES 6
+#define IDNO 7
+int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type);
+int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type);
+BOOL MessageBeep(UINT type);
+
 /* ---- macOS only: a thread's frames, for the crash report and the samplers (pcs[0] = where it is) */
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max);           /* suspends and resumes the thread */
 int host_frames_from(uint64_t pc, uint64_t lr, uint64_t fp, uint64_t *pcs, int max);
+int host_backtrace_here(uint64_t *pcs, int max);                        /* the calling thread, from its caller up */
 
 #endif
 #endif
