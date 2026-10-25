@@ -86,8 +86,10 @@ Each step builds and is checked before the next one starts.
    and driver choice (KosmicKrisp by default, `SMO_VK_DRIVER=moltenvk`), the freeze watchdog's thread report (Mach
    threads, `dladdr` names), the index scan in NEON (200,000 random buffers equal to the scalar rule). The OpenGL
    renderer cannot run on macOS (OpenGL 4.6 and NVIDIA extensions): its file compiles against `compat/GL/gl.h` and
-   the renderer is always Vulkan. To do: the vertex layout in the pipeline key; graphics memory pools that show heap
-   pages at a second address (`nvn_stub.c` uses `MapViewOfFile3`: `mach_vm_remap` here).
+   the renderer is always Vulkan. Graphics memory pools that show heap pages at a second address (virtual pools,
+   `nvnMemoryPoolMapVirtual`): `nvn_stub.c` makes its views with `mach_vm_remap` without copying where Windows uses
+   `MapViewOfFile3`, with the same 64 KB granularity and the same refusals; `tests/macos/test_vpool.c` (20 checks, in
+   `check_runtime.sh`) drives the real entry points. To do: the vertex layout in the pipeline key.
 6. **Audio, video, Help**: audio through SDL3, H.264 through VideoToolbox, the Action Guide in WKWebView.
    Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
    audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns

@@ -72,6 +72,12 @@ step $? "link the console core model's self-test (test_core_model)"
 "$OUT/test_core_model" > "$OUT/core_model.txt" 2>&1
 step $? "console core model (core tokens): $(grep -o 'core model: .*' "$OUT/core_model.txt" | tail -1); $(grep -o 'every 20 us: .*' "$OUT/core_model.txt" | sed 's/.*ready to running: //')"
 
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function "${INC[@]}" runtime/gfx/nvn_stub.c runtime/compat/win32_posix.c tests/macos/test_vpool.c \
+    -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_vpool"
+step $? "link the virtual memory pool test (test_vpool)"
+"$OUT/test_vpool" > "$OUT/vpool.txt" 2>&1
+step $? "virtual memory pools on Mach VM (mach_vm_remap views of heap pages): $(grep -o 'vpool: .*' "$OUT/vpool.txt" | tail -1)"
+
 "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -DFONTLL_TEST "${INC[@]}" runtime/services/nnfontll.c runtime/compat/win32_posix.c \
     -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework AudioToolbox -o "$OUT/fonttest"
 step $? "link nnfontll.c's font test (fonttest)"
