@@ -59,7 +59,7 @@ nf=$(grep -c 'FAILED' "$OUT/net.txt"); ndump=$(grep 'FAILED' "$OUT/net.txt" | gr
 [ "$nf" -eq "$ndump" ]
 step $? "sockets, resolver, ssl, nsd on BSD sockets: $(grep -o '[0-9]* cases, [0-9]* failed' "$OUT/net.txt") ($ndump of them needs sdk.elf from a dump)"
 
-"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -DFONTLL_TEST "${INC[@]}" runtime/services/nnfontll.c runtime/compat/win32_posix.c \
+"$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -DFONTLL_TEST "${INC[@]}" runtime/services/nnfontll.c runtime/compat/win32_posix.c \
     -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework AudioToolbox -o "$OUT/fonttest"
 step $? "link nnfontll.c's font test (fonttest)"
 # the outlines come from CoreText: a TrueType glyph and a CFF glyph of a collection's first face, plain and outlined
