@@ -198,11 +198,24 @@ int host_try_read(const void *p, void *out, size_t n) {
     return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)p, n, (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == n;
 }
 
+/* ---------------------------------------------------------------- blocking hooks */
+static void hook_none(void) {}
+static void (*g_block_begin)(void) = hook_none, (*g_block_end)(void) = hook_none;
+void recomp_set_block_hooks(void (*begin)(void), void (*end)(void)) { g_block_begin = begin ? begin : hook_none; g_block_end = end ? end : hook_none; }
+#define BLOCK_BEGIN() g_block_begin()
+#define BLOCK_END() g_block_end()
+static void lock_slow(os_unfair_lock *l) {             /* contended: blocks */
+    if (os_unfair_lock_trylock(l)) return;
+    BLOCK_BEGIN();
+    os_unfair_lock_lock(l);
+    BLOCK_END();
+}
+
 /* ---------------------------------------------------------------- locks and condition variables */
 void InitializeSRWLock(SRWLOCK *l) { l->l = OS_UNFAIR_LOCK_INIT; }
-void AcquireSRWLockExclusive(SRWLOCK *l) { os_unfair_lock_lock(&l->l); }
+void AcquireSRWLockExclusive(SRWLOCK *l) { lock_slow(&l->l); }
 void ReleaseSRWLockExclusive(SRWLOCK *l) { os_unfair_lock_unlock(&l->l); }
-void AcquireSRWLockShared(SRWLOCK *l) { os_unfair_lock_lock(&l->l); }
+void AcquireSRWLockShared(SRWLOCK *l) { lock_slow(&l->l); }
 void ReleaseSRWLockShared(SRWLOCK *l) { os_unfair_lock_unlock(&l->l); }
 BOOL TryAcquireSRWLockExclusive(SRWLOCK *l) { return os_unfair_lock_trylock(&l->l); }
 
@@ -211,7 +224,7 @@ void DeleteCriticalSection(CRITICAL_SECTION *cs) { (void)cs; }
 void EnterCriticalSection(CRITICAL_SECTION *cs) {
     DWORD me = GetCurrentThreadId();
     if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
-    os_unfair_lock_lock(&cs->l);
+    lock_slow(&cs->l);
     __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
 }
@@ -242,19 +255,23 @@ static int cv_wait(CONDITION_VARIABLE *cv, uint64_t seen, DWORD ms) {
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags) {
     (void)flags;
     uint64_t seen = __atomic_load_n(&cv->seq, __ATOMIC_ACQUIRE);
+    BLOCK_BEGIN();
     ReleaseSRWLockExclusive(l);
     int ok = cv_wait(cv, seen, ms);
     AcquireSRWLockExclusive(l);
+    BLOCK_END();
     return ok;
 }
 BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms) {
     uint64_t seen = __atomic_load_n(&cv->seq, __ATOMIC_ACQUIRE);
     int depth = cs->depth;
+    BLOCK_BEGIN();
     cs->depth = 1;
     LeaveCriticalSection(cs);
     int ok = cv_wait(cv, seen, ms);
     EnterCriticalSection(cs);
     cs->depth = depth;
+    BLOCK_END();
     return ok;
 }
 void WakeConditionVariable(CONDITION_VARIABLE *cv) {
@@ -274,7 +291,9 @@ BOOL QueryPerformanceFrequency(LARGE_INTEGER *f) { f->QuadPart = 1000000000ll; r
 void Sleep(DWORD ms) {
     if (!ms) { sched_yield(); return; }
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000l};
+    BLOCK_BEGIN();
     while (nanosleep(&ts, &ts) && errno == EINTR) {}
+    BLOCK_END();
 }
 BOOL SwitchToThread(void) { sched_yield(); return TRUE; }
 
@@ -455,24 +474,38 @@ static DWORD process_wait(ProcObj *o, DWORD ms);
 DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
     if (h && h != PSEUDO_THREAD && h != PSEUDO_PROCESS) {
         uint32_t kind = *(const uint32_t *)h;
-        if (kind == H_MUTEX) return mutex_wait(h, ms);
-        if (kind == H_PROCESS) return process_wait(h, ms);
+        if (kind == H_MUTEX || kind == H_PROCESS) {
+            if (ms) BLOCK_BEGIN();
+            DWORD r = kind == H_MUTEX ? mutex_wait(h, ms) : process_wait(h, ms);
+            if (ms) BLOCK_END();
+            return r;
+        }
     }
     Obj *o = obj_of(h);
     if (!o || (o->kind != H_THREAD && o->kind != H_EVENT && o->kind != H_SEM)) return WAIT_FAILED;
     struct timespec ts;
     if (ms != INFINITE) deadline_of(ms, &ts);
     pthread_mutex_lock(&o->m);
-    int r = 0;
+    int r = 0, blocked = 0;
+    if (!o->signalled && ms) { blocked = 1; pthread_mutex_unlock(&o->m); BLOCK_BEGIN(); pthread_mutex_lock(&o->m); }
     while (!o->signalled && r != ETIMEDOUT) r = ms == INFINITE ? pthread_cond_wait(&o->cv, &o->m) : pthread_cond_timedwait(&o->cv, &o->m, &ts);
     int got = o->signalled;
     if (got && o->kind == H_EVENT && !o->manual) o->signalled = 0;
     if (got && o->kind == H_SEM) o->signalled--;           /* a semaphore: one unit taken */
     pthread_mutex_unlock(&o->m);
+    if (blocked) BLOCK_END();
     return got ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
 }
 /* Polls every millisecond: the runtime calls it rarely, and never with more than a few handles. */
+static DWORD wait_multiple(DWORD n, const HANDLE *hs, BOOL all, DWORD ms);
 DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
+    if (!ms) return wait_multiple(n, hs, all, 0);
+    BLOCK_BEGIN();
+    DWORD r = wait_multiple(n, hs, all, ms);
+    BLOCK_END();
+    return r;
+}
+static DWORD wait_multiple(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     uint64_t end = ms == INFINITE ? UINT64_MAX : now_ns() + (uint64_t)ms * 1000000ull;
     for (;;) {
         DWORD done = 0;
@@ -1113,8 +1146,10 @@ int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {
                         : (type & 0xf0) == MB_ICONINFORMATION ? kCFUserNotificationNoteAlertLevel : kCFUserNotificationPlainAlertLevel;
     int yesno = (type & 0xf) == MB_YESNO, okcancel = (type & 0xf) == MB_OKCANCEL;
     CFOptionFlags answer = kCFUserNotificationDefaultResponse;
+    BLOCK_BEGIN();
     SInt32 r = CFUserNotificationDisplayAlert(0, level, NULL, NULL, NULL, h, t, yesno ? CFSTR("Yes") : CFSTR("OK"),
                                               yesno ? CFSTR("No") : okcancel ? CFSTR("Cancel") : NULL, NULL, &answer);
+    BLOCK_END();
     CFRelease(t); CFRelease(h);
     int first = r != 0 || (answer & 3) == kCFUserNotificationDefaultResponse;
     return yesno ? (first ? IDYES : IDNO) : okcancel ? (first ? IDOK : IDCANCEL) : IDOK;

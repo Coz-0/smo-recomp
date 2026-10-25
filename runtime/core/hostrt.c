@@ -14,6 +14,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "audit_a64.h"
+#include "core_model.h"
 
 /* the image constants come from build/gen/image.h (generated from the dump) */
 #define FILE_OFF 0x1000ULL
@@ -206,6 +207,7 @@ void stage_init_hit(Ctx *c);
 void stage_play_hit(Ctx *c);
 
 void call_indirect(Ctx *c, uint64_t addr) {
+    CM_SAFE_POINT();                                 /* macOS: the console core model may take the core here (os/core_model.c) */
     if (g_icall_mode) icall_record(c, addr);
     if (g_nerve_mode) nerve_call(c, addr);             /* smo_nerve.c: SMO_NERVELOG, SMO_ACTORPOS, SMO_SEQ @nerve: */
     if (g_nerve_watch[0] && (addr == g_nerve_watch[0] || addr == g_nerve_watch[1])) nerve_watch_hit();   /* smo_nerve.c: the amiibo menu's watch */
@@ -403,6 +405,7 @@ void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }
 static void host_import_real(Ctx *c, int sym);
 static int g_watch_sym = -2;
 void host_import(Ctx *c, int sym) {
+    CM_SAFE_POINT();                                 /* macOS: the console core model may take the core here (os/core_model.c) */
     if (g_watch_sym == -2) {
         const char *e = getenv("SMO_IMPORT_WATCH");
         int w = -1;

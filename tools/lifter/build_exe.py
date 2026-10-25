@@ -57,6 +57,7 @@ HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing'] + T.runtime_includes() + ['-I
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32']
 if T.MAC:
     HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
+    HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
     LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
 
 

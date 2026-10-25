@@ -29,7 +29,7 @@ for o in -O1 -O2; do
     step "${PIPESTATUS[0]}" "do-nothing handler check on AArch64, handlers at $o (test_audit_a64)"
 done
 
-"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/core/hostrt.c runtime/compat/win32_posix.c tests/macos/test_hostrt.c -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_hostrt"
+"$CC" "${CFLAGS[@]}" "${INC[@]}" runtime/core/hostrt.c runtime/os/core_model.c runtime/compat/win32_posix.c tests/macos/test_hostrt.c -framework CoreFoundation -framework AudioToolbox -framework CoreGraphics -o "$OUT/test_hostrt"
 step $? "link hostrt.c with stand-ins (test_hostrt)"
 head -c $((0x11000)) /dev/zero > "$OUT/image.bin"     # file offset 0x1000 + GUEST_FILE_IMAGE of the stand-in
 
