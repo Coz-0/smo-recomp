@@ -4,14 +4,15 @@
 
 Flags and the bounded-time rule are ssbu-recomp's (tools/lifter/build_opt.py, GPL-3.0-or-later):
   clang 9, -O1 -w -fno-strict-aliasing -ffp-contract=off (no fused multiply-add is formed; fused operations the game
-  asks for are explicit fma() calls), default x86-64 target;
+  asks for are explicit fma() calls), default x86-64 target; on macOS Apple clang, arm64 (tools/target.py), where
+  -ffp-contract=off matters more: clang contracts by default for AArch64;
   1. every function longer than OPTNONE_LINES statements is compiled unoptimised (`optnone`, through a generated
      -include header; the generated C is untouched);
   2. a file over TIME_LIMIT seconds is retried with the statement limit divided by 4, then 16;
   3. then the whole file at -O0.
 Only files whose object is missing or older than the source (or funcs.h / runtime headers) are compiled.
 Prints counts, fallbacks and the slowest files; writes build/obj/main/_report.txt. Exit code 1 if any file fails.
-Environment: LLVM_ROOT (default C:/llvm-9.0.0), RECOMP_OPT (-O1), RECOMP_OPTNONE_LINES (20000), RECOMP_TIME_LIMIT (180).
+Environment: LLVM_ROOT (default C:/llvm-9.0.0; macOS: Apple clang), RECOMP_OPT (-O1), RECOMP_OPTNONE_LINES (20000), RECOMP_TIME_LIMIT (180).
 """
 import concurrent.futures
 import os
@@ -26,7 +27,7 @@ import target as T  # noqa: E402
 GEN = T.build('lift', 'main')
 OBJ = T.build('obj', 'main')
 RUNTIME = os.path.join(T.RUNTIME, 'core')        # runtime.h, neon.h, fpexact.h: what the lifted C includes
-CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
+CLANG = T.clang()
 OPT = os.environ.get('RECOMP_OPT', '-O1')
 EXTRA = ['-ffp-contract=off']
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
@@ -53,7 +54,7 @@ def function_sizes(path):
 
 def optnone_header(src, obj, limit):
     big = [(n, name, params) for n, name, params in function_sizes(src) if n > limit]
-    path = obj[:-4] + '.optnone.h'
+    path = os.path.splitext(obj)[0] + '.optnone.h'
     if not big:
         if os.path.exists(path):
             os.remove(path)
@@ -72,14 +73,17 @@ def run_limited(cmd, limit):
         out, _ = p.communicate(timeout=limit)
         return p.returncode, out.decode('latin-1')[-3000:], time.time() - t
     except subprocess.TimeoutExpired:
-        subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)
+        if T.MAC:
+            p.kill()
+        else:
+            subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)
         p.communicate()
         return None, '', time.time() - t
 
 
 def compile_file(name):
     src = os.path.join(GEN, name)
-    obj = os.path.join(OBJ, name[:-2] + '.obj')
+    obj = os.path.join(OBJ, name[:-2] + T.OBJ_EXT)
     total = 0.0
     for step, limit in enumerate((OPTNONE_LINES, OPTNONE_LINES // 4, OPTNONE_LINES // 16)):
         hdr, count, lines = optnone_header(src, obj, limit)
@@ -108,7 +112,7 @@ def main():
     names = sorted(n for n in os.listdir(GEN) if n.endswith('.c'))
     todo = []
     for n in names:
-        obj = os.path.join(OBJ, n[:-2] + '.obj')
+        obj = os.path.join(OBJ, n[:-2] + T.OBJ_EXT)
         if force or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(os.path.join(GEN, n)), newest_dep):
             todo.append(n)
     print('files: %d   to compile: %d   jobs: %d   %s %s' % (len(names), len(todo), jobs, CLANG, OPT))
@@ -131,7 +135,7 @@ def main():
           % (len(results), wall, sum(r[3] for r in results), len(failed), len(noted)))
     for name, code, out, secs, note in sorted(results, key=lambda r: -r[3])[:8]:
         print('  slowest: %-12s %6.0fs %s' % (name, secs, note))
-    objs = [os.path.join(OBJ, n[:-2] + '.obj') for n in names]
+    objs = [os.path.join(OBJ, n[:-2] + T.OBJ_EXT) for n in names]
     have = sum(1 for o in objs if os.path.exists(o))
     print('objects present: %d of %d   total size %.0f MB'
           % (have, len(objs), sum(os.path.getsize(o) for o in objs if os.path.exists(o)) / 2 ** 20))

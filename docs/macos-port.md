@@ -58,6 +58,17 @@ Each step builds and is checked before the next one starts.
    in the game.
 3. **The build scripts run on macOS**: `setup.py`, `build_main.py`, `build_exe.py` with Apple clang, a dylib instead
    of `smo_game.dll`, Homebrew SDL3 and the Vulkan SDK.
+   **Done as far as it goes without a dump** (2026-10-25). `tools/target.py` has the toolchain and file names of each
+   system; `setup.py --only deps` finds Apple clang, the Vulkan SDK and SDL3; `extract.py` links the RomFS with a
+   symbolic link instead of a junction. `tests/macos/check_build.sh`: `build_main.py` compiles lifter-shaped files to
+   arm64 objects (its unoptimised fallback included); the shader shim builds and compiles GLSL to SPIR-V through the
+   SDK's shaderc. `-ffp-contract=off` is checked: Apple clang fuses `a * b + c` into `fmadd` for AArch64 by default
+   (measured), which would change float results against the console; x86-64's baseline has no FMA to fuse into.
+   `tests/macos/check_lifter.sh`: the lifter's differential test on words sampled from arm64 macOS libraries (SDL3,
+   libavcodec's NEON, MoltenVK): 30,176 of 30,176 equal to Unicorn, and the mutation check flags its 4 planted bugs.
+   It found two lifter bugs, fixed: XTN2 wrote the lower half, LDAPR (ARMv8.3) was lifted instead of trapping.
+   Not done: the link of the whole program (needs `gfx/` and `audio/`, steps 5 and 6); `scripts/run.py` (Windows
+   process and memory calls; checked only against a running game).
 4. **Boot without a picture**: the game reaches `nnMain` and its threads run (`SMO_GFX` off).
 5. **Renderer**: an SDL3 window with a Metal layer, the vertex layout in the pipeline key, a fallback for custom
    border colours, the geometry stage of the Ruined Kingdom's lightning.

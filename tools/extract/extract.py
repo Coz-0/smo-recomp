@@ -91,6 +91,18 @@ def write_exefs(files, dst):
 def link_folder(link, target):
     """build/<link> becomes a directory junction to the dump's folder (no copy). A junction already there is replaced;
     a real folder is left alone (it was copied there before): delete it to read the dump in place."""
+    if sys.platform == 'darwin':                       # macOS: a symbolic link does the same
+        if os.path.islink(link):
+            os.remove(link)                            # the link only, never what it points to
+        elif os.path.isdir(link):
+            if any(os.scandir(link)):
+                print('  %s is a folder of its own, not a link to your dump: left as it is (delete it to use %s)' % (link, target))
+                return
+            os.rmdir(link)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(os.path.abspath(target), link, target_is_directory=True)
+        print('  %s -> %s' % (link, target))
+        return
     if os.path.isdir(link) and not os.path.isjunction(link):
         if any(os.scandir(link)):
             print('  %s is a folder of its own, not a link to your dump: left as it is (delete it to use %s)' % (link, target))
