@@ -257,6 +257,24 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     return 0;
 }
 
+/* The main thread waits for the guest's main thread. On macOS it pumps the window's events meanwhile: Cocoa windows belong
+ * to the main thread (display.c). */
+static DWORD wait_game(HANDLE t, DWORD ms) {
+#ifdef _WIN32
+    return WaitForSingleObject(t, ms);
+#else
+    void display_pump(void);
+    ULONGLONG end = ms == INFINITE ? ~0ull : GetTickCount64() + ms;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        DWORD slice = now >= end ? 0 : end - now > 8 ? 8 : (DWORD)(end - now);
+        DWORD r = WaitForSingleObject(t, slice);
+        display_pump();
+        if (r != WAIT_TIMEOUT || GetTickCount64() >= end) return r;
+    }
+#endif
+}
+
 int main(int argc, char **argv) {
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -302,13 +320,13 @@ int main(int argc, char **argv) {
     /* the lifted code uses the host stack for every guest call: give it plenty */
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("SMO_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
-    DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    DWORD wr = wait_game(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
     {   unsigned long long stage_list_started(void);     /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the limit counts from the start of the stage being played */
         for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > GetTickCount64(); )
-            wr = WaitForSingleObject(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
+            wr = wait_game(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
     }
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
-        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = wait_game(t, h - done);
     }
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());

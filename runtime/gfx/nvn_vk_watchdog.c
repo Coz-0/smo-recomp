@@ -12,7 +12,9 @@
  * The report is repeated after 4x the time (5 s, 20 s, 80 s, ...), at most 6 times a run; a line says when frames come back.
  * It only reads: nothing is unblocked or killed. Threads are suspended one at a time for the few microseconds of the unwind;
  * nothing is printed or allocated while one is suspended. */
+#ifdef _WIN32
 #include <tlhelp32.h>
+#endif
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 int display_menu_held(void);                       /* display.c */
 extern volatile LONG g_guest_frozen;               /* hostrt.c */
@@ -56,6 +58,38 @@ static void wd_map_load(void) {                    /* the linker's map of this e
     fclose(fp);
     if (g_wd_nsym) qsort(g_wd_sym, (size_t)g_wd_nsym, sizeof *g_wd_sym, wd_sym_cmp);
 }
+#ifndef _WIN32
+/* macOS: names from dladdr (this program's functions and the system's), the lifted game's as on Windows */
+#include <dlfcn.h>
+#include <mach/mach.h>
+#define IsIconic(h) ((void)(h), display_window_minimised())
+int display_window_minimised(void);                /* display.c */
+static void wd_addr(uint64_t pc, char *out, size_t n) {
+    Dl_info di, gi;
+    char sym[160] = "";
+    if (!dladdr((const void *)(uintptr_t)pc, &di) || !di.dli_fbase) { snprintf(out, n, "%llx (in no module)", (unsigned long long)pc); return; }
+    const char *bn = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+    bn = bn ? bn + 1 : di.dli_fname ? di.dli_fname : "?";
+    uint32_t rva = (uint32_t)(pc - (uint64_t)(uintptr_t)di.dli_fbase);
+    if (dladdr((const void *)&fn_table[0], &gi) && gi.dli_fbase == di.dli_fbase) {
+        uint64_t best = 0, guest = 0;
+        for (int i = 0; i < fn_table_count; i++) { uint64_t f = (uint64_t)(uintptr_t)fn_table[i].fn; if (f <= pc && f > best) { best = f; guest = fn_table[i].addr; } }
+        if (best && pc - best < 0x400000) snprintf(sym, sizeof sym, "guest f_%llx (host +0x%x)", (unsigned long long)guest, (unsigned)(pc - best));
+    } else if (di.dli_sname) snprintf(sym, sizeof sym, "%s+0x%llx", di.dli_sname, (unsigned long long)(pc - (uint64_t)(uintptr_t)di.dli_saddr));
+    snprintf(out, n, "%s+0x%x%s%s%s", bn, (unsigned)rva, sym[0] ? " [" : "", sym, sym[0] ? "]" : "");
+}
+static const char *wd_tname(DWORD tid, char *buf, size_t n) {
+    (void)buf; (void)n;
+    const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: waits for the game)" : guest_thread_name_of(tid);
+    return g ? g : "host thread";
+}
+static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
+    char tb[48];
+    DWORD o = (DWORD)(uintptr_t)cs->OwningThread;
+    if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %d\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), cs->depth);
+    else wdp("  lock %s: free\n", name);
+}
+#else
 static void wd_export(HMODULE m, uint32_t rva, char *out, size_t n) {      /* the nearest exported name at or below rva */
     const uint8_t *b = (const uint8_t *)m;
     const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)b;
@@ -125,6 +159,7 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
     if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld, lock count %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->RecursionCount, (long)cs->LockCount);
     else wdp("  lock %s: free\n", name);
 }
+#endif
 static void wd_dump(double stall_s, LONG64 tries_since) {
     static struct { DWORD tid; ULONGLONG cpu0, cpu1, born; int prio, nfr; uint64_t pc[28]; } th[400];
     char path[MAX_PATH + 16], tb[48], ab[400];
@@ -132,7 +167,11 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
     SYSTEMTIME st; GetLocalTime(&st);
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId(), n = GetModuleFileNameA(NULL, path, MAX_PATH);
     int nt = 0;
+#ifdef _WIN32
     if (n > 4) { strcpy(path + n - 4, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
+#else
+    if (n > 0 && n + 12 < sizeof path) { strcpy(path + n, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }   /* the program has no ".exe" to replace */
+#endif
     wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)pid, (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
@@ -153,6 +192,45 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         }
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
+#ifndef _WIN32
+    {   /* macOS: the task's threads (Mach); CPU time twice, 300 ms apart; then each one's stack, suspended one at a time */
+        thread_act_array_t tl;
+        mach_msg_type_number_t ntl = 0;
+        mach_port_t self = mach_thread_self();
+        (void)pid;
+        if (task_threads(mach_task_self(), &tl, &ntl) == KERN_SUCCESS) {
+            for (int pass = 0; pass < 2; pass++) {
+                for (mach_msg_type_number_t t = 0; t < ntl && t < 400; t++) {
+                    thread_basic_info_data_t bi;
+                    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+                    if (tl[t] == self) continue;
+                    int i;
+                    for (i = 0; i < nt && th[i].tid != (DWORD)tl[t]; i++) {}
+                    if (i == nt) { if (pass) continue; th[nt].tid = (DWORD)tl[t]; th[nt].cpu0 = th[nt].cpu1 = 0; th[nt].nfr = 0; th[nt].prio = 0; th[nt].born = (ULONGLONG)t; nt++; }
+                    if (thread_info(tl[t], THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS) {
+                        ULONGLONG cpu = ((ULONGLONG)bi.user_time.seconds + (ULONGLONG)bi.system_time.seconds) * 10000000ull + ((ULONGLONG)bi.user_time.microseconds + (ULONGLONG)bi.system_time.microseconds) * 10ull;
+                        if (pass) th[i].cpu1 = cpu; else th[i].cpu0 = th[i].cpu1 = cpu;
+                        th[i].prio = bi.policy;              /* macOS: no Windows priority to show; the scheduling policy */
+                    }
+                }
+                if (!pass) Sleep(300);
+            }
+            for (int i = 0; i < nt; i++) {
+                arm_thread_state64_t ts;
+                mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                mach_port_t port = (mach_port_t)th[i].tid;
+                if (thread_suspend(port) != KERN_SUCCESS) continue;
+                if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt) == KERN_SUCCESS)
+                    th[i].nfr = host_frames_from(arm_thread_state64_get_pc(ts), arm_thread_state64_get_lr(ts), arm_thread_state64_get_fp(ts), th[i].pc, 28);
+                thread_resume(port);
+            }
+            for (mach_msg_type_number_t t = 0; t < ntl; t++) mach_port_deallocate(mach_task_self(), tl[t]);
+            vm_deallocate(mach_task_self(), (vm_address_t)tl, ntl * sizeof *tl);
+        }
+        mach_port_deallocate(mach_task_self(), self);
+    }
+    if (nt) g_wd_main_tid = th[0].tid;             /* the task's first thread runs boot.c main */
+#else
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te;
@@ -186,6 +264,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         CloseHandle(h);
     }
     { ULONGLONG first = ~0ull; for (int i = 0; i < nt; i++) if (th[i].born < first) { first = th[i].born; g_wd_main_tid = th[i].tid; } }      /* the process's first thread runs the guest's main thread (boot.c) */
+#endif
     wdp("  threads: %d (the watchdog's own not listed); \"cpu\" = CPU time used in 300 ms: 0.0 means blocked or idle\n", nt);
     for (int i = 0; i < nt; i++) {
         wdp("  thread %lu  %s  priority %d  cpu %.1f ms of 300\n", (unsigned long)th[i].tid, wd_tname(th[i].tid, tb, sizeof tb), th[i].prio, (double)(th[i].cpu1 - th[i].cpu0) / 10000.0);
@@ -220,6 +299,7 @@ static DWORD WINAPI wd_main(void *arg) {
     }
     return 0;
 }
+#ifdef _WIN32
 /* SMO_HOSTPROF=<start s>,<seconds>[,<threads>] (debug aid): samples the stacks of the busiest threads (default 4, by CPU
  * time in half a second at the start) about every millisecond for that long, then prints per thread the functions met
  * most often: "self" when the sampled pc is in the function, "total" when the function is anywhere on the stack, in % of
@@ -407,6 +487,9 @@ static void hp_start(void) {
     HANDLE t = CreateThread(NULL, 0, hp_main, NULL, 0, NULL);
     if (t) { SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL); CloseHandle(t); }
 }
+#else
+static void hp_start(void) { if (getenv("SMO_HOSTPROF")) printf("hostprof: SMO_HOSTPROF is not available on macOS yet\n"); }
+#endif
 static void wd_start(void) {
     static double limit = 5.0;
     hp_start();

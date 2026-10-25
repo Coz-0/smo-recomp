@@ -279,7 +279,7 @@ void Sleep(DWORD ms) {
 BOOL SwitchToThread(void) { sched_yield(); return TRUE; }
 
 /* ---------------------------------------------------------------- handles: threads and events */
-enum { H_THREAD = 0x54485244, H_EVENT = 0x45564e54 };
+enum { H_THREAD = 0x54485244, H_EVENT = 0x45564e54, H_SEM = 0x53454d41 };
 /* every handle starts with its kind */
 typedef struct { uint32_t kind; int fd; } FileObj;
 enum { H_FILE = 0x46494c45, H_FIND = 0x46494e44, H_MUTEX = 0x4d555458, H_PROCESS = 0x50524f43 };
@@ -412,6 +412,22 @@ HANDLE CreateEventA(void *sec, BOOL manual_reset, BOOL initial, LPCSTR name) {
     o->signalled = initial;
     return o;
 }
+HANDLE CreateSemaphoreA(void *sec, LONG initial, LONG maximum, LPCSTR name) {
+    (void)sec; (void)name;
+    Obj *o = obj_new(H_SEM);
+    o->signalled = (int)initial;                          /* the count */
+    o->manual = (int)maximum;
+    return o;
+}
+BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous) {
+    Obj *o = h;
+    pthread_mutex_lock(&o->m);
+    if (previous) *previous = o->signalled;
+    int ok = n > 0 && (LONG)o->signalled + n <= (LONG)o->manual;
+    if (ok) { o->signalled += (int)n; pthread_cond_broadcast(&o->cv); }
+    pthread_mutex_unlock(&o->m);
+    return ok;
+}
 BOOL SetEvent(HANDLE h) {
     Obj *o = h;
     pthread_mutex_lock(&o->m);
@@ -443,7 +459,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
         if (kind == H_PROCESS) return process_wait(h, ms);
     }
     Obj *o = obj_of(h);
-    if (!o || (o->kind != H_THREAD && o->kind != H_EVENT)) return WAIT_FAILED;
+    if (!o || (o->kind != H_THREAD && o->kind != H_EVENT && o->kind != H_SEM)) return WAIT_FAILED;
     struct timespec ts;
     if (ms != INFINITE) deadline_of(ms, &ts);
     pthread_mutex_lock(&o->m);
@@ -451,6 +467,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
     while (!o->signalled && r != ETIMEDOUT) r = ms == INFINITE ? pthread_cond_wait(&o->cv, &o->m) : pthread_cond_timedwait(&o->cv, &o->m, &ts);
     int got = o->signalled;
     if (got && o->kind == H_EVENT && !o->manual) o->signalled = 0;
+    if (got && o->kind == H_SEM) o->signalled--;           /* a semaphore: one unit taken */
     pthread_mutex_unlock(&o->m);
     return got ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
 }
@@ -983,6 +1000,15 @@ BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value) { return !(value ? seten
 DWORD GetCurrentProcessorNumber(void) {
     size_t n = 0;
     return pthread_cpu_number_np(&n) ? 0 : (DWORD)n;
+}
+void GetSystemInfo(SYSTEM_INFO *si) {
+    memset(si, 0, sizeof *si);
+    si->wProcessorArchitecture = 12;                      /* PROCESSOR_ARCHITECTURE_ARM64 */
+    si->dwPageSize = si->dwAllocationGranularity = (DWORD)vm_page_size;
+    si->dwNumberOfProcessors = (DWORD)sysconf(_SC_NPROCESSORS_ONLN);
+    GetProcessAffinityMask(NULL, &si->dwActiveProcessorMask, &si->dwActiveProcessorMask);
+    si->lpMinimumApplicationAddress = (LPVOID)(uintptr_t)vm_page_size;
+    si->lpMaximumApplicationAddress = (LPVOID)(uintptr_t)0x7fffffffffffull;
 }
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     (void)p;

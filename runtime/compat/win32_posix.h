@@ -30,7 +30,7 @@ typedef unsigned long ULONG;
 typedef int64_t LONG64, LONGLONG;
 typedef uint64_t ULONG64, ULONGLONG, DWORD64, DWORD_PTR;
 typedef size_t SIZE_T;
-typedef void *LPVOID, *PVOID, *HANDLE, *HMODULE;
+typedef void *LPVOID, *PVOID, *HANDLE, *HMODULE, *HWND;
 typedef const void *LPCVOID;
 typedef const char *LPCSTR;
 typedef char *LPSTR;
@@ -137,6 +137,7 @@ void WakeAllConditionVariable(CONDITION_VARIABLE *cv);
 
 /* ---- clocks */
 ULONGLONG GetTickCount64(void);
+#define GetTickCount() ((DWORD)GetTickCount64())
 BOOL QueryPerformanceCounter(LARGE_INTEGER *t);       /* nanoseconds */
 BOOL QueryPerformanceFrequency(LARGE_INTEGER *f);     /* 1e9 */
 void Sleep(DWORD ms);
@@ -162,6 +163,8 @@ BOOL SetThreadPriority(HANDLE h, int priority);
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);   /* macOS has none: accepted, ignored */
 BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *t);    /* CPU time used by the thread, in nanoseconds (not cycles) */
 HANDLE CreateEventA(void *sec, BOOL manual_reset, BOOL initial, LPCSTR name);
+HANDLE CreateSemaphoreA(void *sec, LONG initial, LONG maximum, LPCSTR name);
+BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous);
 BOOL SetEvent(HANDLE h);
 BOOL ResetEvent(HANDLE h);
 DWORD WaitForSingleObject(HANDLE h, DWORD ms);
@@ -191,6 +194,9 @@ BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb);
 #define _wcsicmp wcscasecmp
 #define _strdup strdup
 #define _strtoui64 strtoull
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+static inline char *_strlwr(char *s) { for (char *p = s; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32); return s; }
 #define _strtoi64 strtoll
 #define _putenv(s) recomp_putenv(s)
 #define _putenv_s(k, v) setenv((k), (v), 1)
@@ -315,6 +321,9 @@ HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid);              /* WaitF
 BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value);
 BOOL GetUserNameW(LPWSTR out, DWORD *n);       /* the login name; *n in characters with the zero, as on Windows */
 DWORD GetCurrentProcessorNumber(void);
+typedef struct { WORD wProcessorArchitecture, wReserved; DWORD dwPageSize; LPVOID lpMinimumApplicationAddress, lpMaximumApplicationAddress;
+                 DWORD_PTR dwActiveProcessorMask; DWORD dwNumberOfProcessors, dwProcessorType, dwAllocationGranularity; WORD wProcessorLevel, wProcessorRevision; } SYSTEM_INFO;
+void GetSystemInfo(SYSTEM_INFO *si);                 /* processors, page size (16 KB) and allocation granularity (the page here) */
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys);   /* every processor, as one bit each */
 #define NORMAL_PRIORITY_CLASS 0x20u
 #define ABOVE_NORMAL_PRIORITY_CLASS 0x8000u
@@ -324,6 +333,15 @@ BOOL SetThreadPriorityBoost(HANDLE h, BOOL disable);
 #define THREAD_PRIORITY_LOWEST (-2)
 #define THREAD_PRIORITY_BELOW_NORMAL (-1)
 #define THREAD_PRIORITY_IDLE (-15)
+
+/* ---- write watching: macOS has none; "not watched" (the renderer then hashes, as it does for memory Windows cannot watch) */
+typedef uintptr_t ULONG_PTR;
+#define WRITE_WATCH_FLAG_RESET 1u
+#define MEM_WRITE_WATCH 0x200000u
+static inline UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T n, PVOID *pages, ULONG_PTR *count, DWORD *gran) {
+    (void)flags; (void)base; (void)n; (void)pages; (void)gran; *count = 0; return 1;
+}
+static inline UINT ResetWriteWatch(PVOID base, SIZE_T n) { (void)base; (void)n; return 1; }
 
 /* ---- memory probes */
 BOOL IsBadReadPtr(const void *p, uintptr_t n);
@@ -378,9 +396,14 @@ SHORT GetAsyncKeyState(int vk);                   /* 0x8000 while the key is dow
 int recomp_mac_keycode(int vk);                   /* the macOS key code (kVK_*) of a virtual key, -1 if none */
 void recomp_set_key_source(int (*down)(int vk));  /* display: key states from its window (NULL: the system's) */
 
+/* ---- window text: the window is the display's (display.c); these are inert, for code that names an HWND */
+static inline int GetWindowTextA(HWND w, LPSTR s, int n) { (void)w; if (n > 0) s[0] = 0; return 0; }
+static inline BOOL SetWindowTextA(HWND w, LPCSTR s) { (void)w; (void)s; return FALSE; }
+typedef struct { LONG left, top, right, bottom; } RECT;
+static inline BOOL GetClientRect(HWND w, RECT *r) { (void)w; memset(r, 0, sizeof *r); return FALSE; }
+
 /* ---- message boxes: a CoreFoundation alert, modal and blocking on any thread as on Windows. Without a user to
  * answer (no window server) it returns at once with the default button. */
-typedef void *HWND;
 #define MB_OK 0x0u
 #define MB_OKCANCEL 0x1u
 #define MB_YESNO 0x4u
