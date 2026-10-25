@@ -146,6 +146,11 @@ static void test_threads(void) {
     CHECK(WaitForSingleObject(c, 1000) == WAIT_OBJECT_0 && g_counter == 1, "enters once released");
     CloseHandle(c);
 
+    HANDLE sem = CreateSemaphoreA(NULL, 1, 2, NULL);
+    CHECK(WaitForSingleObject(sem, 0) == WAIT_OBJECT_0 && WaitForSingleObject(sem, 10) == WAIT_TIMEOUT, "a semaphore of 1 is taken once");
+    CHECK(ReleaseSemaphore(sem, 2, NULL) && !ReleaseSemaphore(sem, 1, NULL) && WaitForSingleObject(sem, 0) == WAIT_OBJECT_0 && WaitForSingleObject(sem, 0) == WAIT_OBJECT_0,
+          "released by 2 (its maximum), not beyond; taken twice");
+    CloseHandle(sem);
     HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
     CHECK(WaitForSingleObject(e, 10) == WAIT_TIMEOUT, "unset event times out");
     SetEvent(e);

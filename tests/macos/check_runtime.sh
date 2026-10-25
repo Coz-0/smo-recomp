@@ -18,10 +18,17 @@ step() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fail=1; 
 before=$(git status --porcelain --untracked-files=all | sort)
 tests/macos/check_core.sh || fail=1
 
-for d in "${FOLDERS[@]}"; do
+# gfx/ and audio/ carry style warnings of their own (unused variables, && within ||, switches over part of an enum),
+# hidden in the real build (-w); these folders are compiled without them. nvn_vk_draw.c, nvn_vk_pipelines.c and
+# nvn_vk_watchdog.c are part of nvn_vk.c.
+RELAXED=(-Wno-unused-variable -Wno-logical-op-parentheses -Wno-switch -Wno-misleading-indentation -Wno-unknown-pragmas)
+INC+=(-I"$HOME/VulkanSDK/1.4.363.0/macOS/include")
+for d in "${FOLDERS[@]}" gfx audio compat; do
     for f in runtime/$d/*.c; do
+        case "$f" in */nvn_vk_draw.c|*/nvn_vk_pipelines.c|*/nvn_vk_watchdog.c) continue ;; esac
+        extra=(); case "$d" in gfx|audio) extra=("${RELAXED[@]}") ;; esac
         log="$OUT/$(basename "$f" .c).log"
-        "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable -Werror "${INC[@]}" -c "$f" -o "$OUT/$(basename "$f" .c).o" >"$log" 2>&1
+        "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable ${extra[@]+"${extra[@]}"} -Werror "${INC[@]}" -c "$f" -o "$OUT/$(basename "$f" .c).o" >"$log" 2>&1
         r=$?; step $r "compile $f"; [ $r -ne 0 ] && sed 's/^/      /' "$log" | head -20
     done
 done

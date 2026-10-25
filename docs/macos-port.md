@@ -70,9 +70,28 @@ Each step builds and is checked before the next one starts.
    Not done: the link of the whole program (needs `gfx/` and `audio/`, steps 5 and 6); `scripts/run.py` (Windows
    process and memory calls; checked only against a running game).
 4. **Boot without a picture**: the game reaches `nnMain` and its threads run (`SMO_GFX` off).
+   **The program links and runs** (milestone 1, 2026-10-25; `tests/macos/check_link.sh`). With stand-ins for what the
+   dump gives (two lifted-style functions and their tables, the stub `image.h`, empty SDK tables, a zero image and a
+   `main.npdm`), the real `build_main.py` and `build_exe.py` make `libsmo_game.dylib` and `smo_native` from the whole
+   runtime. `SMO_VK_SELFTEST=180`: start-up, every registration, the window, Vulkan on KosmicKrisp, 180 frames on the
+   display clock in 3.000 s (60.00 fps, median 16.66 ms, worst 17.24 ms), 0 Vulkan failures, clean shutdown. Seen on
+   screen (`SMO_SHOW=1`): the window shows the self-test's cleared frames. Without the self-test the guest's start-up
+   runs the stand-in game through nninitStartup and nnMain to "nnMain returned".
+   On macOS a program or library linked over an existing file is killed at its next launch (the kernel keeps the old
+   code signature): `build_exe.py` removes them first.
 5. **Renderer**: an SDL3 window with a Metal layer, the vertex layout in the pipeline key, a fallback for custom
    border colours, the geometry stage of the Ruined Kingdom's lightning.
+   Done so far: the window (`display.c`: SDL3 on the main thread, which pumps its events while it waits for the game;
+   events are taken as they are queued, since `nnpad_sdl.c` flushes SDL's queue), the Metal surface, the Vulkan loader
+   and driver choice (KosmicKrisp by default, `SMO_VK_DRIVER=moltenvk`), the freeze watchdog's thread report (Mach
+   threads, `dladdr` names), the index scan in NEON (200,000 random buffers equal to the scalar rule). The OpenGL
+   renderer cannot run on macOS (OpenGL 4.6 and NVIDIA extensions): its file compiles against `compat/GL/gl.h` and
+   the renderer is always Vulkan. To do: the vertex layout in the pipeline key; graphics memory pools that show heap
+   pages at a second address (`nvn_stub.c` uses `MapViewOfFile3`: `mach_vm_remap` here).
 6. **Audio, video, Help**: audio through SDL3, H.264 through VideoToolbox, the Action Guide in WKWebView.
+   Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
+   audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
+   counted).
 
 ## Things the Mac does differently
 

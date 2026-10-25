@@ -56,8 +56,15 @@ HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing'] + T.runtime_includes() + ['-I
               '-I', SDL3_INC, '-I', VKH] + ([] if T.MAC else ['-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')])
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32']
 if T.MAC:
-    HOST_SOURCES['compat'] = ['win32_posix.c']
+    HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
     LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
+
+
+def fresh_output(path):
+    """macOS: a program or library is removed before it is linked again. Written over in place, the kernel keeps the old
+    code signature of the file and kills its next launch (SIGKILL; seen with smo_native)."""
+    if T.MAC and os.path.exists(path):
+        os.remove(path)
 
 
 def build_game_dll(force):
@@ -76,6 +83,7 @@ def build_game_dll(force):
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     t0 = time.time()
     mac = ['-Wl,-install_name,@rpath/' + T.GAME_LIB] if T.MAC else []       # found next to the program (@executable_path)
+    fresh_output(dll)
     r = subprocess.run([CLANG, '-dynamiclib' if T.MAC else '-shared', '-O1', '-w'] + T.runtime_includes() + ['-I', LIFT] + mac
                        + [shim, '@' + rsp, '-o', dll], capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
@@ -129,6 +137,7 @@ def main():
     else:
         cmd = [CLANG] + objs + [os.path.join(BIN, 'smo_game.lib'), os.path.join(SDL3_LIB, 'SDL3.lib')] \
             + LIBS + ['-Xlinker', '/MAP:' + out[:-4] + '.map', '-o', out]
+    fresh_output(out)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print((r.stdout + r.stderr)[-8000:])
@@ -154,6 +163,7 @@ def build_shader_shim():
     dll = os.path.join(BIN, 'libsmo_glslang.dylib' if T.MAC else 'smo_glslang.dll')
     src = T.runtime('gfx', 'vk_shaderc_shim.c')
     if not os.path.exists(dll) or os.path.getmtime(dll) < os.path.getmtime(src):
+        fresh_output(dll)
         mac = T.runtime_includes() + ['-Wl,-install_name,@rpath/libsmo_glslang.dylib', T.runtime('compat', 'win32_posix.c')] \
             + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)] if T.MAC else []
         r = subprocess.run([CLANG, '-dynamiclib' if T.MAC else '-shared', '-O1', '-w'] + mac + [src, '-o', dll], capture_output=True, text=True)
