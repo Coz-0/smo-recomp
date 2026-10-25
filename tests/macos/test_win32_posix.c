@@ -363,11 +363,36 @@ static void test_try(void) {
     CHECK(n == 50000 && recomp_try_top == NULL, "100000 probes, half of them faulting (%d faults)", n);
 }
 
+/* ---- condition variables: the zero timeout is a poll (the message queues' TryReceive / TrySend rely on it) */
+static CONDITION_VARIABLE g_cv;
+static CRITICAL_SECTION g_cv_cs;
+static DWORD WINAPI cv_waker(LPVOID arg) { (void)arg; Sleep(20); EnterCriticalSection(&g_cv_cs); LeaveCriticalSection(&g_cv_cs); WakeConditionVariable(&g_cv); return 0; }
+static void test_condvar(void) {
+    InitializeConditionVariable(&g_cv);
+    InitializeCriticalSection(&g_cv_cs);
+    EnterCriticalSection(&g_cv_cs);
+    ULONGLONG t0 = GetTickCount64();
+    int n = 0;
+    while (n < 1000 && SleepConditionVariableCS(&g_cv, &g_cv_cs, 0)) n++;       /* a poll on a quiet variable: FALSE at once */
+    CHECK(n == 0, "SleepConditionVariableCS(0) on a quiet variable returned TRUE %d times (a zero wait is a poll, not a wake)", n);
+    CHECK(GetTickCount64() - t0 < 50, "the polls took %llu ms", (unsigned long long)(GetTickCount64() - t0));
+    t0 = GetTickCount64();
+    CHECK(!SleepConditionVariableCS(&g_cv, &g_cv_cs, 30), "a 30 ms wait with no wake times out (FALSE)");
+    ULONGLONG dt = GetTickCount64() - t0;
+    CHECK(dt >= 25 && dt < 500, "the 30 ms wait took %llu ms", (unsigned long long)dt);
+    HANDLE h = CreateThread(NULL, 0, cv_waker, NULL, 0, NULL);
+    CHECK(SleepConditionVariableCS(&g_cv, &g_cv_cs, 5000), "a wake from another thread ends the wait (TRUE)");
+    WaitForSingleObject(h, INFINITE); CloseHandle(h);
+    LeaveCriticalSection(&g_cv_cs);
+    DeleteCriticalSection(&g_cv_cs);
+}
+
 int main(void) {
     test_guest_ranges();
     test_reserve_commit_query();
     test_interlocked();
     test_threads();
+    test_condvar();
     test_misc();
     test_files();
     test_strings_and_misc();
