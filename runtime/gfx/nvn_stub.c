@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -169,7 +173,7 @@ static UnmapViewOfFile2Fn p_UnmapViewOfFile2;
 #endif
 int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);     /* smo_nn.c */
 static void vp_fail(Ctx *c, const char *what, uint64_t a, uint64_t b) {
-    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; Windows error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, GetLastError());
+    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; Windows error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, (unsigned long)GetLastError());
     guest_trap("nvnMemoryPoolMapVirtual: request that cannot be mapped exactly", c ? c->x[30] - 4 : 0);
 }
 static void vp_load(Ctx *c) {

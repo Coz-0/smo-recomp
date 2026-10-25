@@ -1,0 +1,124 @@
+# macOS on Apple silicon: port plan
+
+Status: started. Nothing below has run the game on a Mac yet. What was measured is said; the rest is the plan.
+
+## What was measured (Apple M4, macOS 27, 2026-10-25)
+
+Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew MoltenVK 1.4.2):
+
+| What the renderer asks for | KosmicKrisp (SDK 1.4.363) | MoltenVK 1.4.2 |
+|---|---|---|
+| `VK_EXT_vertex_input_dynamic_state` (required, `nvn_vk_draw.c` stops without it) | no | no |
+| `VK_EXT_graphics_pipeline_library`, `VK_EXT_shader_object` | no | no |
+| `VK_EXT_extended_dynamic_state3`: blend enable/equation, write mask, sample mask, alpha to coverage | no (the renderer keys them instead) | no |
+| `logicOp` | yes | no |
+| `VK_EXT_provoking_vertex`, `VK_EXT_primitive_topology_list_restart`, `VK_EXT_blend_operation_advanced` | yes | no |
+| `VK_EXT_depth_clip_control`, `VK_KHR_push_descriptor`, `VK_EXT_index_type_uint8`, `VK_EXT_4444_formats` | yes | yes |
+| `VK_EXT_custom_border_color` | no | no |
+| `geometryShader`, `wideLines` | no | no |
+| BC and ASTC textures | yes | yes |
+
+KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so the vertex layout
+has to become part of the pipeline key on both.
+
+## Order of work
+
+Each step builds and is checked before the next one starts.
+
+1. **`runtime/core` builds for arm64 macOS.** `runtime/compat/win32_posix.h` gives the Win32 calls the runtime uses
+   (memory, locks, interlocked operations, clocks, threads, module names) on POSIX and Mach, so the Windows sources stay
+   as they are. Code that cannot be shimmed is under `#ifdef _WIN32`, with the macOS version beside it: the crash
+   report (signals and the frame-pointer chain instead of SEH and `RtlVirtualUnwind`), thread sampling
+   (`thread_get_state`), and the `SMO_STRICT` check of do-nothing handlers (AArch64 instead of x64 machine code).
+   Checked by `tests/macos/check_core.sh`, which compiles the folder and runs the shim's tests.
+   **Done** (Apple M4, Apple clang, 2026-10-25). Every file of `runtime/core` compiles with `-Wall -Werror` against a
+   stand-in `image.h`. The shim passes 53 of 53 checks: the four guest ranges map at their fixed addresses, the image
+   protection works in 16 KB pages, and locks, condition variables, `CREATE_SUSPENDED` threads, events and thread
+   sampling behave as on Windows. The AArch64 handler check passes 16 of 16 against handlers compiled at -O1 and -O2.
+   `hostrt.c`, linked with two stand-in lifted functions, maps the image, dispatches an indirect call and reports a
+   write into read-only text and a guest trap with the fault address, the guest and host stacks and exit code 4.
+   Not checked: that the Windows build still compiles (no Windows toolchain on the Mac). The Windows code is
+   unchanged except that the `SMO_CRASH_DUMP` block of the crash report is now a function of its own.
+   `SMO_WATCH` is not available on macOS yet: a signal handler cannot single-step the faulting write.
+2. **The rest of the runtime builds**: `os/` (threads, the three-core scheduling, the heap that shows the same pages
+   at two addresses: `mach_vm_remap` instead of a pagefile-backed section), `fs/`, `libc/`, `services/`, `game/`
+   (`__try`/`__except` probes become a guarded read), `input/` (SDL3 already).
+   **Done for `libc/ os/ fs/ game/ input/ services/`** (2026-10-25; `gfx/` is step 5, `audio/` step 6). Every file
+   compiles with `-Wall -Werror`; `tests/macos/check_runtime.sh` runs, without a dump, the runtime's own self-tests that
+   do not need one:
+   - time zones: the macOS rule equals `localtime_r` in 199,798 conversions of 1970..2037 in each of 8 zones;
+   - save data: mount table, journal, two-phase commit, roll-forward, directory listing: 0 failures;
+   - controllers with SDL3's virtual pads: 51 of 51, as on Windows;
+   - network: 16 of 17 (UDP and TCP on loopback, Poll, the console's error numbers, resolver, ssl, nsd); the 17th
+     reads a table of `sdk.elf` and needs a dump;
+   - glyphs from CoreText outlines (TrueType and CFF), plain and outlined.
+   On macOS for now: the software keyboard is a CoreFoundation alert with a text field (its self-test answers it, the
+   alert itself is not driven); the Help page opens in the web browser; movies keep the failing placeholder; the
+   shared fonts fall back to macOS's own (Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo), not yet seen
+   in the game.
+3. **The build scripts run on macOS**: `setup.py`, `build_main.py`, `build_exe.py` with Apple clang, a dylib instead
+   of `smo_game.dll`, Homebrew SDL3 and the Vulkan SDK.
+   **Done as far as it goes without a dump** (2026-10-25). `tools/target.py` has the toolchain and file names of each
+   system; `setup.py --only deps` finds Apple clang, the Vulkan SDK and SDL3; `extract.py` links the RomFS with a
+   symbolic link instead of a junction. `tests/macos/check_build.sh`: `build_main.py` compiles lifter-shaped files to
+   arm64 objects (its unoptimised fallback included); the shader shim builds and compiles GLSL to SPIR-V through the
+   SDK's shaderc. `-ffp-contract=off` is checked: Apple clang fuses `a * b + c` into `fmadd` for AArch64 by default
+   (measured), which would change float results against the console; x86-64's baseline has no FMA to fuse into.
+   `tests/macos/check_lifter.sh`: the lifter's differential test on words sampled from arm64 macOS libraries (SDL3,
+   libavcodec's NEON, MoltenVK): 30,176 of 30,176 equal to Unicorn, and the mutation check flags its 4 planted bugs.
+   It found two lifter bugs, fixed: XTN2 wrote the lower half, LDAPR (ARMv8.3) was lifted instead of trapping.
+   Not done: the link of the whole program (needs `gfx/` and `audio/`, steps 5 and 6); `scripts/run.py` (Windows
+   process and memory calls; checked only against a running game).
+4. **Boot without a picture**: the game reaches `nnMain` and its threads run (`SMO_GFX` off).
+   **The program links and runs** (milestone 1, 2026-10-25; `tests/macos/check_link.sh`). With stand-ins for what the
+   dump gives (two lifted-style functions and their tables, the stub `image.h`, empty SDK tables, a zero image and a
+   `main.npdm`), the real `build_main.py` and `build_exe.py` make `libsmo_game.dylib` and `smo_native` from the whole
+   runtime. `SMO_VK_SELFTEST=180`: start-up, every registration, the window, Vulkan on KosmicKrisp, 180 frames on the
+   display clock in 3.000 s (60.00 fps, median 16.66 ms, worst 17.24 ms), 0 Vulkan failures, clean shutdown. Seen on
+   screen (`SMO_SHOW=1`): the window shows the self-test's cleared frames. Without the self-test the guest's start-up
+   runs the stand-in game through nninitStartup and nnMain to "nnMain returned".
+   On macOS a program or library linked over an existing file is killed at its next launch (the kernel keeps the old
+   code signature): `build_exe.py` removes them first.
+5. **Renderer**: an SDL3 window with a Metal layer, the vertex layout in the pipeline key, a fallback for custom
+   border colours, the geometry stage of the Ruined Kingdom's lightning.
+   Done so far: the window (`display.c`: SDL3 on the main thread, which pumps its events while it waits for the game;
+   events are taken as they are queued, since `nnpad_sdl.c` flushes SDL's queue), the Metal surface, the Vulkan loader
+   and driver choice (KosmicKrisp by default, `SMO_VK_DRIVER=moltenvk`), the freeze watchdog's thread report (Mach
+   threads, `dladdr` names), the index scan in NEON (200,000 random buffers equal to the scalar rule). The OpenGL
+   renderer cannot run on macOS (OpenGL 4.6 and NVIDIA extensions): its file compiles against `compat/GL/gl.h` and
+   the renderer is always Vulkan. To do: the vertex layout in the pipeline key; graphics memory pools that show heap
+   pages at a second address (`nvn_stub.c` uses `MapViewOfFile3`: `mach_vm_remap` here).
+6. **Audio, video, Help**: audio through SDL3, H.264 through VideoToolbox, the Action Guide in WKWebView.
+   Audio done (not heard yet: it needs the game's renderer running): `smo_audio.c` sends the device sink to an SDL3
+   audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
+   counted).
+
+## Things the Mac does differently
+
+- **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.4.1 that is
+  0x4f16000, which is 4 KB aligned but not 16 KB aligned. Protection stops at the 16 KB page below it, so up to 12 KB
+  of read-only data stays writable. Rounding up instead would make the start of `.data` read-only.
+- **Fixed addresses: the guest layout is 0x10_0000_0000 higher.** macOS keeps 0x70_0000_0000..0x80_0000_0000 for
+  malloc's heap range and reserves 24 GB of it around its small-allocation region at a random place on every launch;
+  below it, 0x10_0000_0000..0x70_0000_0000 is a guard reservation. Measured over 60 launches of a test program (every
+  region of the process listed with `mach_vm_region_recurse`): the console's addresses 0x71/0x73/0x74/0x75 × 2³² were
+  taken in 10 of 20 launches of the shim's test. Above 0x80_0000_0000 nothing was mapped in any launch. So on macOS
+  the game image is at 0x8100000000, the import placeholders at 0x8300000000, the host functions at 0x8400000000 and
+  the SDK module at 0x8500000000 (`hostrt.h`, `tools/target.py`; the lifted code is made for these bases, and
+  `image.h` says which bases it was made for, so a mismatch stops the build). `hostrt.c` reserves the whole window
+  when the program loads. `tests/macos/check_core.sh` launches the mapping test 20 times.
+- **No code patching.** `smo_fast.c` makes one hot game function (the sampler list sort, 1-2 ms of the main thread a
+  frame at Cascade Kingdom on Windows) call a host version by rewriting a `call` in the loaded game code. The game's
+  code on macOS is a signed library, and a written code page fails its signature check, so on macOS the sort runs as
+  lifted until the lifter itself can emit the call to the host version.
+- **`__try` probes.** The runtime reads memory that may not be readable inside `__try { } __except (1) { }`. On macOS
+  the shim gives that form with `sigsetjmp` and the SIGSEGV/SIGBUS handler. As with `setjmp`, a local changed in the
+  block and read after a fault must be `volatile`; none of the runtime's blocks does that.
+- **No core affinity: the console core model must be rebuilt.** On Windows `os_threads.c` keeps the game's threads to
+  the console's three cores by pinning each to one of three host processors (`SetThreadAffinityMask`) with Windows
+  priorities in six levels, so that, as on the console, only the highest-priority ready thread of a core runs. Its
+  comments record what free scheduling costs: 4 of 6 boots failed in the game's heap code, and a stage-entry crash in 2
+  of 91 stress runs. macOS has no processor affinity (thread affinity tags are hints, and Apple silicon ignores them).
+  Until a model of its own exists (a token per console core that a guest thread holds while it runs and gives up when
+  it blocks in an SDK call, handed over in priority order), macOS prints that the model is off. This is the first thing
+  step 4 has to settle.

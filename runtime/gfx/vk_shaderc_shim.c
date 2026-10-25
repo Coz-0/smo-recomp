@@ -16,7 +16,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#include <dlfcn.h>
+#endif
 
 typedef void *shc_compiler;
 typedef void *shc_options;
@@ -45,12 +50,28 @@ static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK init_once(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     (void)once; (void)arg; (void)ctx;
+#ifdef _WIN32
     HMODULE m = LoadLibraryA("shaderc_shared.dll");
     if (!m) {                                                          /* the Vulkan SDK's own copy */
         char path[MAX_PATH];
         const char *sdk = getenv("VULKAN_SDK");
         if (sdk) { snprintf(path, sizeof path, "%s\\Bin\\shaderc_shared.dll", sdk); m = LoadLibraryA(path); }
     }
+#else
+    /* macOS: the copy build_exe.py puts next to this library, else the Vulkan SDK's (VULKAN_SDK = its macOS folder) */
+    HMODULE m = NULL;
+    {
+        Dl_info di;
+        char path[2048];
+        if (dladdr((void *)init_once, &di) && di.dli_fname) {
+            snprintf(path, sizeof path, "%s", di.dli_fname);
+            char *sl = strrchr(path, '/');
+            if (sl) { snprintf(sl + 1, sizeof path - (size_t)(sl + 1 - path), "libshaderc_shared.1.dylib"); m = LoadLibraryA(path); }
+        }
+        const char *sdk = getenv("VULKAN_SDK");
+        if (!m && sdk) { snprintf(path, sizeof path, "%s/lib/libshaderc_shared.1.dylib", sdk); m = LoadLibraryA(path); }
+    }
+#endif
     if (!m) { snprintf(g_load_error, sizeof g_load_error, "shaderc_shared.dll cannot be loaded (Vulkan SDK Bin folder)"); return FALSE; }
 #define GET(field, name) if (!(*(FARPROC *)&S.field = GetProcAddress(m, name))) { snprintf(g_load_error, sizeof g_load_error, "shaderc_shared.dll has no %s", name); return FALSE; }
     GET(compiler_initialize, "shaderc_compiler_initialize")

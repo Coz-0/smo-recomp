@@ -27,7 +27,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -404,7 +408,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     commit_done(mx);
     fs_unlock();
     trace_printf("     fs commit \"%s\": %s (%d changes)\n", name, ok ? "ok" : "FAILED", changes);
-    if (!ok) printf("nn::fs::Commit(\"%s\") failed on the host (Windows error %lu); the committed save data is unchanged or will be completed at the next mount\n", name, GetLastError());
+    if (!ok) printf("nn::fs::Commit(\"%s\") failed on the host (Windows error %lu); the committed save data is unchanged or will be completed at the next mount\n", name, (unsigned long)GetLastError());
     RET(ok ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_ok(Ctx *c) { RET(0); }

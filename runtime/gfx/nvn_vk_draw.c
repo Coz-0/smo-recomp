@@ -12,7 +12,11 @@
  * after destroy, barrier inside a pass, a view of an image in an unexpected layout) and prints every new pipeline. */
 #include <stdarg.h>
 #include <math.h>
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#else
 #include <emmintrin.h>
+#endif
 #include "tex_decode.h"
 #include "smo_ui.h"                                    /* UiMenuJob: the amiibo menu's pictures (vk_menu) */
 static int have_targets_live(void);
@@ -89,6 +93,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     D.f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; D.f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     D.f2.pNext = &D.f11; D.f11.pNext = &D.f12; D.f12.pNext = &D.f13; tail = &D.f13.pNext;
     D.exts[D.next++] = "VK_KHR_swapchain";
+    if (has_name(dext, ndext, "VK_KHR_portability_subset")) D.exts[D.next++] = "VK_KHR_portability_subset";   /* required where offered (MoltenVK) */
 #define EXT(flag, name, st, stype) if (has_name(dext, ndext, name)) { D.flag = 1; D.exts[D.next++] = name; D.st.sType = stype; *tail = &D.st; tail = &D.st.pNext; }
     EXT(has_vids, "VK_EXT_vertex_input_dynamic_state", vids, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT)
     EXT(has_cbc, "VK_EXT_custom_border_color", cbc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT)
@@ -646,6 +651,24 @@ static uint32_t index_max(uint64_t addr, int count, unsigned t) {
     const uint8_t *src = P(addr);
     uint32_t mx = 0;
     int k = 0, per = 16 >> t;                      /* indices in 16 bytes */
+#if defined(__aarch64__) || defined(_M_ARM64)
+    /* AArch64: NEON has unsigned maxima and a maximum across the vector, so no sign flip; a restart index is cleared
+     * (BIC with the lanes equal to all ones) so it counts as 0, as below */
+    (void)per;
+    if (t == 0) {
+        uint8x16_t m = vdupq_n_u8(0), all = vdupq_n_u8(0xff);
+        for (; k + 16 <= count; k += 16) { uint8x16_t v = vld1q_u8(src + k); if (R.restart) v = vbicq_u8(v, vceqq_u8(v, all)); m = vmaxq_u8(m, v); }
+        mx = vmaxvq_u8(m);
+    } else if (t == 1) {
+        uint16x8_t m = vdupq_n_u16(0), all = vdupq_n_u16(0xffff);
+        for (; k + 8 <= count; k += 8) { uint16x8_t v = vld1q_u16((const uint16_t *)(src + 2 * (size_t)k)); if (R.restart) v = vbicq_u16(v, vceqq_u16(v, all)); m = vmaxq_u16(m, v); }
+        mx = vmaxvq_u16(m);
+    } else {
+        uint32x4_t m = vdupq_n_u32(0), all = vdupq_n_u32(0xffffffffu);
+        for (; k + 4 <= count; k += 4) { uint32x4_t v = vld1q_u32((const uint32_t *)(src + 4 * (size_t)k)); if (R.restart) v = vbicq_u32(v, vceqq_u32(v, all)); m = vmaxq_u32(m, v); }
+        mx = vmaxvq_u32(m);
+    }
+#else
     __m128i ones = _mm_set1_epi8(-1), rs = R.restart ? ones : _mm_setzero_si128();
     if (t == 0) {
         __m128i m = _mm_setzero_si128();
@@ -668,6 +691,7 @@ static uint32_t index_max(uint64_t addr, int count, unsigned t) {
         uint32_t b[4]; _mm_storeu_si128((__m128i *)b, _mm_xor_si128(m, flip));
         for (int i = 0; i < per; i++) if (b[i] > mx) mx = b[i];
     }
+#endif
     if (t == 0) { for (; k < count; k++) { uint32_t v = src[k]; if (v > mx && !(R.restart && v == 0xFFu)) mx = v; } }
     else if (t == 1) { const uint16_t *p16 = (const uint16_t *)src; for (; k < count; k++) { uint32_t v = p16[k]; if (v > mx && !(R.restart && v == 0xFFFFu)) mx = v; } }
     else { const uint32_t *p32 = (const uint32_t *)src; for (; k < count; k++) { uint32_t v = p32[k]; if (v > mx && !(R.restart && v == 0xFFFFFFFFu)) mx = v; } }

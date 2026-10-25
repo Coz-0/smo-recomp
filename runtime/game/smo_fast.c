@@ -21,7 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -116,6 +120,13 @@ void smo_fast_install(void) {
         return;
     }
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
+#ifndef _WIN32
+    /* macOS: the game's code is in a signed library, and a written code page fails its signature check when it runs.
+     * The call cannot be redirected after loading; the sort runs as lifted (a hook made by the lifter is the way here). */
+    (void)host_fn_of; (void)g_lifted_sort;
+    printf("smo_fast: NOT installed on macOS (signed code cannot be patched): the game's sampler list sort runs as lifted\n");
+    return;
+#else
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);
     DWORD64 img = 0;
@@ -148,6 +159,7 @@ void smo_fast_install(void) {
     FlushInstructionCache(GetCurrentProcess(), at, 5);
     printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (SMO_FAST=0: the game's own code%s)\n",
            g_check ? "; SMO_FAST_CHECK=1: every sort compared with the game's" : ", SMO_FAST_CHECK=1: compare with it");
+#endif
 }
 
 void smo_fast_report(FILE *out) {

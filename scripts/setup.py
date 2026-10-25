@@ -57,13 +57,21 @@ def check_deps(a):
         except ImportError:
             print('  missing Python package %s (pip install %s)' % (mod, pip))
             ok = False
-    clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
-    sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
-    wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
-    wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
-    for what, path in (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
-                       ('WebView2 SDK (WEBVIEW2_ROOT)', wv2)):
+    vkh = T.vulkan_headers()
+    vkh = os.path.join(vkh, 'vulkan', 'vulkan.h') if vkh else ''
+    if T.MAC:                                         # docs/macos-port.md: Apple clang, Homebrew's SDL3, the LunarG SDK
+        import shutil
+        clang = shutil.which(T.clang()) or ''
+        tools = (('Apple clang (xcode-select --install)', clang), ('Vulkan SDK (~/VulkanSDK or VULKAN_SDK)', vkh),
+                 ('SDL3 (brew install sdl3, or SDL3_ROOT)', os.path.join(T.sdl3()[0], 'SDL3', 'SDL.h')))
+    else:
+        clang = T.clang()
+        sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
+        wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
+        wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
+        tools = (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
+                 ('WebView2 SDK (WEBVIEW2_ROOT)', wv2))
+    for what, path in tools:
         found = bool(path) and os.path.exists(path)
         print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
         ok &= found
@@ -93,7 +101,7 @@ STEPS = [
      lambda a: [[PY, tool('lifter', 'gen_tables.py')], [PY, tool('lifter', 'gen_sdktest.py')]]),
     ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
-    ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
+    ('link', 'bin/' + T.EXE, None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
     ('check', 'difftest + linkcheck', None,
      lambda a: [[PY, tool('lifter', 'difftest.py'), 'all'], [PY, tool('lifter', 'linkcheck.py')]]),
 ]
@@ -146,7 +154,7 @@ def main():
                     raise SystemExit('[%s] failed (exit code %d); fix the cause and run setup again, it resumes here' % (name, r.returncode))
     if 'link' in todo:
         print('\nBuilt: %s. Start the game with: python scripts/run.py <run name> --seconds 300'
-              % os.path.relpath(T.build('bin', 'smo_native.exe'), REPO))
+              % os.path.relpath(T.build('bin', T.EXE), REPO))
 
 
 if __name__ == '__main__':

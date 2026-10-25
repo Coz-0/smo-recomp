@@ -2,9 +2,18 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#include <signal.h>
+#include <unistd.h>
+#include <sys/ucontext.h>
+#include <mach/thread_status.h>
+#endif
 #include "runtime.h"
 #include "hostrt.h"
+#include "audit_a64.h"
 
 /* the image constants come from build/gen/image.h (generated from the dump) */
 #define FILE_OFF 0x1000ULL
@@ -225,7 +234,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
         host_import(c, (int)((addr - IMPORT_BASE) / IMPORT_SLOT));
         return;
     }
-    if (addr >= 0x7500000000ULL && addr < 0x7500000000ULL + SDK_IMAGE_SIZE_GEN) { sdk_dispatch(c, addr); return; }   /* lifted SDK code (sdklift_rt.c), e.g. a vtable entry of an SDK object */
+    if (addr >= SDK_BASE && addr < SDK_BASE + SDK_IMAGE_SIZE_GEN) { sdk_dispatch(c, addr); return; }   /* lifted SDK code (sdklift_rt.c), e.g. a vtable entry of an SDK object */
     void (*fn)(Ctx *) = lookup_guest(addr);
     if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
     fn(c);
@@ -241,6 +250,7 @@ static __declspec(thread) Ctx *t_cur_ctx;
 static uint64_t g_watch_lo, g_watch_hi, g_watch_page, g_watch_off;
 static volatile LONG g_watch_lines;
 static __declspec(thread) int t_watch_step, t_watch_hit;
+#ifdef _WIN32
 static void watch_where(const char *what, CONTEXT *cx) {
     Ctx *c = t_cur_ctx;
     HMODULE m = NULL;
@@ -288,6 +298,15 @@ void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
     VirtualProtect((void *)(uintptr_t)g_watch_page, 0x1000, PAGE_READONLY, &old);
     printf("watch: armed on heap+0x%llx, %llu bytes\n", (unsigned long long)off, (unsigned long long)len);
 }
+#else
+/* The Windows version steps the faulting write once with the page writable (the trap flag); a signal handler on
+ * macOS cannot single-step, so SMO_WATCH is not available here yet. */
+void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
+    (void)heap; (void)heap_size;
+    (void)g_watch_lo; (void)g_watch_hi; (void)g_watch_page; (void)g_watch_off; (void)g_watch_lines; (void)t_watch_step; (void)t_watch_hit;
+    if (getenv("SMO_WATCH")) printf("watch: SMO_WATCH is not available on macOS yet\n");
+}
+#endif
 
 void call_guest(Ctx *c, uint64_t addr) {
     Ctx *saved = t_cur_ctx;
@@ -530,33 +549,28 @@ void guest_trap(const char *what, uint64_t addr) {
     const char *tn = guest_thread_name_of(GetCurrentThreadId());
     printf("\nGUEST TRAP: %s (0x%llx), on thread %s\n", what, (unsigned long long)addr, tn ? tn : "main (or a host thread)");
     trace_printf("GUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
+#ifdef _WIN32
     RaiseException(0xE0000001, 0, 0, NULL);
+#else
+    __builtin_debugtrap();
+#endif
     report_and_exit(2);
 }
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
     printf("\nUNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
     trace_printf("UNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
+#ifdef _WIN32
     RaiseException(0xE0000002, 0, 0, NULL);
+#else
+    __builtin_debugtrap();
+#endif
     report_and_exit(3);
 }
 void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
 
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
-    EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
-    {   /* name the module and its offset, so the address can be looked up in the linker map (build_exe.py writes
-         * <exe>.map next to the exe) even with address-space randomisation */
-        HMODULE m = NULL;
-        char mod[MAX_PATH] = "?";
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)er->ExceptionAddress, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
-        printf("  in %s at offset 0x%llx\n", mod, (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)m));
-    }
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
-        printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
-               (unsigned long long)er->ExceptionInformation[1]);
-    dump_guest_registers();
-    if (getenv("SMO_CRASH_DUMP") && t_cur_ctx) {   /* debug aid: what the guest registers point to (SMO_CRASH_DUMP=<bytes>, 1 = 0x60) */
+/* debug aid: what the guest registers point to (SMO_CRASH_DUMP=<bytes>, 1 = 0x60) */
+static void crash_dump_guest_memory(void) {
+    if (getenv("SMO_CRASH_DUMP") && t_cur_ctx) {
         int dlen = (int)strtol(getenv("SMO_CRASH_DUMP"), NULL, 0);
         if (dlen < 0x60) dlen = 0x60;
         if (dlen > 0x1000) dlen = 0x1000;
@@ -599,6 +613,25 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
 #undef READABLE
         }
     }
+}
+
+#ifdef _WIN32
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
+    {   /* name the module and its offset, so the address can be looked up in the linker map (build_exe.py writes
+         * <exe>.map next to the exe) even with address-space randomisation */
+        HMODULE m = NULL;
+        char mod[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)er->ExceptionAddress, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
+        printf("  in %s at offset 0x%llx\n", mod, (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)m));
+    }
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+        printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
+               (unsigned long long)er->ExceptionInformation[1]);
+    dump_guest_registers();
+    crash_dump_guest_memory();
     {   /* the host frames too (module + offset; tools/lifter/mapaddr.py names them from the exe's map) */
         CONTEXT hc = *ep->ContextRecord;
         printf("host call stack (innermost first):\n");
@@ -633,6 +666,65 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     report_and_exit(4);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#else
+/* macOS: the same report from a signal handler. Host frames come from the frame-pointer chain (every arm64 macOS
+ * binary keeps one); a guest trap arrives here as SIGTRAP from __builtin_debugtrap(), as RaiseException does on Windows. */
+static void host_module_line(const char *indent, uint64_t pc) {
+    HMODULE m = NULL;
+    char mod[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)(uintptr_t)pc, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
+    const char *bn = strrchr(mod, '\\');
+    printf("%s%s+0x%llx\n", indent, bn ? bn + 1 : mod, (unsigned long long)(pc - (uintptr_t)m));
+}
+static void crash_signal(int sig, siginfo_t *si, void *ucv) {
+    static volatile int in_report;
+    if (sig == SIGSEGV || sig == SIGBUS) recomp_try_catch();        /* a fault inside a __try probe goes to its __except */
+    if (__atomic_exchange_n(&in_report, 1, __ATOMIC_SEQ_CST)) _exit(4);     /* a fault inside the report */
+    ucontext_t *uc = ucv;
+    uint64_t pc = arm_thread_state64_get_pc(uc->uc_mcontext->__ss), lr = arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+    uint64_t fp = arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+    printf("\nHOST EXCEPTION signal %d (%s) at host address %p\n", sig, strsignal(sig), (void *)(uintptr_t)pc);
+    host_module_line("  in ", pc);
+    uint32_t esr = uc->uc_mcontext->__es.__esr, ec = esr >> 26;
+    if (sig == SIGSEGV || sig == SIGBUS)
+        printf("  %s address 0x%llx\n", (ec == 0x24 || ec == 0x25) && (esr & 0x40) ? "writing" : "reading", (unsigned long long)(uintptr_t)si->si_addr);
+    dump_guest_registers();
+    crash_dump_guest_memory();
+    uint64_t pcs[400];
+    int n = host_frames_from(pc, lr, fp, pcs, 400);
+    printf("host call stack (innermost first):\n");
+    for (int i = 0; i < n && i < 16; i++) host_module_line("  ", pcs[i]);
+    printf("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    for (int i = 0, shown = 0; i < n && shown < 40; i++) {
+        uint64_t g = guest_function_of(pcs[i]);
+        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+    }
+    report_and_exit(4);
+}
+static void crash_handlers_install(void) {
+    static uint8_t alt[1 << 16];                  /* the thread that boots the runtime reports a host stack overflow too */
+    stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt, .ss_flags = 0};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crash_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT};
+    for (int i = 0; i < (int)(sizeof sigs / sizeof sigs[0]); i++) sigaction(sigs[i], &sa, NULL);
+}
+/* The guest window, from the game image to the end of the SDK module's 4 GB (20 GB of address space, no memory), is
+ * taken when the program is loaded, before anything else of it allocates. VirtualAlloc maps the image, the import
+ * placeholders and the SDK module into it later. */
+__attribute__((constructor)) static void guest_window_reserve(void) {
+    if (!recomp_reserve_window(GUEST_BASE, SDK_BASE + 0x100000000ULL - GUEST_BASE)) {
+        fprintf(stderr, "cannot reserve the guest address range 0x%llx..0x%llx: something else of the process is there\n",
+                GUEST_BASE, SDK_BASE + 0x100000000ULL);
+        exit(1);
+    }
+}
+#endif
 
 /* ---------------------------------------------------------------- loader */
 void runtime_init(const char *elf, const char *trace_path) {
@@ -652,7 +744,11 @@ void runtime_init(const char *elf, const char *trace_path) {
                (void *)g_by_host[0].fn, (void *)g_by_host[fn_table_count - 1].fn);
     }
     g_trace = fopen(trace_path, "w");
+#ifdef _WIN32
     SetUnhandledExceptionFilter(crash_filter);
+#else
+    crash_handlers_install();
+#endif
 
     void *mem = VirtualAlloc((void *)GUEST_BASE, IMAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (mem != (void *)GUEST_BASE) { fprintf(stderr, "cannot map guest image at 0x%llx\n", GUEST_BASE); exit(1); }
@@ -694,8 +790,13 @@ void runtime_init(const char *elf, const char *trace_path) {
      * wild write into code or constants faults instead of corrupting silently. SMO_NO_PROTECT=1 leaves the old mapping. */
     if (!getenv("SMO_NO_PROTECT")) {
         DWORD oldp;
-        if (!VirtualProtect((void *)GUEST_BASE, GUEST_RO_END, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
-        printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + GUEST_RO_END);
+#ifdef _WIN32
+        const uint64_t ro_end = GUEST_RO_END;
+#else
+        const uint64_t ro_end = GUEST_RO_END & ~(uint64_t)(recomp_page_size() - 1);   /* 16 KB pages: the page holding the start of .data stays writable */
+#endif
+        if (!VirtualProtect((void *)GUEST_BASE, ro_end, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
+        printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + ro_end);
     }
 }
 
@@ -713,6 +814,9 @@ void runtime_init(const char *elf, const char *trace_path) {
  *   SMO_AUDIT_COUNTS=<f> at exit, write the call count of every import and run-time host function. */
 
 /* 0 = real code; 1 = empty body; 2 = only stores constants (x0 := *x0 when *sets_x0) */
+#if defined(__aarch64__) || defined(_M_ARM64)
+int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) { return audit_trivial_a64((const void *)fn, x0, sets_x0); }
+#else
 int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     const unsigned char *p = (const unsigned char *)fn;
     int stores = 0;
@@ -746,6 +850,7 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     }
     return 0;
 }
+#endif
 
 static int g_strict = -1;                  /* 0 off, 1 stop, 2 report */
 static int g_audit_started, g_audit_hostfn_bad;   /* before audit_startup, host-function findings are only counted, so the whole list is printed */

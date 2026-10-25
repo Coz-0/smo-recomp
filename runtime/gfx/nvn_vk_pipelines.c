@@ -12,7 +12,9 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#ifdef _WIN32
 #include <psapi.h>
+#endif
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -1426,7 +1428,17 @@ static void prewarm_start(void) {
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
-    {   HMODULE m = LoadLibraryA("smo_glslang.dll");
+    {
+#ifdef _WIN32
+        HMODULE m = LoadLibraryA("smo_glslang.dll");
+#else
+        HMODULE m = NULL;                                 /* macOS: libsmo_glslang.dylib beside the program */
+        {   char path[MAX_PATH + 32];
+            GetModuleFileNameA(NULL, path, MAX_PATH);
+            char *sl = strrchr(path, '\\');
+            if (sl) { strcpy(sl + 1, "libsmo_glslang.dylib"); recomp_path(path, sizeof path, path); m = LoadLibraryA(path); }
+        }
+#endif
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("smo_glslang.dll cannot be loaded (the link step writes it beside the exe)");
     }

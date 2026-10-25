@@ -65,12 +65,22 @@
  * reader returned; SMO_MOVIE_LOG=1 logs every decoder call. */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <shlwapi.h>
+#else
+#include "win32_posix.h"
+#endif
+#ifndef _WIN32
+/* macOS: no Media Foundation. Movies keep nnmovie.c's placeholder, which fails to open them as before this file
+ * existed; H.264 through VideoToolbox is step 6 of docs/macos-port.md. */
+#include "runtime.h"
+void register_movie_mf_imports(void) {}
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1179,3 +1189,4 @@ void register_movie_mf_imports(void) {
     InitializeCriticalSection(&g_init_lock);
     register_imports(movie_mf_imports, (int)(sizeof movie_mf_imports / sizeof movie_mf_imports[0]));
 }
+#endif
