@@ -123,7 +123,7 @@ def stages_of(blob):
             # BNSH (nn::gfx): offsets are from the container's start, and a stage's control offset is stored as a u64 with
             # its code offset right after it; a compute code section starts with its first instruction group. The record
             # and the code lie inside the container (file size at +0x1c), and only there are they looked for: the same
-            # eight bytes can occur elsewhere in the blob (an effect archive of the 1.4.1 update has them in data
+            # eight bytes can occur elsewhere in the blob (an effect archive of the 1.3.0 update has them in data
             # outside the container, beside "code" that is data and ends with a stray EXIT).
             b = max((s for s in starts if s < c), default=None)
             size, cbsize, cboff = struct.unpack_from('<III', blob, c + 0x6f8)

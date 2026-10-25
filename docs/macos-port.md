@@ -191,7 +191,7 @@ give different keys only through the stride.
 
 ## Things the Mac does differently
 
-- **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.4.1 that is
+- **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.3.0 that is
   0x4f16000, which is 4 KB aligned but not 16 KB aligned. Protection stops at the 16 KB page below it, so up to 12 KB
   of read-only data stays writable. Rounding up instead would make the start of `.data` read-only.
 - **Fixed addresses: the guest layout is 0x10_0000_0000 higher.** macOS keeps 0x70_0000_0000..0x80_0000_0000 for

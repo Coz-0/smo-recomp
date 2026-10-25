@@ -1,14 +1,14 @@
-"""Import your decrypted dump of Super Mario Odyssey 1.4.1 into build/.
+"""Import your decrypted dump of Super Mario Odyssey 1.3.0 into build/.
 
     python tools/extract/extract.py --dump <folder> [--build <build folder, default build/>]
 
 <folder> holds what you dumped from your own console, already decrypted by the console (docs/building.md):
-    exefs/          the program's ExeFS with the 1.4.1 update: main, main.npdm, rtld, sdk, subsdk*
-    romfs/          the game's RomFS with the 1.4.1 update applied
+    exefs/          the program's ExeFS with the 1.3.0 update: main, main.npdm, rtld, sdk, subsdk*
+    romfs/          the game's RomFS with the 1.3.0 update applied
     control.nacp    the update's control data
     manual/         optional: the Help pages (the RomFS of the game's HtmlDocument content: html-document/...)
     fonts/          optional: the console's shared fonts, as .bfttf files the way the console stores them, or .ttf
-Each piece is checked: the program id in main.npdm, the NintendoSDK version main carries (7.3.2 for 1.4.1), the display
+Each piece is checked: the program id in main.npdm, the NintendoSDK version main carries (7.3.2 for 1.3.0), the display
 version in control.nacp, and the RomFS and Help folders by what they contain.
 
 Writes, all under build/ (ignored by git):
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T  # noqa: E402
 
 PROGRAM_ID = 0x0100000000010000                   # Super Mario Odyssey
-SDK = '7.3.2.0'                                   # the NintendoSDK the 1.4.1 program was built with
+SDK = '7.3.2.0'                                   # the NintendoSDK the 1.3.0 program was built with
 
 
 class DumpError(Exception):
@@ -49,7 +49,7 @@ def find(dump, *names):
 
 
 def read_exefs(path, need):
-    """{name: bytes} of an ExeFS folder, checked to be the 1.4.1 program."""
+    """{name: bytes} of an ExeFS folder, checked to be the 1.3.0 program."""
     files = {n: open(os.path.join(path, n), 'rb').read() for n in sorted(os.listdir(path))
              if os.path.isfile(os.path.join(path, n))}
     missing = [n for n in need if n not in files]
@@ -61,8 +61,8 @@ def read_exefs(path, need):
     elf, _ = nso.nso_to_elf(files['main'])
     sdk = nso.sdk_version(elf)
     if sdk != SDK:
-        raise DumpError('%s: its main was built with NintendoSDK %s, the 1.4.1 update\'s with %s: is this the ExeFS '
-                        'with the 1.4.1 update?' % (path, sdk, SDK))
+        raise DumpError('%s: its main was built with NintendoSDK %s, the 1.3.0 update\'s with %s: is this the ExeFS '
+                        'with the 1.3.0 update?' % (path, sdk, SDK))
     return files
 
 
@@ -151,7 +151,7 @@ def main():
         exefs = find(dump, 'exefs')
         romfs = find(dump, 'romfs')
         nacp = find(dump, 'control.nacp')
-        for what, p in (('exefs/ (the program with the 1.4.1 update)', exefs), ('romfs/ (the RomFS with the update applied)', romfs),
+        for what, p in (('exefs/ (the program with the 1.3.0 update)', exefs), ('romfs/ (the RomFS with the update applied)', romfs),
                         ('control.nacp (the update\'s)', nacp)):
             if not p:
                 raise DumpError('%s: %s is missing (see docs/building.md for what to dump)' % (dump, what))

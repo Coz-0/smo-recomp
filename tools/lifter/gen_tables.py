@@ -6,7 +6,7 @@ Writes (everything derived from the dump; build/ is ignored by git):
   image.h            image layout of main and sdk (segment ends, relocation tables, .dynsym, .init_array, entry
                      points), GAME_SYM_<name> addresses of the game functions the runtime calls by name, and the game
                      functions its fast path and test aids need (GAME_SYM_ of the sampler sort, GAME_VSYM_, GAME_FN_).
-                     1.4.1's main keeps almost no symbols: those functions are found by what they are and what they do
+                     1.3.0's main keeps almost no symbols: those functions are found by what they are and what they do
                      (find_game_functions, find_sampler_sort): a class's vtable from its RTTI name, a game state's from
                      its nerve's, the strings a function loads, the functions it calls, the shape of its code. Each rule
                      must give exactly one function, or the entry is 0 and the runtime leaves that feature off.
@@ -40,7 +40,7 @@ SDK_BASE = T.SDK_BASE
 GAME_SYMS = ['malloc', 'free', 'calloc', 'realloc', 'aligned_alloc', 'nninitStartup', 'nnMain',
              '_ZdlPv']               # operator delete(void *): frees what the game's operator new (sead heaps) allocated
 # Optional: runtime/game/smo_fast.c's sampler list sort of agl::driver::NVNMgr in host code. A main without these symbols
-# (1.4.1's is stripped) gets them from find_sampler_sort, or 0 when that fails, and smo_fast.c then leaves the game's own
+# (1.3.0's is stripped) gets them from find_sampler_sort, or 0 when that fails, and smo_fast.c then leaves the game's own
 # code alone. Order: the sort, registerSampler_, the key comparison.
 GAME_SYMS_OPTIONAL = ['_ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E', '_ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj',
                       '_ZN3agl6driver6NVNMgr18compareSamplerKey_EPKNS1_10SamplerKeyES4_']
