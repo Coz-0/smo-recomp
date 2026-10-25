@@ -93,6 +93,56 @@ Each step builds and is checked before the next one starts.
    audio stream with the waveOut rules (16 blocks of 40 ms at most, start at 120 ms queued, drops and underruns
    counted).
 
+## The console core model on macOS
+
+**What it must give** (what the Windows model gives through affinity and priorities, `os_threads.c`):
+1. On each of the console's three cores, at most one guest thread runs at a time. A thread runs only on a core of its
+   nn::os core mask.
+2. A core runs its highest-priority ready thread. A thread that becomes ready takes the core from a running thread of
+   lower priority (on Windows within microseconds, by the OS).
+3. A thread that blocks (mutex, condition variable, event, message queue, sleep, a wait for the renderer) leaves its core
+   to the next ready thread.
+
+**How** (`runtime/os/core_model.c`, macOS only; Windows keeps its model):
+- **Tokens.** A token per core. A guest thread runs lifted code only while it holds the token of a core in its mask. It
+  takes one when it starts and gives it back when it ends.
+- **Blocking.** Every host wait goes through the Win32 shim (critical sections, condition variables,
+  `WaitForSingleObject`, `Sleep`), plus `SleepThread`'s `nanosleep`. The shim's slow paths call a hook before and after
+  they block. Around the wait the thread gives its token back and takes one again: the same three-core rule as the
+  console, applied where the console's kernel switches threads. A wait that does not block (an uncontended lock, a set
+  event) costs nothing.
+- **Handover.** A freed core goes to the highest-priority waiting thread whose mask has it. Equal priorities go in the
+  order they came.
+- **Preemption** at safe points. When a thread becomes ready and every core of its mask is held, the lowest-priority
+  holder below it is asked to yield. The holder checks a flag of its own at every SDK call (`host_import`), every
+  run-time host function and every indirect call (`call_indirect`), the points where lifted code leaves straight-line
+  code, then gives the core up and queues again. Lifted code between two such points runs on. The wait this adds is
+  measured, and the report prints its distribution. Preemption anywhere in lifted code (a signal) is the next step if
+  the measurements call for it: the Windows failure was a wait of a whole Windows time slice (tens of ms).
+- **`YieldThread`** gives the core to a ready thread of the same priority, as the console's yield does.
+- **Host threads** (render, audio, vsync, the window's main thread) take no token. They are the PC's, as on Windows.
+- **No time slicing among equal priorities**: an assumption that the console's scheduler does not either, NOT
+  VERIFIED. `SMO_OS_TIMESLICE=<ms>` can turn it on to compare.
+
+**Checked by** `tests/macos/test_core_model.c` (threads standing in for guest threads, no game):
+- never two holders of a core, and never more than three at once;
+- a single-core thread never overlaps another of its core;
+- a thread that blocks lets another of its core run;
+- priority order on handover;
+- preemption latency with a busy lower-priority thread hitting safe points at a given rate;
+- the 17-against-18 scenario of the Windows notes.
+
+**Measured** (M4, `tests/macos/check_runtime.sh`): 9 of 9 checks pass. With a safe point every 20 µs, the time from
+ready to running for a priority-17 thread taking core 2 from a busy priority-18 thread was a median of 16–17 µs and a
+p99 of 25–76 µs over runs. With a safe point every 500 µs the median was 472 µs, so the wait follows the gap between
+safe points. Under the 9-thread load test, a single outlier of 10 ms happened (the holder was descheduled by macOS).
+
+**Wired in:** os_threads.c (start, priority, core mask, current core, name, YieldThread, SleepThread, the main thread
+on core 0), the shim's blocking waits (`recomp_set_block_hooks`), and safe points at `host_import` and `call_indirect`
+(hostrt.c). The real program runs with it on (`check_link.sh`). **Still open, to be measured with the game:** how often
+the game reaches a safe point, and so whether the preemption latency is good enough or signals are needed; host-side
+blocking outside the shim (file reads) still holds a core.
+
 ## Things the Mac does differently
 
 - **16 KB pages.** The guest image protects text and read-only data up to `GUEST_RO_END`; in 1.4.1 that is

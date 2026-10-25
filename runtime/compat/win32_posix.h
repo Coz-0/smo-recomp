@@ -111,6 +111,10 @@ int host_try_read(const void *p, void *out, size_t n);
 #define YieldProcessor() __builtin_arm_yield()
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
+/* ---- blocking: the waits below that really block (a contended lock, a wait not satisfied at once, a sleep) call these
+ * around the block. The console core model (os/core_model.c) sets them: a guest thread gives its core up meanwhile. */
+void recomp_set_block_hooks(void (*begin)(void), void (*end)(void));
+
 /* ---- locks and condition variables */
 typedef struct { os_unfair_lock l; } SRWLOCK;
 #define SRWLOCK_INIT {OS_UNFAIR_LOCK_INIT}
