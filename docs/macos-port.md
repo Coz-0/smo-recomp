@@ -53,7 +53,7 @@ Each step builds and is checked before the next one starts.
      reads a table of `sdk.elf` and needs a dump;
    - glyphs from CoreText outlines (TrueType and CFF), plain and outlined.
    On macOS for now: the software keyboard is a CoreFoundation alert with a text field (its self-test answers it, the
-   alert itself is not driven); the Help page opens in the web browser; movies keep the failing placeholder; the
+   alert itself is not driven); the Help page opens in the web browser; movies play through AVFoundation (step 6); the
    shared fonts fall back to macOS's own (Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo), not yet seen
    in the game.
 3. **The build scripts run on macOS**: `setup.py`, `build_main.py`, `build_exe.py` with Apple clang, a dylib instead
