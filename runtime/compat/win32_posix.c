@@ -247,10 +247,15 @@ void LeaveCriticalSection(CRITICAL_SECTION *cs) {
 void InitializeConditionVariable(CONDITION_VARIABLE *cv) { cv->seq = 0; }
 static int cv_wait(CONDITION_VARIABLE *cv, uint64_t seen, DWORD ms) {
     int r;
+    /* A zero timeout is a poll: woken only if a wake came since `seen` was read. os_sync_wait_on_address_with_timeout
+     * refuses a timeout of 0 (EINVAL), which the line below would have taken for a wake: the caller's "while not ready,
+     * wait 0" loop (mq_get, TryReceiveMessageQueue) then never ended (found with the game: its sound thread never left
+     * its first TryReceiveMessageQueue, so the audio renderer was never updated and the main thread polled forever). */
+    if (ms == 0) return __atomic_load_n(&cv->seq, __ATOMIC_ACQUIRE) != seen;
     if (ms == INFINITE) r = os_sync_wait_on_address((void *)&cv->seq, seen, 8, OS_SYNC_WAIT_ON_ADDRESS_NONE);
     else r = os_sync_wait_on_address_with_timeout((void *)&cv->seq, seen, 8, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
                                                   (uint64_t)ms * 1000000ull);             /* relative, in nanoseconds */
-    return r < 0 && errno == ETIMEDOUT ? 0 : 1;
+    return r < 0 && (errno == ETIMEDOUT || errno == EINVAL) ? 0 : 1;
 }
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags) {
     (void)flags;
