@@ -199,6 +199,8 @@ class Fn:
         if op0 in (10, 11):
             return self.branch(w, pc)
         if op0 in (4, 6, 12, 14):
+            if w & 0x3ffffc00 == 0x38bfc000:              # LDAPR / LDAPRH / LDAPRB (ARMv8.3 RCPC): not on the Cortex-A57
+                return 'guest_trap("undefined instruction", 0x%xULL);' % pc
             return self.loadstore(w, pc)
         if op0 in (5, 13):
             return self.dp_reg(w, pc)
@@ -790,8 +792,8 @@ class Fn:
                       (0, 1, 0x0e): 'F1_CMLT0', (1, 1, 0x0d): 'F1_CMLE0'}.get((u, a, opc))
                 if op:
                     return 'v_f1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, sz, fcount())
-                if (u, opc) == (0, 0x12) and not scalar and size < 3:
-                    return 'v_xtn(%s, %s, %d);' % (V(rd), V(rn), size)
+                if (u, opc) == (0, 0x12) and not scalar and size < 3:     # XTN, XTN2 (Q = 1: into the upper half)
+                    return 'v_%s(%s, %s, %d);' % ('xtn2' if bits(w, 30, 30) else 'xtn', V(rd), V(rn), size)
                 op = {(1, 0x05): 'I1_NOT', (0, 0x05): 'I1_CNT', (1, 0x0b): 'I1_NEG', (0, 0x0b): 'I1_ABS',
                       (0, 0x09): 'I1_CMEQ0', (0, 0x00): 'I1_REV64'}.get((u, opc))
                 if op is None or (op in ('I1_NOT', 'I1_CNT') and size):
