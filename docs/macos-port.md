@@ -53,7 +53,7 @@ Each step builds and is checked before the next one starts.
      reads a table of `sdk.elf` and needs a dump;
    - glyphs from CoreText outlines (TrueType and CFF), plain and outlined.
    On macOS for now: the software keyboard is a CoreFoundation alert with a text field (its self-test answers it, the
-   alert itself is not driven); the Help page opens in the web browser; movies play through AVFoundation (step 6); the
+   alert itself is not driven); the Help page and movies are in the game window (step 6); the
    shared fonts fall back to macOS's own (Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo), not yet seen
    in the game.
 3. **The build scripts run on macOS**: `setup.py`, `build_main.py`, `build_exe.py` with Apple clang, a dylib instead
@@ -100,6 +100,12 @@ Each step builds and is checked before the next one starts.
    `tests/macos/test_movie.m` (24 checks, in `check_runtime.sh`) writes an H.264 + AAC movie whose every frame says
    its own number and reads it through the reader and through the real `movie::Extractor` / `Decoder` objects as the
    game drives them: every frame once and in order, the whole sound, the seek, the track changes, the events.
+   Help done (not seen with the game's manual yet): `smo_guide_mac.m` shows the page in a `WKWebView` over the game
+   window, as `smo_guide.c` does with WebView2 on Windows: the same script (`nnapplet.c`'s window.nx, which finds its
+   host as `window.chrome.webview`: given over WebKit's message handler), the largest 16:9 area zoomed to the manual's
+   1280-pixel layout and following the window's size, pads through `window.__smo_pad`, the game held while it is open,
+   endApplet and callback addresses ending it. `tests/macos/test_guide.m` (9 checks, in `check_runtime.sh`) runs it in
+   a hidden SDL window with a page laid out as the manual is, and reads back its `SMO_GUIDE_SHOT` pictures.
 
 ## The console core model on macOS
 

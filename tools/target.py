@@ -81,7 +81,7 @@ def sdl3():
 
 # what the host runtime links against on macOS (its Win32 calls come from runtime/compat/win32_posix.c)
 MAC_FRAMEWORKS = ['CoreFoundation', 'CoreGraphics', 'CoreText', 'AudioToolbox', 'IOKit', 'Foundation', 'AVFoundation', 'CoreMedia',
-                  'CoreVideo']
+                  'CoreVideo', 'AppKit', 'WebKit']
 
 
 def build(*parts):

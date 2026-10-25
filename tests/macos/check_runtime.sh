@@ -82,6 +82,13 @@ step $? "link the movie test with AVFoundation (test_movie)"
 "$OUT/test_movie" > "$OUT/movie.txt" 2>&1
 step $? "movies on AVFoundation through movie::Extractor / Decoder: $(grep -o 'movie test: .*' "$OUT/movie.txt" | tail -1)"
 
+# the Help in the game window: WKWebView over a hidden SDL window, a page laid out as the manual is, pads from a thread
+"$CC" -fobjc-arc -O1 -g -Wall -Werror "${INC[@]}" runtime/game/smo_guide_mac.m tests/macos/test_guide.m -L/opt/homebrew/lib -lSDL3 \
+    -framework AppKit -framework WebKit -o "$OUT/test_guide"
+step $? "link the Help page test with WebKit (test_guide)"
+"$OUT/test_guide" > "$OUT/guide.txt" 2>&1
+step $? "the Help in the game window (WKWebView): $(grep -o 'guide test: .*' "$OUT/guide.txt" | tail -1)"
+
 "$CC" -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -DFONTLL_TEST "${INC[@]}" runtime/services/nnfontll.c runtime/compat/win32_posix.c \
     -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework AudioToolbox -o "$OUT/fonttest"
 step $? "link nnfontll.c's font test (fonttest)"

@@ -59,6 +59,7 @@ if T.MAC:
     HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
     HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
     HOST_SOURCES['services'] = HOST_SOURCES['services'] + ['nnmovie_av.m']      # nnmovie_mf.c's reader on AVFoundation
+    HOST_SOURCES['game'] = HOST_SOURCES['game'] + ['smo_guide_mac.m']           # the Help in the game window (WKWebView)
     LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
 
 
