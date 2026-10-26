@@ -32,7 +32,7 @@
 /* the Khronos headers of the Vulkan SDK (VULKAN_HEADERS, -I in build_exe.py) */
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
-#else
+#elif defined(__APPLE__)
 #define VK_USE_PLATFORM_METAL_EXT      /* macOS: the surface is the window's CAMetalLayer (display.c) */
 #endif
 #define VK_NO_PROTOTYPES
@@ -59,6 +59,8 @@ void display_before_present(void);
 /* ---------------------------------------------------------------- the loader's functions */
 #ifdef _WIN32
 #define VKF_SURFACE(X) X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
+#elif defined(__linux__)
+#define VKF_SURFACE(X)                 /* SDL makes the surface (display.c) */
 #else
 #define VKF_SURFACE(X) X(VkResult, vkCreateMetalSurfaceEXT, (VkInstance, const VkMetalSurfaceCreateInfoEXT *, const VkAllocationCallbacks *, VkSurfaceKHR *))
 #endif
@@ -248,7 +250,15 @@ static void *vk_sym(const char *name) {
     return p;
 }
 
-#ifndef _WIN32
+#ifdef __linux__
+/* Linux: the system's Vulkan loader; the driver is the loader's choice (VK_DRIVER_FILES / VK_ICD_FILENAMES as usual). */
+static void linux_loader(void) {
+    V.loader = LoadLibraryA("libvulkan.so.1");
+    if (!V.loader) { printf("nvn_vk: libvulkan.so.1 cannot be loaded: no Vulkan loader on this PC\n"); fflush(stdout); ExitProcess(5); }
+}
+const char *const *display_vk_extensions(uint32_t *n);           /* display.c */
+int display_vk_surface(void *instance, void *surface);
+#elif !defined(_WIN32)
 /* macOS: the Vulkan loader and the driver it loads. The driver: VK_DRIVER_FILES / VK_ICD_FILENAMES when set; else
  * SMO_VK_DRIVER=kosmickrisp (the default: Vulkan 1.3 conformant, on Metal; the LunarG SDK's) or moltenvk, from the
  * Vulkan SDK found (VULKAN_SDK, ~/VulkanSDK). The loader: libvulkan.1.dylib next to the program, in that SDK, or
@@ -299,6 +309,8 @@ int nvn_vk_init(void *hwnd) {
 #ifdef _WIN32
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+#elif defined(__linux__)
+    linux_loader();
 #else
     mac_loader_and_driver();
 #endif
@@ -314,8 +326,19 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
-    const char *exts[6], *layers[1];
+    const char *exts[10], *layers[1];
     uint32_t next = 0, nlayers = 0;
+#ifdef __linux__
+    {   /* the window system's surface extensions, as SDL names them (VK_KHR_surface + Wayland or Xlib) */
+        uint32_t n = 0;
+        const char *const *se = display_vk_extensions(&n);
+        for (uint32_t i = 0; se && i < n && next < 6; i++) {
+            if (!has_name(iext, niext, se[i])) { printf("nvn_vk: the Vulkan loader has no %s\n", se[i]); fflush(stdout); ExitProcess(5); }
+            exts[next++] = se[i];
+        }
+        if (!next) { printf("nvn_vk: SDL names no surface extension for the window\n"); fflush(stdout); ExitProcess(5); }
+    }
+#else
 #ifdef _WIN32
     const char *surface_ext = "VK_KHR_win32_surface";
 #else
@@ -323,6 +346,7 @@ int nvn_vk_init(void *hwnd) {
 #endif
     exts[next++] = "VK_KHR_surface"; exts[next++] = surface_ext;
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, surface_ext)) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / %s\n", surface_ext); fflush(stdout); ExitProcess(5); }
+#endif
     /* a "portability" driver (MoltenVK) is listed only to an instance that asks for them */
     int portability = has_name(iext, niext, "VK_KHR_portability_enumeration");
     if (portability) exts[next++] = "VK_KHR_portability_enumeration";
@@ -365,6 +389,8 @@ int nvn_vk_init(void *hwnd) {
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
     r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
     if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+#elif defined(__linux__)
+    if (!display_vk_surface(V.instance, &V.surface)) { printf("nvn_vk: the window's Vulkan surface cannot be made\n"); fflush(stdout); ExitProcess(5); }
 #else
     VkMetalSurfaceCreateInfoEXT si;
     memset(&si, 0, sizeof si);

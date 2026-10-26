@@ -66,10 +66,20 @@
 #include <windows.h>
 #else
 #include "win32_posix.h"
+#ifdef __APPLE__
 /* macOS: the outlines come from CoreText (CTFontCreatePathForGlyph) instead of GDI, from the same font bytes */
 #include <CoreText/CoreText.h>
 #define LF_FACESIZE 32
 typedef CTFontRef HFONT;
+#else
+/* Linux: the outlines come from FreeType (FT_Outline_Decompose of the unscaled glyph), from the same font bytes */
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#include FT_TRUETYPE_TABLES_H
+#define LF_FACESIZE 32
+typedef FT_Face HFONT;
+#endif
 #endif
 #ifndef FONTLL_TEST
 #include "runtime.h"
@@ -319,7 +329,88 @@ static void path_close(Path *path) {
     if (path->contours == path->ccap) { path->ccap = path->ccap ? path->ccap * 2 : 16; path->end = realloc(path->end, (size_t)path->ccap * sizeof(int)); }
     path->end[path->contours++] = path->n;
 }
-#ifndef _WIN32
+#ifdef __linux__
+/* Makes FreeType able to draw from this font file: the face of the collection at the file's index; verifies that it is
+ * this file's face (its head table). */
+static FT_Library g_ft;
+static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
+    if (f->gdi) return f->gdi > 0;
+    f->gdi = -1;
+    if (!g_ft && FT_Init_FreeType(&g_ft)) { printf("nn::fontll: FreeType did not start: glyphs will be blank\n"); return 0; }
+    if (FT_New_Memory_Face(g_ft, f->data, (FT_Long)f->size, (FT_Long)f->face_index, &f->hfont)) {   /* f->data lives as long as the process */
+        printf("nn::fontll: font \"%s\" REJECTED BY FREETYPE: its glyphs will be blank\n", f->name);
+        f->hfont = NULL;
+        return 0;
+    }
+    uint8_t head[54];
+    FT_ULong len = sizeof head;
+    int same = !FT_Load_Sfnt_Table(f->hfont, FT_MAKE_TAG('h', 'e', 'a', 'd'), 0, head, &len) && len == sizeof head && !memcmp(head, f->head, 54);
+    if (!same) { printf("nn::fontll: font \"%s\": FreeType chose another face: its glyphs will be blank\n", f->name); return 0; }
+    f->gdi = 1;
+    return 1;
+}
+/* FT_Outline_Decompose: the outline into polylines, curves flattened as the GDI and CoreText versions do. */
+typedef struct { Path *path; double a, b, c2, d, pixels, x0, y0; int open; } Walk;
+#define TX(w, px, py) ((px) * (w)->a + (py) * (w)->b)
+#define TY(w, px, py) ((px) * (w)->c2 + (py) * (w)->d)
+static int ft_move(const FT_Vector *to, void *info) {
+    Walk *w = info;
+    if (w->open) path_close(w->path);
+    w->x0 = (double)to->x; w->y0 = (double)to->y; w->open = 1;
+    path_point(w->path, TX(w, w->x0, w->y0), TY(w, w->x0, w->y0));
+    return 0;
+}
+static int ft_line(const FT_Vector *to, void *info) {
+    Walk *w = info;
+    w->x0 = (double)to->x; w->y0 = (double)to->y;
+    path_point(w->path, TX(w, w->x0, w->y0), TY(w, w->x0, w->y0));
+    return 0;
+}
+static int ft_conic(const FT_Vector *c, const FT_Vector *to, void *info) {
+    Walk *w = info;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)c->x, y1 = (double)c->y, x2 = (double)to->x, y2 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, u = 1 - t, px = u * u * x0 + 2 * u * t * x1 + t * t * x2, py = u * u * y0 + 2 * u * t * y1 + t * t * y2;
+        path_point(w->path, TX(w, px, py), TY(w, px, py));
+    }
+    w->x0 = x2; w->y0 = y2;
+    return 0;
+}
+static int ft_cubic(const FT_Vector *c1, const FT_Vector *c2, const FT_Vector *to, void *info) {
+    Walk *w = info;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)c1->x, y1 = (double)c1->y, x2 = (double)c2->x, y2 = (double)c2->y, x3 = (double)to->x, y3 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x3 - x2) + fabs(y3 - y2)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, u = 1 - t;
+        double px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
+        double py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
+        path_point(w->path, TX(w, px, py), TY(w, px, py));
+    }
+    w->x0 = x3; w->y0 = y3;
+    return 0;
+}
+#undef TX
+#undef TY
+/* Appends the outline of a glyph, transformed by the 16.16 matrix m / unitsPerEm, as polylines (y up). The glyph is
+ * loaded unscaled and unhinted: font units, as CoreText gives them at a size of one point per unit. */
+static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
+    EnterCriticalSection(&g_lock);
+    if (gdi_prepare(f) && !FT_Load_Glyph(f->hfont, glyph, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) &&
+        f->hfont->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        static const FT_Outline_Funcs funcs = {ft_move, ft_line, ft_conic, ft_cubic, 0, 0};
+        Walk w = {path, m[0] / 65536.0 / f->upem, m[1] / 65536.0 / f->upem, m[2] / 65536.0 / f->upem, m[3] / 65536.0 / f->upem, 0, 0, 0, 0};
+        w.pixels = fabs(w.a) > fabs(w.d) ? fabs(w.a) : fabs(w.d);
+        FT_Outline_Decompose(&f->hfont->glyph->outline, &funcs, &w);
+        if (w.open) path_close(path);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+#elif !defined(_WIN32)
 /* Makes CoreText able to draw from this font file: the face of the collection at the file's index, at one point per font
  * unit; verifies that it is this file's face (its head table). */
 static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
@@ -1260,6 +1351,10 @@ int main(int argc, char **argv) {
         WORD gi = 0xffff;
         GetGlyphIndicesW(g_dc, &ch, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
         int cell = gm.gmCellIncX;
+#elif defined(__linux__)
+        gdi_prepare(f);
+        unsigned gi = f->hfont ? FT_Get_Char_Index(f->hfont, codes[i]) : 0xffff;
+        int cell = f->hfont && !FT_Load_Glyph(f->hfont, gi, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING) ? (int)f->hfont->glyph->advance.x : 0;
 #else
         gdi_prepare(f);
         UniChar ch = (UniChar)codes[i];

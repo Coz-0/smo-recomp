@@ -25,9 +25,23 @@
 
 #ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
-#else
+#elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
+#else
+/* Linux: OpenSSL's MD5 and SHA-1 under CommonCrypto's names (deprecated in OpenSSL 3 for security use; the game's use,
+ * checksums, is not one) */
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/md5.h>
+#include <openssl/sha.h>
+typedef size_t CC_LONG;
+typedef MD5_CTX CC_MD5_CTX;
+#define CC_MD5_DIGEST_LENGTH MD5_DIGEST_LENGTH
+#define CC_SHA1_DIGEST_LENGTH SHA_DIGEST_LENGTH
+#define CC_MD5_Init MD5_Init
+#define CC_MD5_Update MD5_Update
+#define CC_MD5_Final MD5_Final
+#define CC_SHA1 SHA1
 #endif
 
 #define A0 (c->x[0])
@@ -380,11 +394,25 @@ static uint64_t desired_language(void) {
 #endif
     if (env && env[0]) snprintf(name, sizeof name, "%s", env);
 #ifndef _WIN32
+#ifdef __linux__
+    else {                                                /* the user's language (LANGUAGE's first, else LC_ALL, LC_MESSAGES, LANG) */
+        const char *v = getenv("LANGUAGE");
+        if (!v || !v[0]) v = getenv("LC_ALL");
+        if (!v || !v[0]) v = getenv("LC_MESSAGES");
+        if (!v || !v[0]) v = getenv("LANG");
+        if (v && v[0] && strcmp(v, "C") && strcmp(v, "POSIX")) {
+            snprintf(name, sizeof name, "%s", v);
+            name[strcspn(name, ":.@")] = 0;               /* es_ES.UTF-8 -> es_ES */
+            for (char *p = name; *p; p++) if (*p == '_') *p = '-';
+        }
+    }
+#else
     else {                                                /* the first of the user's preferred languages (System Settings) */
         CFArrayRef langs = CFLocaleCopyPreferredLanguages();
         if (langs && CFArrayGetCount(langs) > 0) CFStringGetCString((CFStringRef)CFArrayGetValueAtIndex(langs, 0), name, sizeof name, kCFStringEncodingUTF8);
         if (langs) CFRelease(langs);
     }
+#endif
 #else
     else {
         /* the display language of the user interface, not the regional format */

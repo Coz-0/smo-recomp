@@ -76,9 +76,14 @@
 #include "win32_posix.h"
 #include <spawn.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #endif
+#endif
 #include "sdklift.h"
+#ifndef _WIN32
+#include "core_model.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -267,11 +272,16 @@ static int web_open_in_browser(const char *doc, const char *full, const char *q)
     printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
     return (INT_PTR)r > 32;
 #else
-    char host[MAX_PATH * 2];                                            /* macOS: open(1), the default browser for .html */
+    char host[MAX_PATH * 2];                            /* macOS: open(1); Linux: xdg-open; the default browser for .html */
     recomp_path(host, sizeof host, fwd);
+#ifdef __APPLE__
     char *argv[] = {"/usr/bin/open", host, NULL};
+#else
+    char *argv[] = {"xdg-open", host, NULL};
+#endif
     pid_t pid;
-    int opened = posix_spawn(&pid, argv[0], NULL, NULL, argv, NULL) == 0;
+    extern char **environ;
+    int opened = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) == 0;
     if (opened) { int st; opened = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0; }
     printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, opened ? "" : ": FAILED");
     return opened;
@@ -349,7 +359,56 @@ typedef struct {
     wchar_t text[SWKBD_MAX_CHARS + 2];
 } KbdDialog;
 
-#ifndef _WIN32
+#if defined(__linux__)
+/* Linux: kdialog (KDE) or zenity (GNOME and others) asks for the text, modal on the calling thread as the Windows dialog
+ * is; the first of the two found on PATH. A text shorter than the minimum asks again; a longer one is cut. Without
+ * either the answer is "cancelled", as on a console whose player backs out. */
+static int (*g_kbd_auto)(KbdDialog *k);                   /* self-test: answers in place of the player */
+static int kbd_run_dialog(KbdDialog *k) {
+    if (g_kbd_auto) return g_kbd_auto(k);
+    char info[2400], init[SWKBD_MAX_CHARS * 4 + 4];
+    wchar_t winfo[600];
+    swprintf(winfo, 599, L"%ls%ls%ls%ls%ls", k->header, k->header[0] && k->sub[0] ? L"\n" : L"", k->sub,
+             (k->header[0] || k->sub[0]) && k->guide[0] ? L"\n" : L"", k->guide);
+    winfo[599] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, winfo[0] ? winfo : L"Enter text", -1, info, sizeof info, NULL, NULL)) info[0] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, k->initial, -1, init, sizeof init, NULL, NULL)) init[0] = 0;
+    for (;;) {
+        static const char *const title = "Software keyboard (smo-recomp)";
+        char *kd[] = {"kdialog", "--title", (char *)title, k->password ? "--password" : "--inputbox", info, k->password ? NULL : init, NULL};
+        char *zn[] = {"zenity", "--entry", "--title", (char *)title, "--text", info, k->password ? "--hide-text" : "--entry-text", k->password ? NULL : init, NULL};
+        int fd[2];
+        if (pipe(fd)) return 0;
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+        posix_spawn_file_actions_addclose(&fa, fd[0]);
+        extern char **environ;
+        pid_t pid;
+        int spawned = posix_spawnp(&pid, kd[0], &fa, NULL, kd, environ) == 0 || posix_spawnp(&pid, zn[0], &fa, NULL, zn, environ) == 0;
+        posix_spawn_file_actions_destroy(&fa);
+        close(fd[1]);
+        if (!spawned) { close(fd[0]); printf("nn::swkbd: neither kdialog nor zenity found; answered as cancelled\n"); return 0; }
+        char u[SWKBD_MAX_CHARS * 4 + 4];
+        size_t n = 0;
+        ssize_t r;
+        cm_block_begin();                                /* the player may take a while: the console core goes to another thread */
+        while (n < sizeof u - 1 && (r = read(fd[0], u + n, sizeof u - 1 - n)) != 0) { if (r < 0) { if (errno == EINTR) continue; break; } n += (size_t)r; }
+        close(fd[0]);
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        cm_block_end();
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 0;          /* Cancel, Escape or the window closed */
+        u[n] = 0;
+        if (n && u[n - 1] == '\n') u[n - 1] = 0;
+        MultiByteToWideChar(CP_UTF8, 0, u, -1, k->text, SWKBD_MAX_CHARS + 1);
+        k->text[SWKBD_MAX_CHARS] = 0;
+        if (k->max_len > 0 && (int)wcslen(k->text) > k->max_len) k->text[k->max_len] = 0;
+        if ((int)wcslen(k->text) < k->min_len) continue;
+        return 1;
+    }
+}
+#elif !defined(_WIN32)
 /* macOS: a CoreFoundation alert with a text field, modal on the calling thread as the Windows dialog is. A text shorter
  * than the minimum beeps and asks again (the Windows dialog keeps its OK button from closing); a longer one is cut. */
 static int (*g_kbd_auto)(KbdDialog *k);                   /* self-test: answers in place of the player */
@@ -727,7 +786,7 @@ static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (
 static volatile int g_kbd_test_initial_seen;
 #ifndef _WIN32
 static int g_kbd_test_round;
-static int kbd_test_answer(KbdDialog *k) {                /* macOS: the test's answers instead of the player's (see above) */
+static int kbd_test_answer(KbdDialog *k) {                /* macOS and Linux: the test's answers instead of the player's (see above) */
     if (g_kbd_test_round++ == 0) {
         static const wchar_t typed[] = {'Z', 0x30bc, 0};
         g_kbd_test_initial_seen = wcscmp(k->initial, L"Mario") == 0;
@@ -864,7 +923,7 @@ int nnapplet_selftest(Ctx *c) {
 #else
     g_kbd_auto = NULL;
     printf("  swkbd: the dialog's caller gets the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel "
-           "(the macOS alert itself is answered by the test, not driven): %s\n", dialog_ok ? "ok" : "FAILED");
+           "(the dialog itself is answered by the test, not driven): %s\n", dialog_ok ? "ok" : "FAILED");
 #endif
     bad += !dialog_ok;
     _putenv("SMO_SWKBD=");

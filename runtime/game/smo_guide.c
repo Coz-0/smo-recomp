@@ -20,7 +20,8 @@
  *   - WebView2Loader.dll (from the WebView2 SDK, copied next to the exe by the build) is loaded on first use, and the
  *     WebView2 Runtime is part of Windows 11. When either is missing, guide_show returns 0 and nnapplet.c opens the page
  *     in the PC's web browser instead (said in the log).
- * macOS: smo_guide_mac.m, the same with a WKWebView (this file is Windows only).
+ * macOS: smo_guide_mac.m, the same with a WKWebView. Linux: not in the game window yet; guide_show returns 0 and the page
+ * opens in the web browser (xdg-open, nnapplet.c).
  * Test aid: SMO_GUIDE_SHOT=<file.png> writes the page as shown 1.5 s after it has loaded, and 0.8 s after each pad action as
  * <file>_2.png, _3.png, ... (at most 8 pictures a run; the game's own screenshots do not see the page: the renderer does not
  * draw it). */
@@ -364,5 +365,10 @@ int guide_show(const char *url, const char *script, char *callback, size_t cap) 
     printf("guide: closed, back to the game\n");
     fflush(stdout);
     return 1;
+}
+#elif defined(__linux__)
+int guide_show(const char *url, const char *script, char *callback, size_t cap) {
+    (void)url; (void)script; (void)callback; (void)cap;
+    return 0;                                         /* nnapplet.c opens the page in the web browser */
 }
 #endif

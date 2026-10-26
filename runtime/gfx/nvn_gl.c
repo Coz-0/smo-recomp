@@ -3687,7 +3687,35 @@ static int g_pf_nthr;
 static DWORD g_pf_main_tid;
 const char *guest_thread_name_of(DWORD tid);                             /* os_threads.c */
 static int pf_cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
-#ifndef _WIN32
+#ifdef __linux__
+/* Linux: the threads of the process and their CPU time (/proc/self/task), as the Windows version below reads them */
+static void pf_threads(double frames) {
+    static DWORD tids[512];
+    static ULONG64 cpus[512];
+    struct { DWORD tid; double ms; } top[512];
+    int n = 0, nth = host_task_threads(tids, cpus, 512);
+    double total = 0;
+    for (int t = 0; t < nth; t++) {
+        DWORD tid = tids[t];
+        ULONGLONG cpu = cpus[t], prev = 0;
+        int i;
+        for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != tid; i++) {}
+        if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = tid; i = g_pf_nthr++; }
+        if (i < 512) g_pf_thr[i].cpu = cpu;
+        top[n].tid = tid; top[n].ms = (double)(cpu - prev) / 10000.0 / frames; total += top[n].ms; n++;
+    }
+    printf("nvn_perf: cpu ms/frame by thread (all %.1f):", total);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) if (top[i].ms > 0.05 && (best < 0 || top[i].ms > top[best].ms)) best = i;
+        if (best < 0) break;
+        const char *name = top[best].tid == g_render_tid ? "render(host)" : top[best].tid == g_pf_main_tid ? "main" : guest_thread_name_of(top[best].tid);
+        printf(" %s[%lu] %.1f", name ? name : "host", (unsigned long)top[best].tid, top[best].ms);
+        top[best].ms = 0;
+    }
+    printf("\n");
+}
+#elif !defined(_WIN32)
 /* macOS: the threads of the task and their CPU time (Mach), as the Windows version below reads them with a snapshot */
 #include <mach/mach.h>
 static void pf_threads(double frames) {

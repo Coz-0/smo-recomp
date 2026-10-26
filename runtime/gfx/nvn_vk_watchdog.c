@@ -59,9 +59,11 @@ static void wd_map_load(void) {                    /* the linker's map of this e
     if (g_wd_nsym) qsort(g_wd_sym, (size_t)g_wd_nsym, sizeof *g_wd_sym, wd_sym_cmp);
 }
 #ifndef _WIN32
-/* macOS: names from dladdr (this program's functions and the system's), the lifted game's as on Windows */
+/* macOS and Linux: names from dladdr (this program's functions and the system's), the lifted game's as on Windows */
 #include <dlfcn.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
+#endif
 #define IsIconic(h) ((void)(h), display_window_minimised())
 int display_window_minimised(void);                /* display.c */
 static void wd_addr(uint64_t pc, char *out, size_t n) {
@@ -192,7 +194,28 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         }
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
-#ifndef _WIN32
+#ifdef __linux__
+    {   /* Linux: the process's threads (/proc/self/task); CPU time twice, 300 ms apart; then each one's stack, stopped one
+         * at a time by a signal (win32_posix.c) */
+        static DWORD tids[400];
+        static ULONG64 cpus[400];
+        DWORD self = GetCurrentThreadId();
+        (void)pid;
+        for (int pass = 0; pass < 2; pass++) {
+            int ntl = host_task_threads(tids, cpus, 400);
+            for (int t = 0; t < ntl; t++) {
+                if (tids[t] == self) continue;
+                int i;
+                for (i = 0; i < nt && th[i].tid != tids[t]; i++) {}
+                if (i == nt) { if (pass) continue; th[nt].tid = tids[t]; th[nt].cpu0 = th[nt].cpu1 = 0; th[nt].nfr = 0; th[nt].prio = 0; th[nt].born = (ULONGLONG)t; nt++; }
+                if (pass) th[i].cpu1 = cpus[t]; else th[i].cpu0 = th[i].cpu1 = cpus[t];
+            }
+            if (!pass) Sleep(300);
+        }
+        for (int i = 0; i < nt; i++) th[i].nfr = host_tid_backtrace(th[i].tid, th[i].pc, 28);
+        for (int i = 0; i < nt; i++) if (th[i].tid == (DWORD)getpid()) g_wd_main_tid = th[i].tid;     /* the main thread's id is the process's */
+    }
+#elif !defined(_WIN32)
     {   /* macOS: the task's threads (Mach); CPU time twice, 300 ms apart; then each one's stack, suspended one at a time */
         thread_act_array_t tl;
         mach_msg_type_number_t ntl = 0;
@@ -229,7 +252,9 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         }
         mach_port_deallocate(mach_task_self(), self);
     }
+#ifdef __APPLE__
     if (nt) g_wd_main_tid = th[0].tid;             /* the task's first thread runs boot.c main */
+#endif
 #else
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

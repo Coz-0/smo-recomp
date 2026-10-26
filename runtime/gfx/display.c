@@ -11,7 +11,11 @@
  * the main thread: display_init makes it there, and boot.c's main thread pumps its events (display_pump) while it waits
  * for the game, instead of a window thread of its own as on Windows. */
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
+#else
+#include <SDL3/SDL_vulkan.h>
+#endif
 #endif
 #include "runtime.h"
 #include "hostrt.h"
@@ -226,13 +230,23 @@ static DWORD WINAPI window_thread(LPVOID arg) {
 static void set_title(const char *t) { SetWindowTextA(g_hwnd, t); }
 int display_window_foreground(void) { DWORD pid = 0; HWND fg = GetForegroundWindow(); return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId(); }
 #else
-/* ---- macOS: the same window behaviour on SDL3 */
+/* ---- macOS and Linux: the same window behaviour on SDL3 */
 static char g_title[96];
 static SDL_Window *g_win;
+static int g_win_full;
+#ifdef __APPLE__
 static SDL_MetalView g_metal_view;
 static void *g_metal_layer;
-static int g_win_full;
 void *display_hwnd(void) { return g_metal_layer; }   /* what the renderer makes its surface from: the window's CAMetalLayer */
+#else
+#define g_metal_layer ((void *)g_win)
+void *display_hwnd(void) { return g_win; }           /* Linux: the SDL window; the renderer makes its surface with display_vk_surface */
+/* The instance extensions the window's surface needs, and the surface (SDL's: Wayland or X11, whichever SDL runs on). */
+const char *const *display_vk_extensions(uint32_t *n) { return SDL_Vulkan_GetInstanceExtensions(n); }
+int display_vk_surface(void *instance, void *surface) {
+    return SDL_Vulkan_CreateSurface(g_win, (VkInstance)instance, NULL, (VkSurfaceKHR *)surface);
+}
+#endif
 void *display_cocoa_window(void) { return g_win ? SDL_GetPointerProperty(SDL_GetWindowProperties(g_win), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL) : NULL; }   /* smo_guide_mac.m: its NSWindow */
 void display_toggle_fullscreen(void);
 void display_pixel_size(int *w, int *h) { if (!g_win || !SDL_GetWindowSizeInPixels(g_win, w, h)) { *w = WIDTH; *h = HEIGHT; } }
@@ -312,13 +326,19 @@ static void window_create(void) {                    /* on the main thread */
     const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SMO_SHOW");
     int visible = show ? atoi(show) != 0 : (!strcmp(base, "smo_native") || !strcmp(base, "smo_user"));
     snprintf(g_title, sizeof g_title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "Super Mario Odyssey (smo-recomp)");
+#ifdef __APPLE__
     SDL_WindowFlags flags = SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE | (visible ? 0 : SDL_WINDOW_HIDDEN);
+#else
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE | (visible ? 0 : SDL_WINDOW_HIDDEN);
+#endif
     if (go->window_mode == 3) flags |= SDL_WINDOW_BORDERLESS;
     g_win = SDL_CreateWindow(g_title, go->width, go->height, flags);
     if (!g_win) { printf("display: the window cannot be made: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+#ifdef __APPLE__
     g_metal_view = SDL_Metal_CreateView(g_win);
     g_metal_layer = g_metal_view ? SDL_Metal_GetLayer(g_metal_view) : NULL;
     if (!g_metal_layer) { printf("display: no Metal layer for the window: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+#endif
     SDL_AddEventWatch(window_event, NULL);
     recomp_set_key_source(window_key_down);
     if (go->window_mode == 1 || go->window_mode == 2) do_fullscreen((void *)1);
@@ -418,7 +438,7 @@ void display_init(void) {
     while (!g_ready) Sleep(1);
     nvn_gl_start(g_hwnd);
 #else
-    hitch_init();                                    /* macOS's timed waits end on time: no timer period to ask for */
+    hitch_init();                                    /* macOS's and Linux's timed waits end on time: no timer period to ask for */
     window_create();
     nvn_gl_start(g_metal_layer);
 #endif

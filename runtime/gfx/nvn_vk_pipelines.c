@@ -1446,11 +1446,15 @@ static void prewarm_start(void) {
 #ifdef _WIN32
         HMODULE m = LoadLibraryA("smo_glslang.dll");
 #else
-        HMODULE m = NULL;                                 /* macOS: libsmo_glslang.dylib beside the program */
+        HMODULE m = NULL;                                 /* macOS, Linux: libsmo_glslang.dylib / .so beside the program */
         {   char path[MAX_PATH + 32];
             GetModuleFileNameA(NULL, path, MAX_PATH);
             char *sl = strrchr(path, '\\');
+#ifdef __APPLE__
             if (sl) { strcpy(sl + 1, "libsmo_glslang.dylib"); recomp_path(path, sizeof path, path); m = LoadLibraryA(path); }
+#else
+            if (sl) { strcpy(sl + 1, "libsmo_glslang.so"); recomp_path(path, sizeof path, path); m = LoadLibraryA(path); }
+#endif
         }
 #endif
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;

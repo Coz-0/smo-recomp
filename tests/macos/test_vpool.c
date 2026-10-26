@@ -10,8 +10,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#else
+#include <sys/mman.h>
+#endif
 #include "win32_posix.h"
 #include "runtime.h"
 #include "hostrt.h"
@@ -41,6 +45,10 @@ void register_nvn_imports(void);
 static uint8_t *g_heap;
 static uint64_t g_heap_size;
 int smo_heap_section_handle(HANDLE *h) { *h = g_heap; return g_heap != NULL; }
+#ifdef __linux__
+static int g_heap_fd = -1;                    /* Linux, as smo_nn.c: the heap is a shared mapping of a memfd */
+int smo_heap_memfd(void) { return g_heap_fd; }
+#endif
 int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset) {
     uint64_t base = (uint64_t)(uintptr_t)g_heap;
     if (!g_heap || addr < base || addr + size > base + g_heap_size || addr + size < addr) return 0;
@@ -85,6 +93,12 @@ static int refused(uint64_t v, uint64_t phys, uint64_t poff, uint64_t voff, uint
     waitpid(pid, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 42;
 }
+#ifdef __linux__
+static int no_access(const void *a) {
+    MEMORY_BASIC_INFORMATION mi;
+    return VirtualQuery(a, &mi, sizeof mi) && mi.State == MEM_RESERVE;
+}
+#else
 static int no_access(const void *a) {
     mach_vm_address_t at = (uintptr_t)a;
     mach_vm_size_t size = 0;
@@ -94,6 +108,7 @@ static int no_access(const void *a) {
     if (mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &n, &obj)) return 0;
     return at <= (uintptr_t)a && info.protection == VM_PROT_NONE;
 }
+#endif
 static int same(const uint8_t *a, const uint8_t *b, size_t n) { return memcmp(a, b, n) == 0; }
 static void fill(uint8_t *p, size_t n, unsigned seed) { for (size_t i = 0; i < n; i++) p[i] = (uint8_t)(seed + i * 7 + (i >> 12)); }
 
@@ -101,7 +116,13 @@ static void fill(uint8_t *p, size_t n, unsigned seed) { for (size_t i = 0; i < n
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     register_nvn_imports();
+#ifdef __linux__
+    g_heap_fd = memfd_create("test-heap", MFD_CLOEXEC);
+    if (g_heap_fd < 0 || ftruncate(g_heap_fd, (off_t)HEAP_RESERVE)) return 1;
+    g_heap = mmap(NULL, HEAP_RESERVE, PROT_NONE, MAP_SHARED | MAP_NORESERVE, g_heap_fd, 0);
+#else
     g_heap = VirtualAlloc(NULL, HEAP_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+#endif
     heap_grow(64 << 20);
     CHECK(g_heap && g_bootstrap, "heap and nvnBootstrapLoader");
 

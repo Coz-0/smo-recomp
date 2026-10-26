@@ -10,8 +10,12 @@
 #else
 #include "win32_posix.h"
 #include <sys/mman.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#else
+#include <errno.h>
+#endif
 #endif
 #include "runtime.h"
 #include "hostrt.h"
@@ -171,7 +175,11 @@ static void vp_fail(Ctx *c, const char *what, uint64_t a, uint64_t b) {
 #ifdef _WIN32
     const char *os = "Windows";
 #else
+#ifdef __APPLE__
     const char *os = "Mach";
+#else
+    const char *os = "POSIX";
+#endif
 #endif
     printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; %s error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, os, (unsigned long)GetLastError());
     guest_trap("nvnMemoryPoolMapVirtual: request that cannot be mapped exactly", c ? c->x[30] - 4 : 0);
@@ -215,6 +223,19 @@ static uint64_t vp_reserve(uint64_t size) {
     void *p = mmap(NULL, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     return p == MAP_FAILED ? 0 : (uint64_t)(uintptr_t)p;
 }
+#ifdef __linux__
+int smo_heap_memfd(void);                                          /* smo_nn.c */
+/* Linux: the heap is a shared mapping of a memfd (smo_nn.c): a view is the same file range mapped at the second address.
+ * The caller has checked that the range lies in the committed heap (smo_heap_section_offset). */
+static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {
+    (void)sec;
+    int fd = smo_heap_memfd();
+    if (fd < 0) { SetLastError(0); return 0; }
+    void *p = mmap((void *)(uintptr_t)at, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)sec_off);
+    if (p != (void *)(uintptr_t)at) { SetLastError((DWORD)errno); return 0; }
+    return 1;
+}
+#else
 static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {   /* sec: the heap's base (smo_nn.c) */
     mach_vm_address_t to = at;
     vm_prot_t cur, max;
@@ -224,6 +245,7 @@ static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {  
     if ((cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) { SetLastError(0); return 0; }   /* heap pages not committed */
     return 1;
 }
+#endif
 static int vp_unview(uint64_t at, uint64_t size) {
     return mmap((void *)(uintptr_t)at, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED;
 }

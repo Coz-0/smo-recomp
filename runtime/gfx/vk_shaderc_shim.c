@@ -57,6 +57,9 @@ static BOOL CALLBACK init_once(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         const char *sdk = getenv("VULKAN_SDK");
         if (sdk) { snprintf(path, sizeof path, "%s\\Bin\\shaderc_shared.dll", sdk); m = LoadLibraryA(path); }
     }
+#elif defined(__linux__)
+    HMODULE m = LoadLibraryA("libshaderc_shared.so.1");                /* the system's (shaderc package) */
+    if (!m) m = LoadLibraryA("libshaderc_shared.so");
 #else
     /* macOS: the copy build_exe.py puts next to this library, else the Vulkan SDK's (VULKAN_SDK = its macOS folder) */
     HMODULE m = NULL;
