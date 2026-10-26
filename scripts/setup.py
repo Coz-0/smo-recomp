@@ -20,6 +20,7 @@ by git). Steps run in this order and are resumable: a step whose output exists i
     tables     generated headers and tables                                     (tools/lifter/gen_tables.py, gen_sdktest.py)
     sdk        the system-library functions that are lifted too                                 (tools/lifter/sdklift.py)
     link       host runtime + game library -> build/bin/smo_native.exe                          (tools/lifter/build_exe.py)
+    shaders    every shader stage of the game to SPIR-V, into the renderer's cache                (tools/lifter/precompile_shaders.py)
     check      differential test against Unicorn and link check (only with --only check or --check; minutes)
 
 Other commands:  --status (what is done)   --steps (list)   --only <step>
@@ -94,6 +95,7 @@ STEPS = [
     ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
     ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
+    ('shaders', 'cache/vk/spv', None, lambda a: [[PY, tool('lifter', 'precompile_shaders.py')]]),
     ('check', 'difftest + linkcheck', None,
      lambda a: [[PY, tool('lifter', 'difftest.py'), 'all'], [PY, tool('lifter', 'linkcheck.py')]]),
 ]
