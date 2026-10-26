@@ -10,10 +10,11 @@ OUT=build/linux-check
 mkdir -p "$OUT"
 fail=0
 step() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fail=1; fi; }
-[ -x .venv/bin/python ] && .venv/bin/python tools/lifter/gen_sdktest.py >/dev/null     # build/gen/sdktest_data.h: synthetic JPEGs (Pillow)
+PY=python3; [ -x .venv/bin/python ] && PY=.venv/bin/python
+"$PY" tools/lifter/gen_sdktest.py >/dev/null     # build/gen/sdktest_data.h: synthetic JPEGs (Pillow)
 CC=${CC:-clang}
 CFLAGS=(-std=gnu11 -O1 -g -D_GNU_SOURCE -fno-omit-frame-pointer -Wall -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-but-set-global)
-INC=(-Iruntime/compat -Itests/macos/stub -Ibuild/gen $(pkg-config --cflags sdl3 freetype2 libavformat))
+INC=(-Iruntime/compat -Itests/macos/stub -Ibuild/gen -I/usr/include/freetype2 $(pkg-config --cflags sdl3 freetype2 libavformat 2>/dev/null))
 for d in runtime/*/; do INC+=("-I${d%/}"); done
 LIBS=(-lpthread -ldl -rdynamic)
 before=$(git status --porcelain --untracked-files=all | sort)
