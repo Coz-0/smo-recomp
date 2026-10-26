@@ -26,7 +26,11 @@ import shutil
 import subprocess
 import sys
 import time
-from ctypes import wintypes
+WINDOWS = sys.platform == 'win32'
+if WINDOWS:
+    from ctypes import wintypes
+else:
+    import fcntl
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools', 'lifter'))
@@ -36,20 +40,33 @@ import mapaddr  # noqa: E402
 PLAYED = ('smo_native.exe', 'smo_user.exe')     # the copies a person plays: a window, sound, no waiting for a place
 
 
-class _MemoryStatus(ctypes.Structure):
-    _fields_ = [('dwLength', wintypes.DWORD), ('dwMemoryLoad', wintypes.DWORD)] + [
-        (n, ctypes.c_ulonglong) for n in ('total_phys', 'avail_phys', 'total_page', 'avail_page', 'total_virtual',
-                                          'avail_virtual', 'avail_extended')]
+def exe_name(name):
+    """The program file of a copy: as given on Windows; on macOS and Linux without '.exe', so the scripts' names (smo_test.exe,
+    smo_stress_3.exe) work unchanged."""
+    return name if WINDOWS or not name.lower().endswith('.exe') else name[:-4]
+
+
+if WINDOWS:
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [('dwLength', wintypes.DWORD), ('dwMemoryLoad', wintypes.DWORD)] + [
+            (n, ctypes.c_ulonglong) for n in ('total_phys', 'avail_phys', 'total_page', 'avail_page', 'total_virtual',
+                                              'avail_virtual', 'avail_extended')]
+
+
+def total_memory():
+    if not WINDOWS:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    m = _MemoryStatus()
+    m.dwLength = ctypes.sizeof(m)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m.total_phys
 
 
 def max_games():
     """SMO_MAX_GAMES, or one test game per 12 GB of the PC's memory (at least one)."""
     if os.environ.get('SMO_MAX_GAMES'):
         return max(int(os.environ['SMO_MAX_GAMES']), 0)
-    m = _MemoryStatus()
-    m.dwLength = ctypes.sizeof(m)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-    return max(int(m.total_phys / 2**30 / 12), 1)
+    return max(int(total_memory() / 2**30 / 12), 1)
 
 
 def take_place(exe_name, poll=2.0, name='Local\\smo_test_game_%d'):
@@ -57,8 +74,10 @@ def take_place(exe_name, poll=2.0, name='Local\\smo_test_game_%d'):
     Local\\smo_test_game_<k>, held by this thread until release_place (a launcher that dies frees its place: the mutex
     is abandoned). Returns the mutex handle, or None for the played copies and with no limit."""
     n = max_games()
-    if exe_name.lower() in PLAYED or n == 0:
+    if exe_name.lower() in PLAYED or exe_name.lower() + '.exe' in PLAYED or n == 0:
         return None
+    if not WINDOWS:
+        return take_place_posix(n, poll, name)
     k32 = ctypes.WinDLL('kernel32', use_last_error=True)
     k32.CreateMutexW.restype = wintypes.HANDLE
     k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -83,7 +102,34 @@ def take_place(exe_name, poll=2.0, name='Local\\smo_test_game_%d'):
         time.sleep(poll)
 
 
+def take_place_posix(n, poll, name):
+    """macOS, Linux: the places are lock files in the temporary folder (<name with k>.lock), held with flock by an open
+    file; a launcher that dies closes it, which frees the place as an abandoned mutex does on Windows."""
+    import tempfile
+    waited = None
+    while True:
+        for k in range(n):
+            path = os.path.join(tempfile.gettempdir(), (name % k).replace('\\', '_') + '.lock')
+            f = open(path, 'a')
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                f.close()
+                continue
+            if waited:
+                print('run.py: place %d of %d free after %.0f s' % (k, n, time.time() - waited))
+            return f
+        if waited is None:
+            waited = time.time()
+            print('run.py: %d test games are running (SMO_MAX_GAMES=%d): waiting for one to end' % (n, n))
+            sys.stdout.flush()
+        time.sleep(poll)
+
+
 def release_place(h):
+    if h and not WINDOWS:
+        h.close()                                  # closing the file drops its flock
+        return
     if h:
         ctypes.windll.kernel32.ReleaseMutex(wintypes.HANDLE(h))
         ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(h))
@@ -111,13 +157,15 @@ def main():
     if a.userdata:
         os.makedirs(a.userdata, exist_ok=True)
         a.env.append('SMO_USERDATA=' + os.path.abspath(a.userdata))
-    src = os.path.join(BIN, 'smo_native.exe')
+    a.exe = exe_name(a.exe)
+    src = os.path.join(BIN, T.EXE)
     exe = os.path.join(BIN, a.exe)
     place = take_place(a.exe)
     try:
-        if a.exe != 'smo_native.exe':
+        if a.exe != T.EXE:
             shutil.copy2(src, exe)
-            shutil.copy2(src[:-4] + '.map', exe[:-4] + '.map')
+            if os.path.exists(os.path.splitext(src)[0] + '.map'):
+                shutil.copy2(os.path.splitext(src)[0] + '.map', os.path.splitext(exe)[0] + '.map')
         env = dict(os.environ)
         for kv in a.env:
             k, v = kv.split('=', 1)
@@ -153,7 +201,7 @@ def main():
     if m:
         block = m.group(0)
         print('\n'.join('  ' + l for l in block.split('\n')[:4]))
-        base, syms = mapaddr.load(exe[:-4] + '.map')
+        base, syms = mapaddr.load(os.path.splitext(exe)[0] + '.map') if WINDOWS else (0, [])   # the MSVC map format
         for mod, off in re.findall(r'^\s+(\S+?)\+0x([0-9a-f]+)$', block, re.M):
             name = ''
             if mod.lower() == a.exe.lower():
