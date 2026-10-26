@@ -976,6 +976,11 @@ static VTex *vt_get2(Tex *t, int sync) {
             if (vt->samples == 1) {
                 if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
                 else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
+                /* the first upload usually follows in the same layout, where vt_layout adds no barrier: without this the
+                 * clear and that copy were two transfer writes with no order between them (syncval WRITE_AFTER_WRITE) */
+                VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
             }
         }
     }
