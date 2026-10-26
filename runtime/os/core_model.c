@@ -1,4 +1,4 @@
-/* The console core model on macOS (docs/macos-port.md "The console core model on macOS"). Windows gets the same rules from
+/* The console core model on macOS and Linux (docs/macos-port.md "The console core model on macOS"). Windows gets the same rules from
  * its scheduler (os_threads.c: three pinned host processors, priorities); macOS has no processor affinity, so here they are
  * kept by hand:
  *   - a token per console core; a guest thread runs lifted code only while it holds the token of a core of its mask;
@@ -13,8 +13,7 @@
 #include <time.h>
 #include <errno.h>
 #include <pthread.h>
-#include <os/lock.h>
-#include <os/os_sync_wait_on_address.h>
+#include "posix_sync.h"                      /* os_unfair_lock and the address waits (futexes on Linux) */
 #include "core_model.h"
 
 #define CORES 3

@@ -9,7 +9,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
+#ifdef __APPLE__
 #include <mach/thread_status.h>
+#endif
 #endif
 #include "runtime.h"
 #include "hostrt.h"
@@ -302,11 +304,12 @@ void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
 }
 #else
 /* The Windows version steps the faulting write once with the page writable (the trap flag); a signal handler on
- * macOS cannot single-step, so SMO_WATCH is not available here yet. */
+ * macOS cannot single-step, so SMO_WATCH is not available here yet (on Linux it could, with the trap flag in the
+ * signal context: not written yet). */
 void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
     (void)heap; (void)heap_size;
     (void)g_watch_lo; (void)g_watch_hi; (void)g_watch_page; (void)g_watch_off; (void)g_watch_lines; (void)t_watch_step; (void)t_watch_hit;
-    if (getenv("SMO_WATCH")) printf("watch: SMO_WATCH is not available on macOS yet\n");
+    if (getenv("SMO_WATCH")) printf("watch: SMO_WATCH is only available on Windows yet\n");
 }
 #endif
 
@@ -670,8 +673,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #else
-/* macOS: the same report from a signal handler. Host frames come from the frame-pointer chain (every arm64 macOS
- * binary keeps one); a guest trap arrives here as SIGTRAP from __builtin_debugtrap(), as RaiseException does on Windows. */
+/* macOS and Linux: the same report from a signal handler. Host frames come from the frame-pointer chain (every arm64
+ * macOS binary keeps one; the Linux build keeps them with -fno-omit-frame-pointer); a guest trap arrives here as SIGTRAP
+ * from __builtin_debugtrap(), as RaiseException does on Windows. */
 static void host_module_line(const char *indent, uint64_t pc) {
     HMODULE m = NULL;
     char mod[MAX_PATH] = "?";
@@ -684,13 +688,19 @@ static void crash_signal(int sig, siginfo_t *si, void *ucv) {
     if (sig == SIGSEGV || sig == SIGBUS) recomp_try_catch();        /* a fault inside a __try probe goes to its __except */
     if (__atomic_exchange_n(&in_report, 1, __ATOMIC_SEQ_CST)) _exit(4);     /* a fault inside the report */
     ucontext_t *uc = ucv;
+#ifdef __APPLE__
     uint64_t pc = arm_thread_state64_get_pc(uc->uc_mcontext->__ss), lr = arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
     uint64_t fp = arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+    uint32_t esr = uc->uc_mcontext->__es.__esr, ec = esr >> 26;
+    int writing = (ec == 0x24 || ec == 0x25) && (esr & 0x40);
+#else                                                /* x86-64: no link register; bit 1 of the page-fault error code is "write" */
+    uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP], lr = 0, fp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];
+    int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+#endif
     printf("\nHOST EXCEPTION signal %d (%s) at host address %p\n", sig, strsignal(sig), (void *)(uintptr_t)pc);
     host_module_line("  in ", pc);
-    uint32_t esr = uc->uc_mcontext->__es.__esr, ec = esr >> 26;
     if (sig == SIGSEGV || sig == SIGBUS)
-        printf("  %s address 0x%llx\n", (ec == 0x24 || ec == 0x25) && (esr & 0x40) ? "writing" : "reading", (unsigned long long)(uintptr_t)si->si_addr);
+        printf("  %s address 0x%llx\n", writing ? "writing" : "reading", (unsigned long long)(uintptr_t)si->si_addr);
     dump_guest_registers();
     crash_dump_guest_memory();
     uint64_t pcs[400];
@@ -796,7 +806,7 @@ void runtime_init(const char *elf, const char *trace_path) {
 #ifdef _WIN32
         const uint64_t ro_end = GUEST_RO_END;
 #else
-        const uint64_t ro_end = GUEST_RO_END & ~(uint64_t)(recomp_page_size() - 1);   /* 16 KB pages: the page holding the start of .data stays writable */
+        const uint64_t ro_end = GUEST_RO_END & ~(uint64_t)(recomp_page_size() - 1);   /* 16 KB pages on macOS: the page holding the start of .data stays writable */
 #endif
         if (!VirtualProtect((void *)GUEST_BASE, ro_end, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
         printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + ro_end);
@@ -820,6 +830,12 @@ void runtime_init(const char *elf, const char *trace_path) {
 #if defined(__aarch64__) || defined(_M_ARM64)
 int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) { return audit_trivial_a64((const void *)fn, x0, sets_x0); }
 #else
+/* The Ctx * argument is in rcx on Windows (register 1 in ModRM) and in rdi in the System V ABI of Linux (register 7). */
+#ifdef _WIN32
+#define AUDIT_ARG 1
+#else
+#define AUDIT_ARG 7
+#endif
 int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     const unsigned char *p = (const unsigned char *)fn;
     int stores = 0;
@@ -832,22 +848,22 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
         int w = 0;
         if (q[0] == 0xC3) return stores ? 2 : 1;
         if (q[0] == 0x48) { w = 1; q++; }
-        if (q[0] == 0xC7 && (q[1] == 0x01 || q[1] == 0x41 || q[1] == 0x81)) {                   /* mov [rcx+d], imm32 */
+        if (q[0] == 0xC7 && (q[1] == AUDIT_ARG || q[1] == (0x40 | AUDIT_ARG) || q[1] == (0x80 | AUDIT_ARG))) {   /* mov [rcx+d], imm32 */
             long long disp = 0;
             int modrm = q[1];
             q += 2;
-            if (modrm == 0x41) { disp = (signed char)q[0]; q += 1; } else if (modrm == 0x81) { disp = *(const int *)q; q += 4; }
+            if (modrm == (0x40 | AUDIT_ARG)) { disp = (signed char)q[0]; q += 1; } else if (modrm == (0x80 | AUDIT_ARG)) { disp = *(const int *)q; q += 4; }
             if (disp == 0) { *x0 = w ? (long long)*(const int *)q : (long long)*(const unsigned *)q; *sets_x0 = 1; }
             q += 4; stores++; p = q; continue;
         }
-        if (w && q[0] == 0x83 && q[1] == 0x21 && q[2] == 0x00) { *x0 = 0; *sets_x0 = 1; stores++; p = q + 3; continue; }   /* and qword [rcx], 0 */
+        if (w && q[0] == 0x83 && q[1] == (0x20 | AUDIT_ARG) && q[2] == 0x00) { *x0 = 0; *sets_x0 = 1; stores++; p = q + 3; continue; }   /* and qword [rcx], 0 */
         if (w && q[0] == 0xB8) { rax = *(const long long *)(q + 1); p = q + 9; continue; }      /* movabs rax, imm64 */
         if (!w && q[0] == 0xB8) { rax = *(const unsigned *)(q + 1); p = q + 5; continue; }      /* mov eax, imm32 */
         if (!w && q[0] == 0x31 && q[1] == 0xC0) { rax = 0; p = q + 2; continue; }               /* xor eax, eax */
-        if (w && q[0] == 0x89 && q[1] == 0x01) { *x0 = rax; *sets_x0 = 1; stores++; p = q + 2; continue; }   /* mov [rcx], rax */
+        if (w && q[0] == 0x89 && q[1] == AUDIT_ARG) { *x0 = rax; *sets_x0 = 1; stores++; p = q + 2; continue; }   /* mov [rcx], rax */
         if (!w && q[0] == 0x0F && q[1] == 0x57 && q[2] == 0xC0) { p = q + 3; continue; }        /* xorps xmm0, xmm0 */
-        if (!w && q[0] == 0x0F && (q[1] == 0x11 || q[1] == 0x29) && (q[2] == 0x41 || q[2] == 0x81)) {   /* movups/movaps [rcx+d], xmm0 */
-            p = q + (q[2] == 0x41 ? 4 : 7); stores++; continue;
+        if (!w && q[0] == 0x0F && (q[1] == 0x11 || q[1] == 0x29) && (q[2] == (0x40 | AUDIT_ARG) || q[2] == (0x80 | AUDIT_ARG))) {   /* movups/movaps [rcx+d], xmm0 */
+            p = q + (q[2] == (0x40 | AUDIT_ARG) ? 4 : 7); stores++; continue;
         }
         return 0;
     }

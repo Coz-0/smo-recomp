@@ -1,5 +1,6 @@
-/* The Win32 subset of win32_posix.h on macOS: Mach for memory, threads and clocks, os_unfair_lock and
- * os_sync_wait_on_address for locks and condition variables, pthreads for threads. */
+/* The Win32 subset of win32_posix.h on macOS and Linux: Mach (macOS) or /proc and signals (Linux) for memory,
+ * threads and clocks, os_unfair_lock and os_sync_wait_on_address for locks and condition variables (futexes on Linux,
+ * posix_sync.h), pthreads for threads. */
 #ifndef _WIN32
 #include "win32_posix.h"
 
@@ -12,29 +13,48 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <crt_externs.h>
-#include <os/os_sync_wait_on_address.h>
+#include <copyfile.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <AudioToolbox/AudioServices.h>
+#include <CoreGraphics/CoreGraphics.h>
+#else
+#include <sys/uio.h>
+#include <sys/sendfile.h>
+#include <ucontext.h>
+#include <semaphore.h>
+#include <stdbool.h>
+#include <sys/random.h>
+/* What the Mach calls give on macOS: a thread's id (its kernel tid on Linux) and the page size. */
+typedef pid_t mach_port_t;
+static size_t g_page_size;
+__attribute__((constructor(101))) static void page_size_init(void) { g_page_size = (size_t)sysconf(_SC_PAGESIZE); }
+#define vm_page_size g_page_size
+static mach_port_t self_tid(void) { return (mach_port_t)gettid(); }
+#endif
 #include <fcntl.h>
 #include <dirent.h>
 #include <fnmatch.h>
 #include <signal.h>
-#include <copyfile.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <pwd.h>
-#include <CoreFoundation/CoreFoundation.h>
-#include <AudioToolbox/AudioServices.h>
-#include <CoreGraphics/CoreGraphics.h>
 
 static void win_path(char *p);
 
 /* ---------------------------------------------------------------- C runtime */
 int __argc;
 char **__argv;
+#ifdef __APPLE__
 __attribute__((constructor)) static void args_init(void) { __argc = *_NSGetArgc(); __argv = *_NSGetArgv(); }
+#else
+/* glibc passes the program's arguments to constructors */
+__attribute__((constructor)) static void args_init(int argc, char **argv) { __argc = argc; __argv = argv; }
+#endif
 
 /* The alignment and the size are stored in front of the block, so _aligned_realloc can copy. */
 typedef struct { void *raw; size_t size; } AlignedHead;
@@ -73,12 +93,20 @@ static int prot_of(DWORD p) {
     default: return PROT_NONE;
     }
 }
+#ifdef __APPLE__
 static DWORD page_of(vm_prot_t p) {
     if (p & VM_PROT_EXECUTE) return p & VM_PROT_WRITE ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
     if (p & VM_PROT_WRITE) return PAGE_READWRITE;
     if (p & VM_PROT_READ) return PAGE_READONLY;
     return PAGE_NOACCESS;
 }
+#else
+static DWORD page_of_rwx(int r, int w, int x) {
+    if (x) return w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+    if (w) return PAGE_READWRITE;
+    return r ? PAGE_READONLY : PAGE_NOACCESS;
+}
+#endif
 
 /* Reservations, so MEM_RELEASE (size 0) knows the size and VirtualQuery the allocation base. */
 #define MAX_RES 4096
@@ -156,6 +184,51 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     return FALSE;
 }
 
+#ifdef __linux__
+/* The mapping of /proc/self/maps holding addr (or the gap up to the next one). Neighbouring lines with the same
+ * protection are one region, as Windows reports them. */
+SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T len) {
+    if (len < sizeof *mbi) return 0;
+    memset(mbi, 0, sizeof *mbi);
+    uintptr_t at = page_down((uintptr_t)addr), lo = 0, hi = 0, next = 0;
+    DWORD prot = 0;
+    int found = 0;
+    mbi->BaseAddress = (void *)at;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long a, b;
+        char perm[5];
+        if (sscanf(line, "%lx-%lx %4s", &a, &b, perm) != 3) continue;
+        DWORD p = page_of_rwx(perm[0] == 'r', perm[1] == 'w', perm[2] == 'x');
+        if (found) {                                   /* extend over neighbours with the same protection */
+            if (a == hi && p == prot) { hi = b; continue; }
+            break;
+        }
+        if (at >= a && at < b) { found = 1; lo = a; hi = b; prot = p; continue; }
+        if (a > at) { next = a; break; }
+    }
+    fclose(f);
+    if (!found) {
+        mbi->State = MEM_FREE;
+        mbi->Protect = PAGE_NOACCESS;
+        mbi->RegionSize = next ? (SIZE_T)(next - at) : vm_page_size;
+        return sizeof *mbi;
+    }
+    (void)lo;
+    mbi->RegionSize = (SIZE_T)(hi - at);
+    mbi->State = prot == PAGE_NOACCESS ? MEM_RESERVE : MEM_COMMIT;
+    mbi->Protect = prot == PAGE_NOACCESS ? 0 : prot;
+    mbi->Type = MEM_PRIVATE;
+    os_unfair_lock_lock(&g_res_lock);
+    int i = res_find((uintptr_t)addr);
+    mbi->AllocationBase = i >= 0 ? (void *)g_res[i].base : (void *)lo;
+    mbi->AllocationProtect = i >= 0 ? g_res[i].protect : prot;
+    os_unfair_lock_unlock(&g_res_lock);
+    return sizeof *mbi;
+}
+#else
 SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T len) {
     if (len < sizeof *mbi) return 0;
     memset(mbi, 0, sizeof *mbi);
@@ -183,6 +256,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T len) {
     os_unfair_lock_unlock(&g_res_lock);
     return sizeof *mbi;
 }
+#endif
 
 /* Every host page the range touches, as on Windows. With 16 KB pages that can be more than the caller meant: a
  * caller that must not touch the page past its range rounds its size down to recomp_page_size() itself. */
@@ -193,10 +267,19 @@ BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD protect, DWORD *old) {
     return !mprotect((void *)lo, hi - lo, prot_of(protect));
 }
 
+#ifdef __linux__
+/* process_vm_readv on the process itself: the kernel copies, and an unreadable source is an error (EFAULT), not a
+ * signal. */
+int host_try_read(const void *p, void *out, size_t n) {
+    struct iovec local = {out, n}, remote = {(void *)p, n};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+#else
 int host_try_read(const void *p, void *out, size_t n) {
     mach_vm_size_t got = 0;
     return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)p, n, (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == n;
 }
+#endif
 
 /* ---------------------------------------------------------------- blocking hooks */
 static void hook_none(void) {}
@@ -212,7 +295,7 @@ static void lock_slow(os_unfair_lock *l) {             /* contended: blocks */
 }
 
 /* ---------------------------------------------------------------- locks and condition variables */
-void InitializeSRWLock(SRWLOCK *l) { l->l = OS_UNFAIR_LOCK_INIT; }
+void InitializeSRWLock(SRWLOCK *l) { memset(&l->l, 0, sizeof l->l); }      /* OS_UNFAIR_LOCK_INIT is all zeros */
 void AcquireSRWLockExclusive(SRWLOCK *l) { lock_slow(&l->l); }
 void ReleaseSRWLockExclusive(SRWLOCK *l) { os_unfair_lock_unlock(&l->l); }
 void AcquireSRWLockShared(SRWLOCK *l) { lock_slow(&l->l); }
@@ -342,7 +425,11 @@ static Obj *self_obj(void) {
     if (!t_self) {
         t_self = obj_new(H_THREAD);
         t_self->thread = pthread_self();
+#ifdef __APPLE__
         t_self->port = pthread_mach_thread_np(pthread_self());
+#else
+        t_self->port = self_tid();
+#endif
     }
     return t_self;
 }
@@ -355,7 +442,11 @@ static void *thread_start(void *p) {
      * free, equal to "me" 0) took a free lock for its own and only counted the depth; the later Leave unlocked an
      * os_unfair_lock the thread had never taken (_os_unfair_lock_unowned_abort, found with the pipeline workers at
      * start-up). */
+#ifdef __APPLE__
     o->port = pthread_mach_thread_np(pthread_self());
+#else
+    __atomic_store_n(&o->port, self_tid(), __ATOMIC_RELEASE);
+#endif
     /* A signal stack of this thread's own: the crash handler (hostrt.c, SA_ONSTACK) can then report a stack overflow
      * on this thread too. Without it the handler ran on the overflowed stack, faulted again and the process ended
      * with _exit(4) and nothing in the log. sigaltstack is per thread; the boot thread has its own in hostrt.c. */
@@ -391,7 +482,11 @@ HANDLE CreateThread(void *sec, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID a
     int r = pthread_create(&o->thread, &at, thread_start, o);
     pthread_attr_destroy(&at);
     if (r) { free(o); return NULL; }
+#ifdef __APPLE__
     o->port = pthread_mach_thread_np(o->thread);
+#else
+    while (!__atomic_load_n(&o->port, __ATOMIC_ACQUIRE)) sched_yield();     /* the thread stores its own tid first */
+#endif
     if (tid) *tid = o->port;
     return o;
 }
@@ -409,13 +504,104 @@ BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *dst, DWORD access
     *dst = o;
     return TRUE;
 }
+#ifdef __APPLE__
 DWORD GetCurrentThreadId(void) { return t_self ? t_self->port : pthread_mach_thread_np(pthread_self()); }
+#else
+DWORD GetCurrentThreadId(void) { return t_self ? (DWORD)t_self->port : (DWORD)self_tid(); }
+#endif
 DWORD GetThreadId(HANDLE h) { Obj *o = obj_of(h); return o && o->kind == H_THREAD ? o->port : 0; }
 
+#ifdef __APPLE__
 DWORD SuspendThread(HANDLE h) {
     Obj *o = obj_of(h);
     return thread_suspend(o->port) == KERN_SUCCESS ? 0 : (DWORD)-1;
 }
+#else
+/* Linux has no suspension of another thread: a signal stops it in its handler, which keeps the thread's registers for
+ * GetThreadContext / host_thread_backtrace and waits until ResumeThread. One suspended thread at a time (the samplers
+ * and the watchdog take one after the other), guarded by g_susp_lock. */
+#define SIG_SUSPEND (SIGRTMIN + 3)
+static os_unfair_lock g_susp_lock = OS_UNFAIR_LOCK_INIT;
+static struct { volatile int stopped, resume; sem_t ack; uint64_t pc, sp, fp; } g_susp;
+static void suspend_signal(int sig, siginfo_t *si, void *ucv) {
+    (void)sig; (void)si;
+    int e = errno;
+    ucontext_t *uc = ucv;
+    g_susp.pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    g_susp.sp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+    g_susp.fp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];
+    __atomic_store_n(&g_susp.stopped, 1, __ATOMIC_RELEASE);
+    sem_post(&g_susp.ack);
+    while (!__atomic_load_n(&g_susp.resume, __ATOMIC_ACQUIRE)) recomp_futex(&g_susp.resume, FUTEX_WAIT_PRIVATE, 0, NULL);
+    errno = e;
+}
+static void suspend_install(void) {
+    static volatile int done;
+    if (__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL)) return;
+    sem_init(&g_susp.ack, 0, 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = suspend_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigfillset(&sa.sa_mask);
+    sigaction(SIG_SUSPEND, &sa, NULL);
+}
+static int suspend_tid(pid_t tid) {
+    if (tid == self_tid()) return 0;
+    suspend_install();
+    os_unfair_lock_lock(&g_susp_lock);
+    g_susp.stopped = 0; g_susp.resume = 0;
+    if (syscall(SYS_tgkill, getpid(), tid, SIG_SUSPEND)) { os_unfair_lock_unlock(&g_susp_lock); return 0; }
+    while (sem_wait(&g_susp.ack) && errno == EINTR) {}
+    return 1;                                        /* g_susp_lock stays taken until resume_suspended */
+}
+static void resume_suspended(void) {
+    __atomic_store_n(&g_susp.resume, 1, __ATOMIC_RELEASE);
+    recomp_futex(&g_susp.resume, FUTEX_WAKE_PRIVATE, 1, NULL);
+    os_unfair_lock_unlock(&g_susp_lock);
+}
+DWORD SuspendThread(HANDLE h) {
+    Obj *o = obj_of(h);
+    if (!o || o->kind != H_THREAD || o == t_self) return (DWORD)-1;
+    return suspend_tid(o->port) ? 0 : (DWORD)-1;
+}
+int host_tid_backtrace(DWORD tid, uint64_t *pcs, int max) {
+    if (!suspend_tid((pid_t)tid)) return 0;
+    int got = host_frames_from(g_susp.pc, 0, g_susp.fp, pcs, max);
+    g_susp.stopped = 0;
+    resume_suspended();
+    return got;
+}
+int host_task_threads(DWORD *tids, ULONG64 *cpu, int max) {
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return 0;
+    long hz = sysconf(_SC_CLK_TCK);
+    int n = 0;
+    for (struct dirent *e; n < max && (e = readdir(d));) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64], buf[512];
+        snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[got] = 0;
+        const char *p = strrchr(buf, ')');               /* the name may hold spaces; the fields follow its ')' */
+        unsigned long long ut = 0, st = 0;
+        if (!p || sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2) continue;
+        tids[n] = (DWORD)atoi(e->d_name);
+        cpu[n] = (ut + st) * 10000000ull / (ULONG64)(hz > 0 ? hz : 100);
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+BOOL recomp_suspended_regs(uint64_t *pc, uint64_t *sp, uint64_t *fp) {
+    if (!__atomic_load_n(&g_susp.stopped, __ATOMIC_ACQUIRE)) return FALSE;
+    *pc = g_susp.pc; *sp = g_susp.sp; *fp = g_susp.fp;
+    return TRUE;
+}
+#endif
 DWORD ResumeThread(HANDLE h) {
     Obj *o = obj_of(h);
     pthread_mutex_lock(&o->m);
@@ -423,7 +609,14 @@ DWORD ResumeThread(HANDLE h) {
     if (gated) { o->gate = 0; pthread_cond_broadcast(&o->cv); }
     pthread_mutex_unlock(&o->m);
     if (gated) return 1;
+#ifdef __APPLE__
     return thread_resume(o->port) == KERN_SUCCESS ? 1 : (DWORD)-1;
+#else
+    if (!__atomic_load_n(&g_susp.stopped, __ATOMIC_ACQUIRE)) return (DWORD)-1;
+    g_susp.stopped = 0;
+    resume_suspended();
+    return 1;
+#endif
 }
 BOOL SetThreadPriority(HANDLE h, int priority) {
     Obj *o = obj_of(h);
@@ -435,6 +628,16 @@ BOOL SetThreadPriority(HANDLE h, int priority) {
     return !pthread_setschedparam(o->thread, policy, &sp);
 }
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) { (void)h; (void)mask; return 1; }
+#ifdef __linux__
+BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *t) {
+    Obj *o = obj_of(h);
+    clockid_t c;
+    struct timespec ts;
+    if (!o || pthread_getcpuclockid(o->thread, &c) || clock_gettime(c, &ts)) return FALSE;
+    *t = (ULONG64)ts.tv_sec * 1000000000ull + (ULONG64)ts.tv_nsec;
+    return TRUE;
+}
+#else
 BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *t) {
     Obj *o = obj_of(h);
     thread_basic_info_data_t bi;
@@ -444,6 +647,7 @@ BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *t) {
          ((ULONG64)bi.user_time.microseconds + (ULONG64)bi.system_time.microseconds) * 1000ull;
     return TRUE;
 }
+#endif
 
 HANDLE CreateEventA(void *sec, BOOL manual_reset, BOOL initial, LPCSTR name) {
     (void)sec; (void)name;
@@ -485,7 +689,7 @@ BOOL ResetEvent(HANDLE h) {
 }
 
 static void deadline_of(DWORD ms, struct timespec *ts) {
-    clock_gettime(CLOCK_REALTIME, ts);      /* pthread_cond_timedwait's clock on macOS */
+    clock_gettime(CLOCK_REALTIME, ts);      /* pthread_cond_timedwait's clock (macOS; Linux's default) */
     ts->tv_sec += ms / 1000;
     ts->tv_nsec += (long)(ms % 1000) * 1000000l;
     if (ts->tv_nsec >= 1000000000l) { ts->tv_sec++; ts->tv_nsec -= 1000000000l; }
@@ -555,7 +759,12 @@ void ExitProcess(UINT code) { fflush(NULL); exit((int)code); }
 /* ---------------------------------------------------------------- process and modules */
 HMODULE GetModuleHandleA(LPCSTR name) {
     if (name) return NULL;
+#ifdef __APPLE__
     return (HMODULE)_dyld_get_image_header(0);
+#else
+    extern const char __ehdr_start;                  /* the program's ELF header, where the linker loaded it */
+    return (HMODULE)&__ehdr_start;
+#endif
 }
 BOOL GetModuleHandleExA(DWORD flags, LPCSTR addr, HMODULE *m) {
     Dl_info di;
@@ -576,6 +785,22 @@ DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD size) {
 }
 
 static void ft_set(FILETIME *f, uint64_t hundred_ns) { f->dwLowDateTime = (DWORD)hundred_ns; f->dwHighDateTime = (DWORD)(hundred_ns >> 32); }
+#ifdef __linux__
+BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user) {
+    unsigned long long u, n, s, id, io, irq, sirq;
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return FALSE;
+    int got = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &s, &id, &io, &irq, &sirq);
+    fclose(f);
+    if (got != 7) return FALSE;
+    uint64_t hz = (uint64_t)sysconf(_SC_CLK_TCK), k = 10000000ull / (hz ? hz : 100);   /* ticks -> 100 ns */
+    uint64_t t_idle = (id + io) * k, t_sys = (s + irq + sirq) * k, t_user = (u + n) * k;
+    if (idle) ft_set(idle, t_idle);
+    if (kernel) ft_set(kernel, t_sys + t_idle);
+    if (user) ft_set(user, t_user);
+    return TRUE;
+}
+#else
 BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user) {
     host_cpu_load_info_data_t li;
     mach_msg_type_number_t n = HOST_CPU_LOAD_INFO_COUNT;
@@ -588,6 +813,7 @@ BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user) {
     if (user) ft_set(user, t_user);
     return TRUE;
 }
+#endif
 BOOL GetProcessTimes(HANDLE p, FILETIME *creation, FILETIME *exit_, FILETIME *kernel, FILETIME *user) {
     (void)p;
     struct rusage ru;
@@ -598,6 +824,27 @@ BOOL GetProcessTimes(HANDLE p, FILETIME *creation, FILETIME *exit_, FILETIME *ke
     if (user) ft_set(user, (uint64_t)ru.ru_utime.tv_sec * 10000000ull + (uint64_t)ru.ru_utime.tv_usec * 10ull);
     return TRUE;
 }
+#ifdef __linux__
+BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb) {
+    (void)p; (void)cb;
+    unsigned long long rss = 0, hwm = 0, anon = 0, kb;
+    char line[256];
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return FALSE;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) rss = kb;
+        else if (sscanf(line, "VmHWM: %llu kB", &kb) == 1) hwm = kb;
+        else if (sscanf(line, "RssAnon: %llu kB", &kb) == 1) anon = kb;
+    }
+    fclose(f);
+    struct rusage ru;
+    pmc->PageFaultCount = getrusage(RUSAGE_SELF, &ru) ? 0 : (DWORD)(ru.ru_minflt + ru.ru_majflt);
+    pmc->WorkingSetSize = (SIZE_T)(rss << 10);
+    pmc->PeakWorkingSetSize = (SIZE_T)(hwm << 10);
+    pmc->PagefileUsage = pmc->PrivateUsage = (SIZE_T)(anon << 10);
+    return TRUE;
+}
+#else
 BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb) {
     (void)p; (void)cb;
     task_vm_info_data_t vi;
@@ -611,6 +858,7 @@ BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb) {
     pmc->PagefileUsage = pmc->PrivateUsage = (SIZE_T)vi.phys_footprint;
     return TRUE;
 }
+#endif
 
 /* ---------------------------------------------------------------- C runtime, strings */
 int recomp_putenv(const char *kv) {
@@ -830,7 +1078,11 @@ BOOL SetEndOfFile(HANDLE h) {
 BOOL FlushFileBuffers(HANDLE h) {
     FileObj *o = file_of(h);
     if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+#ifdef F_FULLFSYNC
     return !fcntl(o->fd, F_FULLFSYNC) || !fsync(o->fd) ? TRUE : fail_errno();
+#else
+    return !fsync(o->fd) ? TRUE : fail_errno();
+#endif
 }
 intptr_t _get_osfhandle(int fd) {
     static _Thread_local FileObj wrap[4];     /* a few at once, as FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f))) needs */
@@ -853,14 +1105,43 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
         char *sl = strrchr(dir, '/');
         if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
         int fd = open(dir, O_RDONLY);
+#ifdef F_FULLFSYNC
         if (fd >= 0) { fcntl(fd, F_FULLFSYNC); close(fd); }
+#else
+        if (fd >= 0) { fsync(fd); close(fd); }
+#endif
     }
     return TRUE;
 }
 BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
     PATH_ARG(a, from); PATH_ARG(b, to);
+#ifdef __APPLE__
     return !copyfile(a, b, NULL, COPYFILE_DATA | (fail_if_exists ? COPYFILE_EXCL : 0)) ? TRUE : fail_errno();
+#else
+    int in = open(a, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return fail_errno();
+    struct stat st;
+    int out = fstat(in, &st) ? -1 : open(b, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | (fail_if_exists ? O_EXCL : 0), st.st_mode & 0777);
+    if (out < 0) { int e = errno; close(in); errno = e; return fail_errno(); }
+    off_t left = st.st_size;
+    while (left > 0) {
+        ssize_t n = sendfile(out, in, NULL, (size_t)left);
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; int e = n ? errno : EIO; close(in); close(out); errno = e; return fail_errno(); }
+        left -= n;
+    }
+    close(in);
+    return !close(out) ? TRUE : fail_errno();
+#endif
 }
+#ifdef __APPLE__
+#define ST_BIRTH(st) (st).st_birthtimespec
+#define ST_ATIME(st) (st).st_atimespec
+#define ST_MTIME(st) (st).st_mtimespec
+#else
+#define ST_BIRTH(st) (st).st_ctim                    /* stat has no birth time on Linux: the change time stands in */
+#define ST_ATIME(st) (st).st_atim
+#define ST_MTIME(st) (st).st_mtim
+#endif
 static DWORD attrs_of(const struct stat *st, const char *name) {
     DWORD a = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
     if (!(st->st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
@@ -892,9 +1173,9 @@ BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, void *out) 
     WIN32_FILE_ATTRIBUTE_DATA *a = out;
     if (stat(p, &st)) return fail_errno();
     a->dwFileAttributes = attrs_of(&st, p);
-    ft_of_timespec(&a->ftCreationTime, st.st_birthtimespec);
-    ft_of_timespec(&a->ftLastAccessTime, st.st_atimespec);
-    ft_of_timespec(&a->ftLastWriteTime, st.st_mtimespec);
+    ft_of_timespec(&a->ftCreationTime, ST_BIRTH(st));
+    ft_of_timespec(&a->ftLastAccessTime, ST_ATIME(st));
+    ft_of_timespec(&a->ftLastWriteTime, ST_MTIME(st));
     a->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32); a->nFileSizeLow = (DWORD)st.st_size;
     return TRUE;
 }
@@ -936,9 +1217,9 @@ static int find_next(FindObj *o, WIN32_FIND_DATAA *fd) {
         memset(fd, 0, sizeof *fd);
         if (!stat(full, &st)) {
             fd->dwFileAttributes = attrs_of(&st, e->d_name);
-            ft_of_timespec(&fd->ftCreationTime, st.st_birthtimespec);
-            ft_of_timespec(&fd->ftLastAccessTime, st.st_atimespec);
-            ft_of_timespec(&fd->ftLastWriteTime, st.st_mtimespec);
+            ft_of_timespec(&fd->ftCreationTime, ST_BIRTH(st));
+            ft_of_timespec(&fd->ftLastAccessTime, ST_ATIME(st));
+            ft_of_timespec(&fd->ftLastWriteTime, ST_MTIME(st));
             fd->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32); fd->nFileSizeLow = (DWORD)st.st_size;
         }
         snprintf(fd->cFileName, sizeof fd->cFileName, "%s", e->d_name);
@@ -1065,12 +1346,21 @@ BOOL GetUserNameW(LPWSTR out, DWORD *n) {
 }
 BOOL SetEnvironmentVariableA(LPCSTR name, LPCSTR value) { return !(value ? setenv(name, value, 1) : unsetenv(name)); }
 DWORD GetCurrentProcessorNumber(void) {
+#ifdef __APPLE__
     size_t n = 0;
     return pthread_cpu_number_np(&n) ? 0 : (DWORD)n;
+#else
+    int c = sched_getcpu();
+    return c < 0 ? 0 : (DWORD)c;
+#endif
 }
 void GetSystemInfo(SYSTEM_INFO *si) {
     memset(si, 0, sizeof *si);
+#ifdef __aarch64__
     si->wProcessorArchitecture = 12;                      /* PROCESSOR_ARCHITECTURE_ARM64 */
+#else
+    si->wProcessorArchitecture = 9;                       /* PROCESSOR_ARCHITECTURE_AMD64 */
+#endif
     si->dwPageSize = si->dwAllocationGranularity = (DWORD)vm_page_size;
     si->dwNumberOfProcessors = (DWORD)sysconf(_SC_NPROCESSORS_ONLN);
     GetProcessAffinityMask(NULL, &si->dwActiveProcessorMask, &si->dwActiveProcessorMask);
@@ -1133,6 +1423,10 @@ HMODULE LoadLibraryW(LPCWSTR name) {
 FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
     Dl_info di;
     void *h = m;
+#ifdef __linux__
+    if (m && m == GetModuleHandleA(NULL)) h = dlopen(NULL, RTLD_LAZY);     /* the program (its symbols need -rdynamic) */
+    else
+#endif
     if (m && dladdr(m, &di) && di.dli_fbase == m && di.dli_fname) h = dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
     if (!h) h = RTLD_DEFAULT;
     return (FARPROC)dlsym(h, name);
@@ -1140,6 +1434,7 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
 BOOL FreeLibrary(HMODULE m) { return m && !dlclose(m); }
 
 /* ---------------------------------------------------------------- the keyboard */
+#ifdef __APPLE__
 int recomp_mac_keycode(int vk) {
     /* kVK_ANSI_A.. of HIToolbox/Events.h: the keys of the US layout's positions */
     static const signed char letters[26] = {0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E,
@@ -1158,19 +1453,48 @@ int recomp_mac_keycode(int vk) {
     default: return -1;
     }
 }
+#endif
 static int (*g_key_source)(int vk);
 void recomp_set_key_source(int (*down)(int vk)) { g_key_source = down; }
 SHORT GetAsyncKeyState(int vk) {
     if (g_key_source) return g_key_source(vk) ? (SHORT)0x8000 : 0;
+#ifdef __linux__
+    return 0;                                         /* no system-wide key state without a window: the display's only */
+#else
     int k = recomp_mac_keycode(vk);
     if (k < 0) return 0;
     int down = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)k);
     if (!down && (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU))   /* the right-hand modifier too, as Windows' generic code */
         down = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)(vk == VK_SHIFT ? 0x3C : vk == VK_CONTROL ? 0x3E : 0x3D));
     return down ? (SHORT)0x8000 : 0;
+#endif
 }
 
 /* ---------------------------------------------------------------- message boxes */
+#ifdef __linux__
+/* SDL3's message box when the program has SDL loaded (the game does; the tests do not), found at run time so the
+ * shim needs no SDL to link; otherwise the text on stderr and the default button. */
+typedef struct { uint32_t flags; int buttonID; const char *text; } RecompSdlButton;
+typedef struct { uint32_t flags; void *window; const char *title, *message; int numbuttons; const RecompSdlButton *buttons; const void *colors; } RecompSdlBox;
+int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {
+    (void)owner;
+    int yesno = (type & 0xf) == MB_YESNO, okcancel = (type & 0xf) == MB_OKCANCEL;
+    int first = yesno ? IDYES : IDOK, second = yesno ? IDNO : IDCANCEL;
+    bool (*show)(const RecompSdlBox *, int *) = (bool (*)(const RecompSdlBox *, int *))dlsym(RTLD_DEFAULT, "SDL_ShowMessageBox");
+    if (show && (getenv("DISPLAY") || getenv("WAYLAND_DISPLAY"))) {
+        RecompSdlButton b[2] = {{1u, first, yesno ? "Yes" : "OK"}, {2u, second, yesno ? "No" : "Cancel"}};   /* return / escape default */
+        uint32_t level = (type & 0xf0) == MB_ICONERROR ? 0x10u : (type & 0xf0) == MB_ICONWARNING ? 0x20u : 0x40u;
+        RecompSdlBox box = {level, NULL, caption ? caption : "", text ? text : "", yesno || okcancel ? 2 : 1, b, NULL};
+        int hit = first;
+        BLOCK_BEGIN();
+        bool ok = show(&box, &hit);
+        BLOCK_END();
+        return ok && hit >= 0 ? hit : first;
+    }
+    fprintf(stderr, "%s: %s\n", caption ? caption : "message", text ? text : "");
+    return first;
+}
+#else
 int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {
     (void)owner;
     CFStringRef t = CFStringCreateWithCString(NULL, text ? text : "", kCFStringEncodingUTF8);
@@ -1188,13 +1512,18 @@ int MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT type) {
     int first = r != 0 || (answer & 3) == kCFUserNotificationDefaultResponse;
     return yesno ? (first ? IDYES : IDNO) : okcancel ? (first ? IDOK : IDCANCEL) : IDOK;
 }
+#endif
 int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
     char t[4096], h[512];
     if (!WideCharToMultiByte(CP_UTF8, 0, text, -1, t, sizeof t, NULL, NULL)) t[0] = 0;
     if (!WideCharToMultiByte(CP_UTF8, 0, caption, -1, h, sizeof h, NULL, NULL)) h[0] = 0;
     return MessageBoxA(owner, t, h, type);
 }
+#ifdef __APPLE__
 BOOL MessageBeep(UINT type) { (void)type; AudioServicesPlayAlertSound(kSystemSoundID_UserPreferredAlert); return TRUE; }
+#else
+BOOL MessageBeep(UINT type) { (void)type; return TRUE; }
+#endif
 
 /* ---------------------------------------------------------------- __try / __except (1) */
 _Thread_local RecompTry *recomp_try_top;
@@ -1226,8 +1555,8 @@ void recomp_try_install(void) {
 }
 
 /* ---------------------------------------------------------------- frames
- * Every arm64 macOS binary keeps frame pointers (the platform ABI requires them): [fp] is the caller's fp, [fp + 8]
- * the return address. Reads go through host_try_read, so a broken chain ends the walk instead of faulting. */
+ * Every arm64 macOS binary keeps frame pointers (the platform ABI requires them), and the Linux build compiles with
+ * -fno-omit-frame-pointer: [fp] is the caller's fp, [fp + 8] the return address, on both. Reads go through host_try_read, so a broken chain ends the walk instead of faulting. */
 int host_frames_from(uint64_t pc, uint64_t lr, uint64_t fp, uint64_t *pcs, int max) {
     int n = 0;
     if (n < max) pcs[n++] = pc;
@@ -1247,6 +1576,15 @@ __attribute__((noinline)) int host_backtrace_here(uint64_t *pcs, int max) {
     if (!host_try_read((const void *)(uintptr_t)fp, rec, sizeof rec)) return 0;
     return host_frames_from(rec[1] & 0x0000ffffffffffffull, 0, rec[0], pcs, max);
 }
+#ifdef __linux__
+int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max) {
+    uint64_t pc, sp, fp;
+    if (SuspendThread(h) == (DWORD)-1) return 0;
+    int got = recomp_suspended_regs(&pc, &sp, &fp) ? host_frames_from(pc, 0, fp, pcs, max) : 0;
+    ResumeThread(h);
+    return got;
+}
+#else
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max) {
     Obj *o = obj_of(h);
     arm_thread_state64_t st;
@@ -1258,4 +1596,5 @@ int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max) {
     thread_resume(o->port);
     return got;
 }
+#endif
 #endif

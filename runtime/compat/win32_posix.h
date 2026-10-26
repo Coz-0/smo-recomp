@@ -1,4 +1,4 @@
-/* The Win32 calls the runtime uses, on macOS (POSIX and Mach), so the runtime's sources build unchanged there.
+/* The Win32 calls the runtime uses, on macOS (POSIX and Mach) and Linux (POSIX), so the runtime's sources build unchanged there.
  *
  * Included in place of <windows.h> on every system but Windows. Only what the runtime calls is here, with the
  * Windows meaning it relies on; a call outside that subset is a compile error, not a silent stub. What cannot be
@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include <os/lock.h>
+#include "posix_sync.h"
 #include <errno.h>
 #include <time.h>
 
@@ -108,7 +108,11 @@ int host_try_read(const void *p, void *out, size_t n);
 #define InterlockedCompareExchange(p, x, c) __sync_val_compare_and_swap((p), (c), (x))
 #define InterlockedCompareExchange64(p, x, c) __sync_val_compare_and_swap((p), (c), (x))
 #define InterlockedCompareExchangePointer(p, x, c) __sync_val_compare_and_swap((p), (c), (x))
+#if defined(__aarch64__)
 #define YieldProcessor() __builtin_arm_yield()
+#else
+#define YieldProcessor() __builtin_ia32_pause()
+#endif
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 /* ---- blocking: the waits below that really block (a contended lock, a wait not satisfied at once, a sleep) call these
@@ -445,6 +449,11 @@ void recomp_try_install(void);                        /* a handler that does onl
 
 /* ---- macOS only: a thread's frames, for the crash report and the samplers (pcs[0] = where it is) */
 int host_thread_backtrace(HANDLE h, uint64_t *pcs, int max);           /* suspends and resumes the thread */
+#ifdef __linux__
+/* ---- Linux only: any thread of the process by its kernel id (the samplers and the watchdog) */
+int host_tid_backtrace(DWORD tid, uint64_t *pcs, int max);              /* suspends and resumes the thread */
+int host_task_threads(DWORD *tids, ULONG64 *cpu, int max);              /* ids and CPU time (100 ns) from /proc/self/task */
+#endif
 int host_frames_from(uint64_t pc, uint64_t lr, uint64_t fp, uint64_t *pcs, int max);
 int host_backtrace_here(uint64_t *pcs, int max);                        /* the calling thread, from its caller up */
 

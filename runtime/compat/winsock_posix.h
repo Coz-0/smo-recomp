@@ -39,17 +39,62 @@ static inline int ioctlsocket(SOCKET s, unsigned long cmd, u_long *v) { int i = 
 #define InetPtonA inet_pton
 static inline int WSAPoll(WSAPOLLFD *fds, unsigned long n, int timeout) { return poll(fds, (nfds_t)n, timeout); }
 
+#ifdef SO_NOSIGPIPE
 static inline SOCKET ws_nosigpipe(SOCKET s) {
     if (s >= 0) { int one = 1; setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); }
     return s;
 }
+#else
+/* Linux has no SO_NOSIGPIPE: every send says MSG_NOSIGNAL instead */
+static inline SOCKET ws_nosigpipe(SOCKET s) { return s; }
+#define send(s, b, n, f) send((s), (b), (n), (f) | MSG_NOSIGNAL)
+#define sendto(s, b, n, f, a, l) sendto((s), (b), (n), (f) | MSG_NOSIGNAL, (a), (l))
+#endif
 /* Winsock's lengths are int; BSD's are socklen_t (unsigned): same size, so the pointers are passed as they are. */
 #define socket(af, type, proto) ws_nosigpipe(socket((af), (type), (proto)))
 #define accept(s, a, l) ws_nosigpipe(accept((s), (a), (socklen_t *)(l)))
 #define getpeername(s, a, l) getpeername((s), (a), (socklen_t *)(l))
 #define getsockname(s, a, l) getsockname((s), (a), (socklen_t *)(l))
 #define recvfrom(s, b, n, f, a, l) recvfrom((s), (b), (size_t)(n), (f), (a), (socklen_t *)(l))
+#ifdef __linux__
+/* Linux numbers the SOL_SOCKET options its own way; nnsocket.inc passes the BSD numbers the console, Winsock and macOS
+ * share (SO_REUSEADDR 4, SO_ERROR 0x1007, ...), and the time-outs as Winsock's DWORD milliseconds. */
+static inline int ws_sol_name(int name) {
+    switch (name) {
+    case 0x0001: return SO_DEBUG; case 0x0002: return SO_ACCEPTCONN; case 0x0004: return SO_REUSEADDR;
+    case 0x0008: return SO_KEEPALIVE; case 0x0010: return SO_DONTROUTE; case 0x0020: return SO_BROADCAST;
+    case 0x0080: return SO_LINGER; case 0x0100: return SO_OOBINLINE; case 0x0200: return SO_REUSEPORT;
+    case 0x1001: return SO_SNDBUF; case 0x1002: return SO_RCVBUF; case 0x1003: return SO_SNDLOWAT;
+    case 0x1004: return SO_RCVLOWAT; case 0x1005: return SO_SNDTIMEO; case 0x1006: return SO_RCVTIMEO;
+    case 0x1007: return SO_ERROR; case 0x1008: return SO_TYPE;
+    default: return name;                             /* a host constant already (SO_LINGER) */
+    }
+}
+static inline int ws_setsockopt(int s, int level, int name, const void *v, socklen_t len) {
+    if (level != SOL_SOCKET) return setsockopt(s, level, name, v, len);
+    if ((name == 0x1005 || name == 0x1006) && len == 4) {
+        unsigned ms = *(const unsigned *)v;
+        struct timeval tv = {(time_t)(ms / 1000), (suseconds_t)(ms % 1000) * 1000};
+        return setsockopt(s, level, ws_sol_name(name), &tv, sizeof tv);
+    }
+    return setsockopt(s, level, ws_sol_name(name), v, len);
+}
+static inline int ws_getsockopt(int s, int level, int name, void *v, socklen_t *len) {
+    if (level != SOL_SOCKET) return getsockopt(s, level, name, v, len);
+    if ((name == 0x1005 || name == 0x1006) && *len >= 4) {
+        struct timeval tv;
+        socklen_t tl = sizeof tv;
+        int r = getsockopt(s, level, ws_sol_name(name), &tv, &tl);
+        if (!r) { *(unsigned *)v = (unsigned)(tv.tv_sec * 1000 + tv.tv_usec / 1000); *len = 4; }
+        return r;
+    }
+    return getsockopt(s, level, ws_sol_name(name), v, len);
+}
+#define setsockopt(s, lv, nm, v, l) ws_setsockopt((s), (lv), (nm), (v), (socklen_t)(l))
+#define getsockopt(s, lv, nm, v, l) ws_getsockopt((s), (lv), (nm), (v), (socklen_t *)(l))
+#else
 #define getsockopt(s, lv, nm, v, l) getsockopt((s), (lv), (nm), (v), (socklen_t *)(l))
+#endif
 
 #define WSAEINTR EINTR
 #define WSAEBADF EBADF

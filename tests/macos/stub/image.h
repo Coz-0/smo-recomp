@@ -6,8 +6,13 @@
 #define SDK_VERSION 0u
 #define GAME_ELF_DEFAULT "main.elf"
 #define GAME_BUILD_ID "stub"
+#ifdef __APPLE__                                  /* hostrt.h's layout: 0x10_0000_0000 higher on macOS */
 #define GEN_GUEST_BASE 0x8100000000ULL
 #define GEN_SDK_BASE 0x8500000000ULL
+#else
+#define GEN_GUEST_BASE 0x7100000000ULL
+#define GEN_SDK_BASE 0x7500000000ULL
+#endif
 #define GUEST_FILE_IMAGE 0x10000ULL
 #define GUEST_IMAGE_SIZE 0x20000ULL
 #define GUEST_RO_END 0x9000ULL

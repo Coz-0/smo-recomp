@@ -5,14 +5,20 @@
 #include <unistd.h>
 
 static int g_fail, g_pass;
+/* hostrt.h's guest layout: the console's addresses on Linux, 0x10_0000_0000 higher on macOS */
+#ifdef __APPLE__
+#define G(a) (a)
+#else
+#define G(a) ((a) - 0x1000000000ull)
+#endif
 #define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 /* ---- the fixed guest ranges hostrt.c and sdklift_rt.c map */
 static void test_guest_ranges(void) {
     /* hostrt.h's macOS layout, inside the window hostrt.c reserves at load (0x7100000000.. on Windows collides with
      * macOS's malloc heap range in about half of all launches: measured, docs/macos-port.md) */
-    static const uint64_t bases[] = {0x8100000000ull, 0x8300000000ull, 0x8400000000ull, 0x8500000000ull};
-    CHECK(recomp_reserve_window(0x8100000000ull, 0x500000000ull), "reserve the guest window");
+    static const uint64_t bases[] = {G(0x8100000000ull), G(0x8300000000ull), G(0x8400000000ull), G(0x8500000000ull)};
+    CHECK(recomp_reserve_window(G(0x8100000000ull), 0x500000000ull), "reserve the guest window");
     for (int i = 0; i < 4; i++) {
         void *p = VirtualAlloc((void *)(uintptr_t)bases[i], 0x6000000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         CHECK(p == (void *)(uintptr_t)bases[i], "map at 0x%llx gave %p", (unsigned long long)bases[i], p);
@@ -21,7 +27,7 @@ static void test_guest_ranges(void) {
     CHECK(again == NULL, "a second map at a taken address must fail, got %p", again);
     void *outside = VirtualAlloc((void *)(uintptr_t)0x9000000000ull, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     CHECK(outside == (void *)(uintptr_t)0x9000000000ull, "a free fixed address outside the window maps too");
-    void *tmp = VirtualAlloc((void *)(uintptr_t)0x8200000000ull, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *tmp = VirtualAlloc((void *)(uintptr_t)G(0x8200000000ull), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     CHECK(tmp && VirtualFree(tmp, 0, MEM_RELEASE), "map and release inside the window");
     MEMORY_BASIC_INFORMATION wi;
     CHECK(VirtualQuery(tmp, &wi, sizeof wi) && wi.State == MEM_RESERVE, "released inside the window: reserved again, not free (0x%x)", wi.State);
@@ -29,7 +35,11 @@ static void test_guest_ranges(void) {
     CHECK(g[0x5fffff0] == 0, "fresh pages read zero");
     g[0x123] = 0x5a;
     size_t pg = recomp_page_size();
+#ifdef __APPLE__
     CHECK(pg == 0x4000, "host page is 16 KB on Apple silicon (got 0x%zx)", pg);
+#else
+    CHECK(pg == 0x1000, "host page is 4 KB on x86-64 Linux (got 0x%zx)", pg);
+#endif
     /* the image protection of hostrt.c: read-only up to a 4 KB boundary, rounded down to the host page */
     uint64_t ro_end = 0x4f16000ull & ~(uint64_t)(pg - 1);
     DWORD old = 0;
@@ -119,7 +129,7 @@ static void test_threads(void) {
     BOOL woke = SleepConditionVariableSRW(&g_cv, &g_srw, 50, 0);
     ReleaseSRWLockExclusive(&g_srw);
     ULONGLONG dt = GetTickCount64() - t0;
-    CHECK(!woke && dt >= 45 && dt < 500, "condition variable times out after 50 ms (woke %d after %llu ms)", woke, dt);
+    CHECK(!woke && dt >= 45 && dt < 500, "condition variable times out after 50 ms (woke %d after %llu ms)", woke, (unsigned long long)dt);
 
     HANDLE w = CreateThread(NULL, 0, waker, NULL, 0, NULL);
     AcquireSRWLockExclusive(&g_srw);
@@ -329,8 +339,10 @@ static void test_strings_and_misc(void) {
     static int rw = 5;
     char full[512];
     CHECK(_fullpath(full, "/Users\\x/./a/../b\\c", sizeof full) && !strcmp(full, "\\Users\\x\\b\\c"), "_fullpath resolves . and .. (%s)", full);
+#ifdef __APPLE__
     CHECK(recomp_mac_keycode('A') == 0x00 && recomp_mac_keycode(VK_RETURN) == 0x24 && recomp_mac_keycode(VK_F1 + 11) == 0x6F && recomp_mac_keycode(0x5D) == -1,
           "virtual keys to macOS key codes");
+#endif
     CHECK(IsBadWritePtr((void *)&ro, sizeof ro) && !IsBadWritePtr(&rw, sizeof rw) && !IsBadReadPtr(&ro, sizeof ro) && IsBadReadPtr((void *)(uintptr_t)8, 4),
           "IsBadReadPtr / IsBadWritePtr");
     SYSTEMTIME st;
