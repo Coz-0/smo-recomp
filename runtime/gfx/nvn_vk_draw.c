@@ -299,7 +299,18 @@ static uint64_t g_occ_total;                       /* samples of the count the r
 static int g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % g_occ_cap)); g_occ_open = 0; } }
-static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
+/* pass ends counted by the source line that asked (SMO_VK_FRAMELOG: the nvn_vk_frame line lists the busiest): where a
+ * frame's passes are split by this file rather than by the game's own target changes */
+static struct { int line; long long n; } g_pe[16]; static int g_pe_n;
+static long long g_retarget_same;             /* target sets equal to the current targets: the pass went on */
+static void pass_end_r(int line) {
+    if (!R.in_pass) return;
+    occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot();
+    int i; for (i = 0; i < g_pe_n && g_pe[i].line != line; i++) {}
+    if (i == g_pe_n && g_pe_n < 16) { g_pe[g_pe_n].line = line; g_pe[g_pe_n++].n = 0; }
+    if (i < 16) g_pe[i].n++;
+}
+#define pass_end() pass_end_r(__LINE__)
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
@@ -602,7 +613,23 @@ static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkIma
     b.srcAccessMask = layout_access(from); b.dstAccessMask = layout_access(to); b.oldLayout = from; b.newLayout = to;
     vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
+static int general_layouts(void) {               /* every image stays in VK_IMAGE_LAYOUT_GENERAL after its first use. Metal has no layouts, so on
+                                                  * Vulkan-over-Metal a transition only costs the pass it ends (13 of 102 a frame; measured: 102 -> 89
+                                                  * passes, 25.8 -> 23.3 ms of GPU a frame walking in Cap Kingdom, M4 / KosmicKrisp). Default on macOS;
+                                                  * SMO_VK_GENERAL=0/1 overrides (off on Windows: NVIDIA's optimal layouts are worth their transitions) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_VK_GENERAL");
+#ifdef __APPLE__
+        on = e && e[0] ? atoi(e) : 1;
+#else
+        on = e && e[0] ? atoi(e) : 0;
+#endif
+    }
+    return on;
+}
+#define LAYOUT(vt, x) (general_layouts() ? (vt)->layout : (x))      /* the layout a command names for a VTex image: its own under SMO_VK_GENERAL */
 static void vt_layout(VTex *vt, VkImageLayout to) {
+    if (general_layouts() && to != VK_IMAGE_LAYOUT_UNDEFINED) to = VK_IMAGE_LAYOUT_GENERAL;
     if (vt->layout == to) return;
     pass_end();
     cmd_begin();
@@ -875,14 +902,14 @@ static void rs_upload(VTex *vt, int level, int layer, uint64_t off, uint32_t row
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
     vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(R.cmd, R.ring, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    vkCmdCopyBufferToImage(R.cmd, R.ring, tmp->img, LAYOUT(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &c);
     vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1;
     b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.dstSubresource.mipLevel = (uint32_t)level; b.dstSubresource.baseArrayLayer = (uint32_t)layer; b.dstSubresource.layerCount = 1;
     b.srcOffsets[1].x = w; b.srcOffsets[1].y = h; b.srcOffsets[1].z = 1;
     b.dstOffsets[0].x = rs_edge(x, vt->sx, lw); b.dstOffsets[0].y = rs_edge(y, vt->sy, lh); b.dstOffsets[1].x = rs_edge(x + w, vt->sx, lw); b.dstOffsets[1].y = rs_edge(y + h, vt->sy, lh); b.dstOffsets[1].z = 1;
     if (b.dstOffsets[1].x <= b.dstOffsets[0].x || b.dstOffsets[1].y <= b.dstOffsets[0].y) return;
-    vkCmdBlitImage(R.cmd, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, rs_filter(vt));
+    vkCmdBlitImage(R.cmd, tmp->img, LAYOUT(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &b, rs_filter(vt));
     g_rs_up++;
 }
 static VTex *g_put_vt;
@@ -918,7 +945,7 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)layer; c.imageSubresource.layerCount = 1;
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = (uint32_t)(vt->is3d ? d : 1);
     if (!vt->is3d && (uint32_t)layer >= (uint32_t)vt->layers) return;
-    vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &c);
     R.upload_bytes += (LONG64)size;
 }
 /* The image of a texture: made at first use, and holding what the guest memory holds (unless the GPU wrote it). */
@@ -1006,8 +1033,8 @@ static VTex *vt_get2(Tex *t, int sync) {
             VkImageSubresourceRange sr = {vt->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             if (vt->samples == 1) {
-                if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
-                else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
+                if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &z, 1, &sr); }
+                else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &z, 1, &sr); }
             }
         }
     }
@@ -1816,6 +1843,9 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
 static void compute_pipe_make(VStage *v);
 static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uint32_t gy, uint32_t gz);
 static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
+    static int off = -1;                           /* SMO_VK_NOCOMPUTE=1 (measurement only): no compute dispatch runs; the picture is wrong where they feed it */
+    if (off < 0) off = getenv("SMO_VK_NOCOMPUTE") && atoi(getenv("SMO_VK_NOCOMPUTE"));
+    if (off) return;
     Prog *p = R.prog[5];
     static int nlog;
     R.dispatches++;
@@ -2363,7 +2393,7 @@ static void write_region(Tex *t, const View *vp, const int *r, const void *data,
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)layer; c.imageSubresource.layerCount = 1;
     c.imageOffset.x = r[0]; c.imageOffset.y = r[1]; c.imageOffset.z = vt->is3d ? r[2] : 0;
     c.imageExtent.width = (uint32_t)r[3]; c.imageExtent.height = (uint32_t)r[4]; c.imageExtent.depth = (uint32_t)(vt->is3d ? depth : 1);
-    vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &c);
     t->gpu_written = 1; t->uploaded = 1;
 }
 static void copy_buf_tex(const Cmd *m) {
@@ -2418,13 +2448,13 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
         if (b.srcOffsets[1].x > lw) { b.srcOffsets[0].x = lw - 1; b.srcOffsets[1].x = lw; } if (b.srcOffsets[1].y > lh) { b.srcOffsets[0].y = lh - 1; b.srcOffsets[1].y = lh; }
         b.dstOffsets[1].x = r[3]; b.dstOffsets[1].y = r[4]; b.dstOffsets[1].z = 1;
         vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, rs_filter(vt));
+        vkCmdBlitImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), tmp->img, LAYOUT(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &b, rs_filter(vt));
         vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         c.imageSubresource.mipLevel = 0; c.imageSubresource.baseArrayLayer = 0; c.imageSubresource.layerCount = 1; c.imageOffset.x = c.imageOffset.y = c.imageOffset.z = 0;
-        vkCmdCopyImageToBuffer(R.cmd, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+        vkCmdCopyImageToBuffer(R.cmd, tmp->img, LAYOUT(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), buf, 1, &c);
         g_rs_down++;
     } else
-    vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    vkCmdCopyImageToBuffer(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
     memcpy(out, mem.map, (size_t)size);
@@ -2491,7 +2521,7 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
     /* a copy within one texture (another level or layer of it, e.g. a mip chain made level by level) goes through the
      * GENERAL layout, with a barrier so that it reads what the copy before it wrote; the same level and layer is refused */
     int same = vs == vd;
-    VkImageLayout sl = same ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dl = same ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageLayout sl = same || general_layouts() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dl = same || general_layouts() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     pass_end(); cmd_begin();
     if (same) {
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -2682,6 +2712,26 @@ static void exec(const Cmd *m, int depth) {
     case OP_TARGETS: {
         const TargetRef *col = (const TargetRef *)blob, *dep = col + 8;
         int n = (int)a[0] < 8 ? (int)a[0] : 8;
+        {   /* the same targets again (the game sets them before most of its draw groups): the pass goes on. About 80 of a
+             * walking frame's 105 pass ends were target sets, and a pass costs ~0.1-0.2 ms of GPU time on Vulkan-over-Metal
+             * whatever its size (tests/macos/vk_pass_cost.c). SMO_VK_RETARGET=1 ends the pass as before. */
+            static int always = -1;
+            if (always < 0) always = getenv("SMO_VK_RETARGET") && atoi(getenv("SMO_VK_RETARGET"));
+            int same = R.in_pass && !always;
+            int nn = 0;
+            for (int i = 0; i < n && same; i++) {
+                const TargetRef *t = col[i].tex && !col[i].tex->dead ? &col[i] : NULL;
+                if (t) nn = i + 1;
+                if ((t != NULL) != (i < R.ncol && R.col[i].tex != NULL)) same = 0;
+                else if (t && memcmp(t, &R.col[i], sizeof *t)) same = 0;
+            }
+            if (same && nn != R.ncol) same = 0;
+            if (same) {
+                int d = dep->tex && !dep->tex->dead;
+                if (d != (R.depth.tex != NULL) || (d && memcmp(dep, &R.depth, sizeof *dep))) same = 0;
+            }
+            if (same) { g_retarget_same++; break; }
+        }
         pass_end();
         for (int i = 0; i < R.ncol; i++) if (R.col[i].tex && R.col[i].tex->vk) ((VTex *)R.col[i].tex->vk)->feedback = 0;
         if (R.depth.tex && R.depth.tex->vk) ((VTex *)R.depth.tex->vk)->feedback = 0;
@@ -2896,7 +2946,7 @@ static void exec(const Cmd *m, int depth) {
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 1, (uint32_t)(vt->is3d ? 0 : layer), 1};
         VkClearColorValue cv;
         memcpy(&cv, blob + 48, 16);
-        vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &sr);
+        vkCmdClearColorImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &cv, 1, &sr);
         t->gpu_written = 1; t->uploaded = 1;
         break;
     }
@@ -2977,7 +3027,7 @@ static void save_bmp_vk(const char *path, VTex *vt) {
         vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         memset(&c, 0, sizeof c);
         c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1; c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
-        vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+        vkCmdCopyImageToBuffer(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), buf, 1, &c);
         if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
         cmd_wait_all();
         FILE *f = fopen(path, "wb");
@@ -3335,7 +3385,7 @@ static int ashot_take(VTex *vt, const char *path) {             /* 1: the copy i
     pass_end(); cmd_begin();
     VkImageLayout was = vt->layout;
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ashot[i].buf, 1, &c);
+    vkCmdCopyImageToBuffer(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), g_ashot[i].buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     g_ashot[i].w = w; g_ashot[i].h = h;
     g_ashot[i].bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;
@@ -3500,7 +3550,7 @@ swap: ;
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
             b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + s4[2]; b.srcOffsets[1].y = s4[1] + s4[3]; b.srcOffsets[1].z = 1;
             b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
-            vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+            vkCmdBlitImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         overlay_draw(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -3586,6 +3636,10 @@ swap: ;
         if (lo >= 0 && frame >= lo && frame <= hi)
             printf("nvn_vk_frame: %lld draws %lld skipped %lld (render off %lld) conditional %lld (off %lld) passes %lld texture barriers %lld vertex over-reads %lld ring wraps %lld streamed %lld KB condhash %016llx\n", (long long)frame, (long long)R.frame_draws,
                    (long long)R.frame_skipped, (long long)g_fr_offskip, (long long)g_fr_cond, (long long)g_fr_condoff, (long long)g_fr_passes, (long long)g_fr_texbar, (long long)g_fr_vtxover, (long long)g_fr_wraps, (long long)(g_ring_bytes - g_fr_ring0) >> 10, (unsigned long long)g_fr_condhash);
+        {   char buf[256] = ""; int k = 0;
+            for (int i = 0; i < g_pe_n; i++) { if (g_pe[i].n) k += snprintf(buf + k, sizeof buf - (size_t)k, " L%d:%lld", g_pe[i].line, g_pe[i].n); g_pe[i].n = 0; }
+            printf("nvn_vk_frame: pass ends by source line:%s | target sets that kept the pass %lld\n", k ? buf : " none", g_retarget_same); g_retarget_same = 0;
+        }
         g_fr_cond = g_fr_condoff = g_fr_offskip = g_fr_passes = g_fr_texbar = g_fr_wraps = g_fr_vtxover = 0; g_fr_ring0 = g_ring_bytes; g_fr_condhash = 1469598103934665603ull;
     }
     R.frame_draws = R.frame_skipped = R.frame_clears = 0;
@@ -3609,7 +3663,7 @@ static VTex *dummy_image(VkImageType type, uint32_t layers, VkFlags flags) {
     VKC(vkBindImageMemory(V.device, vt->img, vt->mem.mem, vt->mem.off));
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&z, 0, sizeof z);
-    vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr);
+    vkCmdClearColorImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &z, 1, &sr);
     vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     vt->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = vt; g_vtex_all = vt;
     return vt;
