@@ -10,6 +10,10 @@ import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION = '1.4.1'                                       # the game version this project builds
+# The display versions in control.nacp of the two updates that carry this program: the update of content version 6
+# (393216) says 1.4.1; an earlier one says 1.3.0 with the same main, build id b424be15... (issue #5), and the same ExeFS
+# and RomFS byte for byte (issue #3). Either is accepted; everything the build reads is the same.
+DISPLAY_VERSIONS = ('1.4.1', '1.3.0')
 BUILD = os.path.join(REPO, 'build')
 DUMP = os.path.join(BUILD, 'dump', 'update')
 RUNTIME = os.path.join(REPO, 'runtime')

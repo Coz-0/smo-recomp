@@ -53,8 +53,8 @@ build needs the game as the 1.4.1 update leaves it, in one folder laid out like 
   game functions the runtime needs are found in it by what they are and do (`tools/lifter/gen_tables.py`). A dump
   folder laid out for older builds may still hold the base game's ExeFS as `exefs-1.0.0\`: it is ignored.
 - **Checks:** the import reads the program id from `main.npdm`, the NintendoSDK version `main` was built with (7.3.2)
-  and the display version in `control.nacp` (1.4.1), and looks for the RomFS's own folders. A missing or wrong piece is
-  named.
+  and the display version in `control.nacp` (1.4.1, or 1.3.0: an earlier update carries the same program and RomFS
+  and says 1.3.0 there), and looks for the RomFS's own folders. A missing or wrong piece is named.
 - **Read in place:** `build\romfs` and `build\manual` become directory junctions to your dump's folders (the RomFS is
   about 5.7 GB), so keep the dump where it is. Only the executable modules are converted, into `build\dump`.
 - **Fonts:** the game draws with the console's shared fonts in one place met so far, the map screen's legend and its
