@@ -222,15 +222,15 @@ BOOL TryAcquireSRWLockExclusive(SRWLOCK *l) { return os_unfair_lock_trylock(&l->
 void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs); }
 void DeleteCriticalSection(CRITICAL_SECTION *cs) { (void)cs; }
 void EnterCriticalSection(CRITICAL_SECTION *cs) {
-    DWORD me = GetCurrentThreadId();
-    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
+    DWORD me = GetCurrentThreadId();                      /* never 0 (thread_start); 0 means free below */
+    if (me && (DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return; }
     lock_slow(&cs->l);
     __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
 }
 BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
     DWORD me = GetCurrentThreadId();
-    if ((DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
+    if (me && (DWORD)(uintptr_t)__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->depth++; return TRUE; }
     if (!os_unfair_lock_trylock(&cs->l)) return FALSE;
     __atomic_store_n(&cs->OwningThread, (HANDLE)(uintptr_t)me, __ATOMIC_RELAXED);
     cs->depth = 1;
@@ -350,10 +350,22 @@ static Obj *self_obj(void) {
 static void *thread_start(void *p) {
     Obj *o = p;
     t_self = o;
+    /* The thread's own id, before anything else runs on it. CreateThread also stores it after pthread_create, but
+     * the thread can be here first: it then saw 0 as its id, and EnterCriticalSection's owner check (OwningThread 0 =
+     * free, equal to "me" 0) took a free lock for its own and only counted the depth; the later Leave unlocked an
+     * os_unfair_lock the thread had never taken (_os_unfair_lock_unowned_abort, found with the pipeline workers at
+     * start-up). */
+    o->port = pthread_mach_thread_np(pthread_self());
+    /* A signal stack of this thread's own: the crash handler (hostrt.c, SA_ONSTACK) can then report a stack overflow
+     * on this thread too. Without it the handler ran on the overflowed stack, faulted again and the process ended
+     * with _exit(4) and nothing in the log. sigaltstack is per thread; the boot thread has its own in hostrt.c. */
+    stack_t ss = {.ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0};
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
     pthread_mutex_lock(&o->m);
     while (o->gate) pthread_cond_wait(&o->cv, &o->m);
     pthread_mutex_unlock(&o->m);
     o->fn(o->arg);
+    if (ss.ss_sp) { stack_t off = {.ss_flags = SS_DISABLE}; sigaltstack(&off, NULL); free(ss.ss_sp); }
     pthread_mutex_lock(&o->m);
     o->signalled = 1;
     pthread_cond_broadcast(&o->cv);
@@ -371,7 +383,11 @@ HANDLE CreateThread(void *sec, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID a
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    if (stack) pthread_attr_setstacksize(&at, page_up(stack));
+    /* Windows gives a thread made with size 0 the program's reserve (1 MB by default, committed as used); macOS's
+     * pthread default is 512 KB. 8 MB here (pages are mapped as touched, so an unused reserve costs nothing): the
+     * shader compiler's SPIR-V post-processing recurses once per block of a shader's flow graph, and a pipeline
+     * worker overflowed 512 KB on one of the game's shaders right after the mode select (found on macOS). */
+    pthread_attr_setstacksize(&at, page_up(stack ? stack : (SIZE_T)8 << 20));
     int r = pthread_create(&o->thread, &at, thread_start, o);
     pthread_attr_destroy(&at);
     if (r) { free(o); return NULL; }

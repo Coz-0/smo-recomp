@@ -290,6 +290,7 @@ static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_
 #define OCC_Q 4096
 typedef struct { uint64_t lo, hi, dst, serial; LONG64 frame; int kind, log; } OccEntry;     /* segments [lo, hi); kind 0 report (to dst), 1 reset (the segments are dropped), 2 fold (added up, nothing written) */
 static VkQueryPool g_occ_pool;
+static uint32_t g_occ_cap = OCC_MAX;             /* queries in the pool: OCC_MAX, or less where the driver refuses that many (occ_pool) */
 static int g_occ_on, g_occ_open;                   /* counting; a segment is open */
 static uint64_t g_occ_head, g_occ_tail, g_occ_mark, g_occ_seg_serial;   /* next segment; oldest segment in use; first segment of no entry yet; submission of the newest segment */
 static OccEntry g_occ_q[OCC_Q];
@@ -297,7 +298,7 @@ static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queu
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
 static int g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
-static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
+static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % g_occ_cap)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
@@ -647,58 +648,62 @@ static void vtx_switches(void) {
  * built at -O1, which does not vectorize): one index at a time it was 7% of the render thread in Cascade Kingdom, about
  * 1.2 ms a frame. Unsigned maxima: bytes directly, 16- and 32-bit indices with the top bit flipped compared as signed;
  * a restart index counts as 0. */
+static int g_idx_restart;                         /* the indices of the draw being prepared hold a restart index (all ones): index_max */
 static uint32_t index_max(uint64_t addr, int count, unsigned t) {
-    static struct { uint64_t addr; uint32_t gen, maxi; int n; uint8_t t, rs; } c[2048];
+    static struct { uint64_t addr; uint32_t gen, maxi; int n; uint8_t t, rs, has_rs; } c[2048];
     unsigned h = (unsigned)(((addr >> 1) ^ (uint64_t)count * 0x9E3779B1u) * 2654435761u) >> 21;
-    if (c[h].addr == addr && c[h].n == count && c[h].t == (uint8_t)t && c[h].gen == R.gen && c[h].rs == (uint8_t)R.restart) return c[h].maxi;
+    if (c[h].addr == addr && c[h].n == count && c[h].t == (uint8_t)t && c[h].gen == R.gen && c[h].rs == (uint8_t)R.restart) { g_idx_restart = c[h].has_rs; return c[h].maxi; }
     const uint8_t *src = P(addr);
-    uint32_t mx = 0;
+    uint32_t mx = 0, has_rs = 0;                   /* has_rs: an index of all ones was seen (a restart index when restart is on) */
     int k = 0, per = 16 >> t;                      /* indices in 16 bytes */
 #if defined(__aarch64__) || defined(_M_ARM64)
     /* AArch64: NEON has unsigned maxima and a maximum across the vector, so no sign flip; a restart index is cleared
      * (BIC with the lanes equal to all ones) so it counts as 0, as below */
     (void)per;
     if (t == 0) {
-        uint8x16_t m = vdupq_n_u8(0), all = vdupq_n_u8(0xff);
-        for (; k + 16 <= count; k += 16) { uint8x16_t v = vld1q_u8(src + k); if (R.restart) v = vbicq_u8(v, vceqq_u8(v, all)); m = vmaxq_u8(m, v); }
-        mx = vmaxvq_u8(m);
+        uint8x16_t m = vdupq_n_u8(0), all = vdupq_n_u8(0xff), any = m;
+        for (; k + 16 <= count; k += 16) { uint8x16_t v = vld1q_u8(src + k), eq = vceqq_u8(v, all); any = vorrq_u8(any, eq); if (R.restart) v = vbicq_u8(v, eq); m = vmaxq_u8(m, v); }
+        mx = vmaxvq_u8(m); has_rs = vmaxvq_u8(any) != 0;
     } else if (t == 1) {
-        uint16x8_t m = vdupq_n_u16(0), all = vdupq_n_u16(0xffff);
-        for (; k + 8 <= count; k += 8) { uint16x8_t v = vld1q_u16((const uint16_t *)(src + 2 * (size_t)k)); if (R.restart) v = vbicq_u16(v, vceqq_u16(v, all)); m = vmaxq_u16(m, v); }
-        mx = vmaxvq_u16(m);
+        uint16x8_t m = vdupq_n_u16(0), all = vdupq_n_u16(0xffff), any = m;
+        for (; k + 8 <= count; k += 8) { uint16x8_t v = vld1q_u16((const uint16_t *)(src + 2 * (size_t)k)), eq = vceqq_u16(v, all); any = vorrq_u16(any, eq); if (R.restart) v = vbicq_u16(v, eq); m = vmaxq_u16(m, v); }
+        mx = vmaxvq_u16(m); has_rs = vmaxvq_u16(any) != 0;
     } else {
-        uint32x4_t m = vdupq_n_u32(0), all = vdupq_n_u32(0xffffffffu);
-        for (; k + 4 <= count; k += 4) { uint32x4_t v = vld1q_u32((const uint32_t *)(src + 4 * (size_t)k)); if (R.restart) v = vbicq_u32(v, vceqq_u32(v, all)); m = vmaxq_u32(m, v); }
-        mx = vmaxvq_u32(m);
+        uint32x4_t m = vdupq_n_u32(0), all = vdupq_n_u32(0xffffffffu), any = m;
+        for (; k + 4 <= count; k += 4) { uint32x4_t v = vld1q_u32((const uint32_t *)(src + 4 * (size_t)k)), eq = vceqq_u32(v, all); any = vorrq_u32(any, eq); if (R.restart) v = vbicq_u32(v, eq); m = vmaxq_u32(m, v); }
+        mx = vmaxvq_u32(m); has_rs = vmaxvq_u32(any) != 0;
     }
 #else
-    __m128i ones = _mm_set1_epi8(-1), rs = R.restart ? ones : _mm_setzero_si128();
+    __m128i ones = _mm_set1_epi8(-1), rs = R.restart ? ones : _mm_setzero_si128(), any = _mm_setzero_si128();
     if (t == 0) {
         __m128i m = _mm_setzero_si128();
-        for (; k + 16 <= count; k += 16) { __m128i v = _mm_loadu_si128((const __m128i *)(src + k)); m = _mm_max_epu8(m, _mm_andnot_si128(_mm_and_si128(_mm_cmpeq_epi8(v, ones), rs), v)); }
+        for (; k + 16 <= count; k += 16) { __m128i v = _mm_loadu_si128((const __m128i *)(src + k)), eq = _mm_cmpeq_epi8(v, ones); any = _mm_or_si128(any, eq); m = _mm_max_epu8(m, _mm_andnot_si128(_mm_and_si128(eq, rs), v)); }
         uint8_t b[16]; _mm_storeu_si128((__m128i *)b, m);
         for (int i = 0; i < per; i++) if (b[i] > mx) mx = b[i];
     } else if (t == 1) {
         __m128i flip = _mm_set1_epi16((short)0x8000), m = flip;
-        for (; k + 8 <= count; k += 8) { __m128i v = _mm_loadu_si128((const __m128i *)(src + 2 * (size_t)k)); m = _mm_max_epi16(m, _mm_xor_si128(_mm_andnot_si128(_mm_and_si128(_mm_cmpeq_epi16(v, ones), rs), v), flip)); }
+        for (; k + 8 <= count; k += 8) { __m128i v = _mm_loadu_si128((const __m128i *)(src + 2 * (size_t)k)), eq = _mm_cmpeq_epi16(v, ones); any = _mm_or_si128(any, eq); m = _mm_max_epi16(m, _mm_xor_si128(_mm_andnot_si128(_mm_and_si128(eq, rs), v), flip)); }
         uint16_t b[8]; _mm_storeu_si128((__m128i *)b, _mm_xor_si128(m, flip));
         for (int i = 0; i < per; i++) if (b[i] > mx) mx = b[i];
     } else {
         __m128i flip = _mm_set1_epi32((int)0x80000000u), m = flip;
         for (; k + 4 <= count; k += 4) {
-            __m128i v = _mm_loadu_si128((const __m128i *)(src + 4 * (size_t)k));
-            v = _mm_xor_si128(_mm_andnot_si128(_mm_and_si128(_mm_cmpeq_epi32(v, ones), rs), v), flip);
+            __m128i v = _mm_loadu_si128((const __m128i *)(src + 4 * (size_t)k)), eq = _mm_cmpeq_epi32(v, ones);
+            any = _mm_or_si128(any, eq);
+            v = _mm_xor_si128(_mm_andnot_si128(_mm_and_si128(eq, rs), v), flip);
             __m128i gt = _mm_cmpgt_epi32(v, m);
             m = _mm_or_si128(_mm_and_si128(gt, v), _mm_andnot_si128(gt, m));
         }
         uint32_t b[4]; _mm_storeu_si128((__m128i *)b, _mm_xor_si128(m, flip));
         for (int i = 0; i < per; i++) if (b[i] > mx) mx = b[i];
     }
+    has_rs = _mm_movemask_epi8(any) != 0;
 #endif
-    if (t == 0) { for (; k < count; k++) { uint32_t v = src[k]; if (v > mx && !(R.restart && v == 0xFFu)) mx = v; } }
-    else if (t == 1) { const uint16_t *p16 = (const uint16_t *)src; for (; k < count; k++) { uint32_t v = p16[k]; if (v > mx && !(R.restart && v == 0xFFFFu)) mx = v; } }
-    else { const uint32_t *p32 = (const uint32_t *)src; for (; k < count; k++) { uint32_t v = p32[k]; if (v > mx && !(R.restart && v == 0xFFFFFFFFu)) mx = v; } }
-    c[h].addr = addr; c[h].n = count; c[h].t = (uint8_t)t; c[h].gen = R.gen; c[h].rs = (uint8_t)R.restart; c[h].maxi = mx;
+    if (t == 0) { for (; k < count; k++) { uint32_t v = src[k]; if (v == 0xFFu) has_rs = 1; if (v > mx && !(R.restart && v == 0xFFu)) mx = v; } }
+    else if (t == 1) { const uint16_t *p16 = (const uint16_t *)src; for (; k < count; k++) { uint32_t v = p16[k]; if (v == 0xFFFFu) has_rs = 1; if (v > mx && !(R.restart && v == 0xFFFFu)) mx = v; } }
+    else { const uint32_t *p32 = (const uint32_t *)src; for (; k < count; k++) { uint32_t v = p32[k]; if (v == 0xFFFFFFFFu) has_rs = 1; if (v > mx && !(R.restart && v == 0xFFFFFFFFu)) mx = v; } }
+    c[h].addr = addr; c[h].n = count; c[h].t = (uint8_t)t; c[h].gen = R.gen; c[h].rs = (uint8_t)R.restart; c[h].maxi = mx; c[h].has_rs = (uint8_t)has_rs;
+    g_idx_restart = (int)has_rs;
     g_imax_scans++;
     return mx;
 }
@@ -1564,9 +1569,21 @@ static void occ_pool(void) {
     if (g_occ_pool) return;
     if (!D.f12.hostQueryReset) nvn_vk_missing("occlusion counters on a GPU without hostQueryReset");
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = OCC_MAX;
-    VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool));
-    vkResetQueryPool(V.device, g_occ_pool, 0, OCC_MAX);
+    qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+    /* A driver may refuse a pool this large: KosmicKrisp (Vulkan on Metal) answers VK_ERROR_OUT_OF_DEVICE_MEMORY for
+     * 65536 occlusion queries (Metal's visibility result buffer is bounded), with plenty of memory left. Then half as
+     * many, down to 4096: the ring is a modulus of g_occ_cap, and occ_fold makes room when half of it is in use. */
+    VkResult qr = VK_SUCCESS, refused = VK_SUCCESS;
+    for (g_occ_cap = OCC_MAX; g_occ_cap >= 4096; g_occ_cap /= 2) {
+        qi.queryCount = g_occ_cap;
+        qr = vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool);
+        if (qr == VK_SUCCESS) break;
+        if (refused == VK_SUCCESS) refused = qr;
+        g_occ_pool = VK_NULL_HANDLE;
+    }
+    if (qr != VK_SUCCESS) { g_occ_cap = OCC_MAX; qi.queryCount = OCC_MAX; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool)); }   /* the usual report and stop */
+    if (g_occ_cap != OCC_MAX) printf("nvn_vk: occlusion query pool of %u queries (the driver refused %u: %s)\n", g_occ_cap, OCC_MAX, vk_result_name(refused));
+    vkResetQueryPool(V.device, g_occ_pool, 0, g_occ_cap);
     g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
     g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
 }
@@ -1631,11 +1648,11 @@ static void gs_dbg_read(int after) {
 }
 static void occ_draw(void) {                       /* after draw_prepare, inside a pass */
     if (!g_occ_on || g_occ_open || !R.in_pass) return;
-    if (g_occ_head - g_occ_tail >= OCC_MAX) {      /* full within one batch (occ_fold makes room between batches) */
-        nvn_vk_missing("more than 65536 occlusion count segments waiting for the GPU within one batch");
+    if (g_occ_head - g_occ_tail >= g_occ_cap) {    /* full within one batch (occ_fold makes room between batches) */
+        nvn_vk_missing("more occlusion count segments waiting for the GPU within one batch than the query pool holds");
         return;
     }
-    vkCmdBeginQuery(R.cmd, g_occ_pool, (uint32_t)(g_occ_head % OCC_MAX), D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);   /* NVN counts samples */
+    vkCmdBeginQuery(R.cmd, g_occ_pool, (uint32_t)(g_occ_head % g_occ_cap), D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);   /* NVN counts samples */
     g_occ_head++;
     g_occ_seg_serial = R.serial + 1;               /* the number the command buffer being recorded will get */
     g_occ_open = 1;
@@ -1656,8 +1673,8 @@ static int occ_done(uint64_t serial, int wait) {
 static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
     static uint64_t res[OCC_MAX];
     while (lo < hi) {
-        uint32_t first = (uint32_t)(lo % OCC_MAX);
-        uint32_t n = hi - lo < (uint64_t)(OCC_MAX - first) ? (uint32_t)(hi - lo) : OCC_MAX - first;
+        uint32_t first = (uint32_t)(lo % g_occ_cap);
+        uint32_t n = hi - lo < (uint64_t)(g_occ_cap - first) ? (uint32_t)(hi - lo) : g_occ_cap - first;
         if (sum) {
             VKC(vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 8, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             for (uint32_t i = 0; i < n; i++) *sum += res[i];
@@ -1702,9 +1719,9 @@ static void occ_push(int kind, uint64_t dst) {     /* queues an entry for the se
  * batch, when half of the ring is in use, its segments so far are added up into the count (a fold entry) and the GPU is
  * waited for. Segments of a count that was reset without a report are dropped by the reset's entry. */
 static void occ_fold(void) {
-    if (!g_occ_pool || g_occ_head - g_occ_tail < OCC_MAX / 2) return;
+    if (!g_occ_pool || g_occ_head - g_occ_tail < g_occ_cap / 2) return;
     occ_resolve(0);
-    if (g_occ_head - g_occ_tail < OCC_MAX / 2) return;
+    if (g_occ_head - g_occ_tail < g_occ_cap / 2) return;
     if (g_occ_head > g_occ_mark) { occ_push(2, 0); g_occ_folds++; }
     occ_resolve(g_occ_qn);
 }
@@ -2161,7 +2178,16 @@ static int draw_prepare(unsigned prim) {
     if (D.has_eds3 && (R.dyn3_dirty || R.dyn3_samples != k.samples)) { set_dynamic_state3(k.samples); R.dyn3_dirty = 0; }
     if (gs && g_gs_dbg_fs) { vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); R.dyn_dirty = 1; }      /* SMO_VK_GS_DEBUG=3 (gs_pipe_get) */
     vkCmdSetPrimitiveTopology(R.cmd, (VkPrimitiveTopology)topo[prim]);
-    vkCmdSetPrimitiveRestartEnable(R.cmd, R.restart && (D.has_plr || prim == 3 || prim == 5 || prim == 6));
+    /* Primitive restart: always as asked for strips and fans. For lists (VK_EXT_primitive_topology_list_restart) only
+     * when the draw's indices hold a restart index (index_max saw one): the game asks for restart on nearly every
+     * draw, and on Metal (KosmicKrisp) list restart has no native form, so the driver rewrote the indices of every
+     * such draw: 55 ms of GPU time a frame for 290 draws in Cap Kingdom's opening, 20 ms without (M4, 2026-10-25).
+     * SMO_VK_LIST_RESTART=1: as asked, always (the old behaviour); 0: never for lists. */
+    static int list_restart = -1;
+    if (list_restart < 0) { const char *e = getenv("SMO_VK_LIST_RESTART"); list_restart = e && e[0] ? atoi(e) : 2; }
+    int strip = prim == 3 || prim == 5 || prim == 6;
+    int lists = D.has_plr && (list_restart == 1 || (list_restart == 2 && g_idx_restart));
+    vkCmdSetPrimitiveRestartEnable(R.cmd, R.restart && (strip || lists));
     /* 4. vertex input (nvn_vk_vlayout.c) */
     {
         VkVertexInputBindingDescription2EXT bd[17];
@@ -2555,6 +2581,7 @@ static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_
     if (indices && g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
     if (indices) { int64_t mv = (int64_t)index_max(indices, (int)count, t) + base_vertex; vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
     else vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0);
+    g_idx_restart = indices != 0;                  /* quads: the index scan above saw them; without indices there is nothing to restart */
     { LONG64 t0 = tk(); int ok = draw_prepare(4 /* NVN_DRAW_PRIMITIVE_TRIANGLES */); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     vkCmdBindIndexBuffer(R.cmd, R.ring, off, VK_INDEX_TYPE_UINT32);
     occ_draw();
@@ -2568,6 +2595,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     if (gsr) gs_dbg_read(0);
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
+    g_idx_restart = 0;                             /* no indices: nothing to restart */
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     occ_draw();
     if (R.prog[2]) gsq_begin();

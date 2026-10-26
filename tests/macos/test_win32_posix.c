@@ -403,12 +403,48 @@ static void test_condvar(void) {
     DeleteCriticalSection(&g_cv_cs);
 }
 
+/* ---- a new thread's id is its own from its first instruction (CreateThread used to store it after pthread_create, and
+ * a thread that ran first saw 0: EnterCriticalSection then took a free lock as its own by the owner check alone) */
+static CRITICAL_SECTION g_race_cs;
+static volatile LONG g_race_zero_ids, g_race_counter;
+static DWORD WINAPI race_thread(LPVOID arg) {
+    (void)arg;
+    if (GetCurrentThreadId() == 0) InterlockedIncrement(&g_race_zero_ids);
+    for (int i = 0; i < 200; i++) { EnterCriticalSection(&g_race_cs); g_race_counter++; LeaveCriticalSection(&g_race_cs); }
+    return 0;
+}
+static void test_thread_id_from_start(void) {
+    InitializeCriticalSection(&g_race_cs);
+    for (int round = 0; round < 20; round++) {
+        HANDLE hs[16];
+        for (int i = 0; i < 16; i++) hs[i] = CreateThread(NULL, 0, race_thread, NULL, 0, NULL);
+        for (int i = 0; i < 16; i++) { WaitForSingleObject(hs[i], INFINITE); CloseHandle(hs[i]); }
+    }
+    CHECK(g_race_zero_ids == 0, "%ld thread(s) saw their own id as 0 at start", (long)g_race_zero_ids);
+    CHECK(g_race_counter == 20 * 16 * 200, "the critical section kept the count exact (%ld of %d)", (long)g_race_counter, 20 * 16 * 200);
+    DeleteCriticalSection(&g_race_cs);
+}
+
+/* ---- a thread made with stack size 0 has room to recurse as on Windows (the shader compiler recurses per basic
+ * block; macOS's pthread default of 512 KB overflowed on one of the game's shaders) */
+static volatile int g_deep_sink;
+static int deep(int n) { volatile char frame[64 << 10]; frame[0] = (char)n; frame[sizeof frame - 1] = 1; g_deep_sink += frame[0]; return n ? deep(n - 1) + frame[sizeof frame - 1] : 0; }
+static DWORD WINAPI deep_thread(LPVOID arg) { *(int *)arg = deep(64) == 64; return 0; }      /* 64 frames of 64 KB: 4 MB of stack */
+static void test_thread_stack(void) {
+    int ok = 0;
+    HANDLE h = CreateThread(NULL, 0, deep_thread, &ok, 0, NULL);
+    CHECK(h && WaitForSingleObject(h, 10000) == WAIT_OBJECT_0 && ok, "a thread with the default stack recursed 4 MB deep (%d)", ok);
+    if (h) CloseHandle(h);
+}
+
 int main(void) {
     test_guest_ranges();
     test_reserve_commit_query();
     test_interlocked();
     test_threads();
     test_condvar();
+    test_thread_id_from_start();
+    test_thread_stack();
     test_misc();
     test_files();
     test_strings_and_misc();
