@@ -54,6 +54,8 @@ The end of every log has the counts that tell whether a run was healthy:
   the instructions of a dump.
 - `SMO_MX_NOSTRUCT=1` translates with the old `switch(pc)` control flow instead of structured blocks;
   `SMO_MX_MUTATE=1` plants a known bug, to check that the equivalence harness catches it.
+- `SMO_MX_NO_IPA_FOLD=1` keeps the `* gl_FragCoord.w * (1 / w)` of every perspective varying read in fragment stages
+  (`fold_ipa_w` in `mx_translate.c` drops it where the register surely holds `1 / w`).
 - Equivalence harness: `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of vk_prog_*.bin> [max]`.
 - `tests\check_all_shaders.py` takes every shader stage out of the game's shader archives (agl `.sharcb`, g3d `.bfsha`,
   the effect `.ptcl`, nested archives, `main` and `sdk`) into `build\shaders_all`, translates each with the Vulkan back

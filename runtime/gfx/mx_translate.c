@@ -1741,6 +1741,63 @@ static const char *const k_prelude =
     "  if (kind == 3u) return uint(int(clamp(f, -32768.0, 32767.0)));\n"
     "  return uint(clamp(f, 0.0, 65535.0)); }\n";
 
+/* IPA "multiply" by 1 / w undoes the * w of IPA "pass": every read of a perspective varying is emitted as
+ * f = attr; f *= gl_FragCoord.w; f *= F(rK) with rK = 1.0 / gl_FragCoord[3] (the shader's MUFU.RCP of the position's
+ * IPA), two multiplies the driver cannot fold (w * (1 / w) is not 1 in floats). Measured over the game's 20,436
+ * fragment stages: 262,424 such reads in 19,091 of them. Both multiplies are dropped where rK surely holds 1 / w: within
+ * one run of unconditional instruction lines (each emitted as "{ ... }"; any other line is control flow or predicated
+ * and forgets everything), after a line that set rK to the reciprocal of a register set to gl_FragCoord[3], and before
+ * the next write of rK. The varying is then the value Vulkan interpolated, as on the console up to rounding; the same
+ * fold as Savage Wind's glsl_fold_ipa_w (-8 % ACO instructions there). */
+static int fold_reg_after(const char *p, const char *pre) {       /* "<pre>rN" at p: N, else -1 */
+    size_t n = strlen(pre);
+    if (strncmp(p, pre, n)) return -1;
+    p += n;
+    if (*p != 'r' || p[1] < '0' || p[1] > '9') return -1;
+    return atoi(p + 1);
+}
+static void fold_ipa_w(char *s, size_t *len) {
+    unsigned char st[256];                                    /* 0 unknown, 1 gl_FragCoord.w, 2 1 / gl_FragCoord.w */
+    memset(st, 0, sizeof st);
+    char *w = s;
+    for (char *line = s; *line;) {
+        char *eol = strchr(line, '\n');
+        size_t n = eol ? (size_t)(eol - line + 1) : strlen(line);
+        char *start = w;
+        memmove(w, line, n); w += n;
+        line += n;
+        if (start[0] != '{') { memset(st, 0, sizeof st); continue; }
+        start[w - start - (start[w - start - 1] == '\n')] = 0;  /* the line as a string while it is looked at */
+        int set = -1, kind = 0, k;
+        if ((k = fold_reg_after(start, "{ float f = F(U(gl_FragCoord[3])); ")) >= 0) { set = k; kind = 1; }
+        else if (!strncmp(start, "{ float f = (1.0 / (F(r", 23)) {
+            int src = atoi(start + 23);
+            const char *q = strstr(start, "))); ");
+            if (q && (k = fold_reg_after(q, "))); ")) >= 0 && src < 256 && st[src] == 1) { set = k; kind = 2; }
+        }
+        for (char *m = start; (m = strstr(m, "f *= gl_FragCoord.w; f *= F(r"));) {
+            int r = atoi(m + 29);
+            char *close = strchr(m + 29, ')');
+            if (r < 256 && st[r] == 2 && close && close[1] == ';') {
+                size_t cut = (size_t)(close + 2 - m) + (close[2] == ' ');
+                memmove(m, m + cut, strlen(m + cut) + 1);
+            } else m++;
+        }
+        for (char *m = start; (m = strstr(m, " r"));) {          /* every register this line writes: "rN = " */
+            m += 2;
+            if (*m < '0' || *m > '9') continue;
+            int r = atoi(m);
+            while (*m >= '0' && *m <= '9') m++;
+            if (m[0] == ' ' && m[1] == '=' && m[2] != '=' && r < 256) st[r] = r == set ? (unsigned char)kind : 0;
+        }
+        size_t keep = strlen(start);
+        w = start + keep;
+        if (eol) *w++ = '\n';
+    }
+    *w = 0;
+    *len = (size_t)(w - s);
+}
+
 int mx_translate(const MxIn *in, MxOut *out) {
     Mx *e = calloc(1, sizeof *e);
     char *res = NULL;
@@ -1824,6 +1881,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         goto done;
     }
 
+    if (in->stage == MX_FRAGMENT && in->target == 1 && e->s && !getenv("SMO_MX_NO_IPA_FOLD")) fold_ipa_w(e->s, &e->len);
     /* assemble: header, declarations, helpers, main */
     {
         Mx h;
