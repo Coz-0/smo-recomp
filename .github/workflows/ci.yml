@@ -1,0 +1,31 @@
+name: ci
+
+# Checks that need no game dump: every tool, script and test compiles; the runtime's fast paths equal the plain code
+# they replaced (tests/check_fast_paths.py, with the runner's clang instead of clang 9); scripts/run.py's limit on
+# test games running at once (tests/check_game_places.py, starts no game).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      LLVM_ROOT: C:\Program Files\LLVM
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Every tool, script and test compiles
+        run: python -m compileall -q tools scripts tests
+      - name: tests/check_fast_paths.py
+        run: python tests/check_fast_paths.py
+      - name: tests/check_game_places.py
+        run: python tests/check_game_places.py
