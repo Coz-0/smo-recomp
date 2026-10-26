@@ -290,6 +290,7 @@ static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_
 #define OCC_Q 4096
 typedef struct { uint64_t lo, hi, dst, serial; LONG64 frame; int kind, log; } OccEntry;     /* segments [lo, hi); kind 0 report (to dst), 1 reset (the segments are dropped), 2 fold (added up, nothing written) */
 static VkQueryPool g_occ_pool;
+static uint32_t g_occ_cap = OCC_MAX;             /* queries in the pool: OCC_MAX, or less where the driver refuses that many (occ_pool) */
 static int g_occ_on, g_occ_open;                   /* counting; a segment is open */
 static uint64_t g_occ_head, g_occ_tail, g_occ_mark, g_occ_seg_serial;   /* next segment; oldest segment in use; first segment of no entry yet; submission of the newest segment */
 static OccEntry g_occ_q[OCC_Q];
@@ -297,7 +298,7 @@ static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queu
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
 static int g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
-static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
+static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % g_occ_cap)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
@@ -1564,9 +1565,21 @@ static void occ_pool(void) {
     if (g_occ_pool) return;
     if (!D.f12.hostQueryReset) nvn_vk_missing("occlusion counters on a GPU without hostQueryReset");
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = OCC_MAX;
-    VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool));
-    vkResetQueryPool(V.device, g_occ_pool, 0, OCC_MAX);
+    qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+    /* A driver may refuse a pool this large: KosmicKrisp (Vulkan on Metal) answers VK_ERROR_OUT_OF_DEVICE_MEMORY for
+     * 65536 occlusion queries (Metal's visibility result buffer is bounded), with plenty of memory left. Then half as
+     * many, down to 4096: the ring is a modulus of g_occ_cap, and occ_fold makes room when half of it is in use. */
+    VkResult qr = VK_SUCCESS, refused = VK_SUCCESS;
+    for (g_occ_cap = OCC_MAX; g_occ_cap >= 4096; g_occ_cap /= 2) {
+        qi.queryCount = g_occ_cap;
+        qr = vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool);
+        if (qr == VK_SUCCESS) break;
+        if (refused == VK_SUCCESS) refused = qr;
+        g_occ_pool = VK_NULL_HANDLE;
+    }
+    if (qr != VK_SUCCESS) { g_occ_cap = OCC_MAX; qi.queryCount = OCC_MAX; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool)); }   /* the usual report and stop */
+    if (g_occ_cap != OCC_MAX) printf("nvn_vk: occlusion query pool of %u queries (the driver refused %u: %s)\n", g_occ_cap, OCC_MAX, vk_result_name(refused));
+    vkResetQueryPool(V.device, g_occ_pool, 0, g_occ_cap);
     g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
     g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
 }
@@ -1631,11 +1644,11 @@ static void gs_dbg_read(int after) {
 }
 static void occ_draw(void) {                       /* after draw_prepare, inside a pass */
     if (!g_occ_on || g_occ_open || !R.in_pass) return;
-    if (g_occ_head - g_occ_tail >= OCC_MAX) {      /* full within one batch (occ_fold makes room between batches) */
-        nvn_vk_missing("more than 65536 occlusion count segments waiting for the GPU within one batch");
+    if (g_occ_head - g_occ_tail >= g_occ_cap) {    /* full within one batch (occ_fold makes room between batches) */
+        nvn_vk_missing("more occlusion count segments waiting for the GPU within one batch than the query pool holds");
         return;
     }
-    vkCmdBeginQuery(R.cmd, g_occ_pool, (uint32_t)(g_occ_head % OCC_MAX), D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);   /* NVN counts samples */
+    vkCmdBeginQuery(R.cmd, g_occ_pool, (uint32_t)(g_occ_head % g_occ_cap), D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);   /* NVN counts samples */
     g_occ_head++;
     g_occ_seg_serial = R.serial + 1;               /* the number the command buffer being recorded will get */
     g_occ_open = 1;
@@ -1656,8 +1669,8 @@ static int occ_done(uint64_t serial, int wait) {
 static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
     static uint64_t res[OCC_MAX];
     while (lo < hi) {
-        uint32_t first = (uint32_t)(lo % OCC_MAX);
-        uint32_t n = hi - lo < (uint64_t)(OCC_MAX - first) ? (uint32_t)(hi - lo) : OCC_MAX - first;
+        uint32_t first = (uint32_t)(lo % g_occ_cap);
+        uint32_t n = hi - lo < (uint64_t)(g_occ_cap - first) ? (uint32_t)(hi - lo) : g_occ_cap - first;
         if (sum) {
             VKC(vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 8, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             for (uint32_t i = 0; i < n; i++) *sum += res[i];
@@ -1702,9 +1715,9 @@ static void occ_push(int kind, uint64_t dst) {     /* queues an entry for the se
  * batch, when half of the ring is in use, its segments so far are added up into the count (a fold entry) and the GPU is
  * waited for. Segments of a count that was reset without a report are dropped by the reset's entry. */
 static void occ_fold(void) {
-    if (!g_occ_pool || g_occ_head - g_occ_tail < OCC_MAX / 2) return;
+    if (!g_occ_pool || g_occ_head - g_occ_tail < g_occ_cap / 2) return;
     occ_resolve(0);
-    if (g_occ_head - g_occ_tail < OCC_MAX / 2) return;
+    if (g_occ_head - g_occ_tail < g_occ_cap / 2) return;
     if (g_occ_head > g_occ_mark) { occ_push(2, 0); g_occ_folds++; }
     occ_resolve(g_occ_qn);
 }
