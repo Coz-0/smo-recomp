@@ -1424,6 +1424,9 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 static void prewarm_start(void) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
+    /* CreateDirectory makes one level: build/cache first, which nothing else makes on the Vulkan renderer (the OpenGL
+     * one did), else a fresh build never keeps its stages, SPIR-V or pipeline cache and every start is a first run */
+    if (!getenv("SMO_VK_CACHE")) CreateDirectoryA("../cache", NULL);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("smo_glslang.dll");
