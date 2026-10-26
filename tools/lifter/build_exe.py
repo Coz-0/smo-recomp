@@ -9,6 +9,9 @@ its header and WebView2Loader.dll, for the Help page in the game window), Vulkan
 Vulkan SDK's Include folder), clang 9 (LLVM_ROOT).
 Host files are recompiled when they or any runtime header / generated file changed. Prints every compiler error.
 
+Linux (docs/linux-port.md): build/bin/libsmo_game.so and build/bin/smo_native, with the system's clang, SDL3, Vulkan
+headers, shaderc, FreeType, FFmpeg and OpenSSL; no WebView2 (Help opens in the web browser).
+
 macOS (docs/macos-port.md): build/bin/libsmo_game.dylib and build/bin/smo_native, with Apple clang; SDL3 from Homebrew
 (or SDL3_ROOT), the Vulkan SDK from ~/VulkanSDK (or VULKAN_SDK); no WebView2. The program finds the game library next to
 itself (@executable_path).
@@ -53,7 +56,7 @@ GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing'] + T.runtime_includes() + ['-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
-              '-I', SDL3_INC, '-I', VKH] + ([] if T.MAC else ['-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')])
+              '-I', SDL3_INC, '-I', VKH] + ([] if T.POSIX else ['-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')])
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32']
 if T.MAC:
     HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
@@ -61,6 +64,12 @@ if T.MAC:
     HOST_SOURCES['services'] = HOST_SOURCES['services'] + ['nnmovie_av.m']      # nnmovie_mf.c's reader on AVFoundation
     HOST_SOURCES['game'] = HOST_SOURCES['game'] + ['smo_guide_mac.m']           # the Help in the game window (WKWebView)
     LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
+if T.LINUX:
+    HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
+    HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
+    HOST_SOURCES['services'] = HOST_SOURCES['services'] + ['nnmovie_ff.c']      # nnmovie_mf.c's reader on FFmpeg
+    HOST_FLAGS += T.LINUX_CFLAGS
+    LIBS = T.LINUX_LIBS
 
 
 def fresh_output(path):
@@ -72,7 +81,7 @@ def fresh_output(path):
 
 def build_game_dll(force):
     dll = os.path.join(BIN, T.GAME_LIB)
-    lib = dll if T.MAC else dll[:-4] + '.lib'           # macOS: the program links the dylib itself
+    lib = dll if T.POSIX else dll[:-4] + '.lib'         # macOS, Linux: the program links the library itself
     shim = T.runtime('core', 'game_shim.c')
     objs = sorted(glob.glob(os.path.join(OBJ_GAME, '*' + T.OBJ_EXT)))
     if not objs:
@@ -86,6 +95,8 @@ def build_game_dll(force):
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     t0 = time.time()
     mac = ['-Wl,-install_name,@rpath/' + T.GAME_LIB] if T.MAC else []       # found next to the program (@executable_path)
+    if T.LINUX:     # calls inside the library bind to it at link time (no interposition), as they do in a DLL
+        mac = ['-fPIC', '-fuse-ld=lld', '-Wl,--no-dependent-libraries', '-Wl,-Bsymbolic', '-Wl,-soname,' + T.GAME_LIB] + T.LINUX_CFLAGS
     fresh_output(dll)
     r = subprocess.run([CLANG, '-dynamiclib' if T.MAC else '-shared', '-O1', '-w'] + T.runtime_includes() + ['-I', LIFT] + mac
                        + [shim, '@' + rsp, '-o', dll], capture_output=True, text=True)
@@ -138,6 +149,9 @@ def main():
     if T.MAC:
         cmd = [CLANG] + objs + [os.path.join(BIN, T.GAME_LIB), '-Wl,-rpath,@executable_path'] + LIBS \
             + ['-Wl,-map,' + os.path.splitext(out)[0] + '.map', '-o', out]
+    elif T.LINUX:   # -rdynamic: the game library and the shim's GetProcAddress find the program's own functions
+        cmd = [CLANG, '-fuse-ld=lld', '-rdynamic', '-Wl,--no-dependent-libraries'] + objs + [os.path.join(BIN, T.GAME_LIB), "-Wl,-rpath,$ORIGIN"] + LIBS \
+            + ['-Wl,-Map,' + out + '.map', '-o', out]
     else:
         cmd = [CLANG] + objs + [os.path.join(BIN, 'smo_game.lib'), os.path.join(SDL3_LIB, 'SDL3.lib')] \
             + LIBS + ['-Xlinker', '/MAP:' + out[:-4] + '.map', '-o', out]
@@ -146,7 +160,7 @@ def main():
     if r.returncode:
         print((r.stdout + r.stderr)[-8000:])
         return 1
-    if not T.MAC:
+    if not T.POSIX:
         copy_if_changed(os.path.join(SDL3_LIB, 'SDL3.dll'), os.path.join(BIN, 'SDL3.dll'))
         copy_if_changed(os.path.join(WEBVIEW2, 'build', 'native', 'x64', 'WebView2Loader.dll'), os.path.join(BIN, 'WebView2Loader.dll'))
     print('linked %s (%.1f MB)' % (out, os.path.getsize(out) / 2 ** 20))
@@ -164,17 +178,20 @@ def build_shader_shim():
     """smo_glslang.dll from runtime/gfx/vk_shaderc_shim.c (see its header for why not glslang's static libraries), plus the
     Vulkan SDK's shaderc_shared.dll beside it; then a self-test: one vertex shader must compile to SPIR-V."""
     import ctypes
-    dll = os.path.join(BIN, 'libsmo_glslang.dylib' if T.MAC else 'smo_glslang.dll')
+    dll = os.path.join(BIN, T.SHADER_LIB)
     src = T.runtime('gfx', 'vk_shaderc_shim.c')
     if not os.path.exists(dll) or os.path.getmtime(dll) < os.path.getmtime(src):
         fresh_output(dll)
         mac = T.runtime_includes() + ['-Wl,-install_name,@rpath/libsmo_glslang.dylib', T.runtime('compat', 'win32_posix.c')] \
-            + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)] if T.MAC else []
+            + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)] if T.MAC else \
+            T.runtime_includes() + T.LINUX_CFLAGS + ['-fPIC', T.runtime('compat', 'win32_posix.c'), '-ldl', '-lpthread'] if T.LINUX else []
         r = subprocess.run([CLANG, '-dynamiclib' if T.MAC else '-shared', '-O1', '-w'] + mac + [src, '-o', dll], capture_output=True, text=True)
         if r.returncode:
             print((r.stdout + r.stderr)[-3000:])
             return 1
-    if T.MAC:
+    if T.LINUX:
+        pass                                            # the system's libshaderc_shared.so.1, found by the loader
+    elif T.MAC:
         sdk_lib = os.path.join(T.vulkan_sdk(), 'lib', 'libshaderc_shared.1.dylib')
         if os.path.exists(sdk_lib):
             copy_if_changed(sdk_lib, os.path.join(BIN, 'libshaderc_shared.1.dylib'))

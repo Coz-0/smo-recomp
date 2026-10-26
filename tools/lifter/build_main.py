@@ -33,6 +33,8 @@ EXTRA = ['-ffp-contract=off']
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 BASE_FLAGS = ['-w', '-fno-strict-aliasing', '-I', RUNTIME, '-I', GEN]
+if T.LINUX:                                       # the objects go into a shared library (libsmo_game.so)
+    BASE_FLAGS += ['-fPIC']
 DEF = re.compile(r'^(?:static )?void (\w+)\((Ctx \*c(?:, uint64_t rp)?)\) \{$')
 
 
@@ -73,7 +75,7 @@ def run_limited(cmd, limit):
         out, _ = p.communicate(timeout=limit)
         return p.returncode, out.decode('latin-1')[-3000:], time.time() - t
     except subprocess.TimeoutExpired:
-        if T.MAC:
+        if T.POSIX:
             p.kill()
         else:
             subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)

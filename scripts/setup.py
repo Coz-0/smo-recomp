@@ -64,6 +64,13 @@ def check_deps(a):
         clang = shutil.which(T.clang()) or ''
         tools = (('Apple clang (xcode-select --install)', clang), ('Vulkan SDK (~/VulkanSDK or VULKAN_SDK)', vkh),
                  ('SDL3 (brew install sdl3, or SDL3_ROOT)', os.path.join(T.sdl3()[0], 'SDL3', 'SDL.h')))
+    elif T.LINUX:                                     # docs/linux-port.md: the distribution's packages
+        import shutil
+        clang = shutil.which(T.clang()) or ''
+        tools = (('clang and lld (clang, lld)', clang), ('lld', shutil.which('ld.lld') or ''), ('Vulkan headers (vulkan-headers)', vkh),
+                 ('SDL3 (sdl3)', os.path.join(T.sdl3()[0], 'SDL3', 'SDL.h')), ('shaderc (shaderc)', '/usr/include/shaderc/shaderc.h'),
+                 ('FreeType (freetype2)', '/usr/include/freetype2/ft2build.h'), ('FFmpeg (ffmpeg)', '/usr/include/libavformat/avformat.h'),
+                 ('OpenSSL (openssl)', '/usr/include/openssl/md5.h'))
     else:
         clang = T.clang()
         sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')

@@ -11,6 +11,9 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION = '1.3.0'                                       # the game version this project builds
+# The display versions in control.nacp of the updates that carry this program: content version 4 (262144) says 1.3.0,
+# content version 6 (393216) says 1.4.1; their ExeFS and RomFS are byte-identical (issue #3), only the version string differs.
+DISPLAY_VERSIONS = ('1.3.0', '1.4.1')
 BUILD = os.environ.get('SMO_BUILD_DIR') or os.path.join(REPO, 'build')     # SMO_BUILD_DIR: a build folder elsewhere (tests)
 DUMP = os.path.join(BUILD, 'dump', 'update')
 RUNTIME = os.path.join(REPO, 'runtime')
@@ -20,6 +23,8 @@ RUNTIME_DIRS = ['core', 'libc', 'os', 'fs', 'gfx', 'audio', 'input', 'services',
 # checks they agree). On Windows at the console's own addresses; on macOS 0x10_0000_0000 higher, because macOS keeps
 # 0x70_0000_0000..0x80_0000_0000 for malloc's heap range (docs/macos-port.md).
 MAC = sys.platform == 'darwin'
+LINUX = sys.platform.startswith('linux')
+POSIX = MAC or LINUX                                    # the runtime's Win32 calls come from runtime/compat
 LAYOUT_SHIFT = 0x1000000000 if MAC else 0
 GUEST_BASE = 0x7100000000 + LAYOUT_SHIFT
 SDK_BASE = 0x7500000000 + LAYOUT_SHIFT
@@ -31,22 +36,25 @@ def runtime(folder, name):
 
 
 def runtime_includes():
-    """clang -I arguments for every runtime folder (the runtime's files include each other by bare name); on macOS also
-    runtime/compat, the Win32 calls of the runtime on POSIX and Mach (docs/macos-port.md)."""
-    dirs = RUNTIME_DIRS + (['compat'] if MAC else [])
+    """clang -I arguments for every runtime folder (the runtime's files include each other by bare name); on macOS and
+    Linux also runtime/compat, the Win32 calls of the runtime on POSIX (docs/macos-port.md, docs/linux-port.md)."""
+    dirs = RUNTIME_DIRS + (['compat'] if POSIX else [])
     return [arg for d in dirs for arg in ('-I', os.path.join(RUNTIME, d))]
 
 
-# ---- the toolchain and file names of this system (Windows: clang 9 and the MSVC linker; macOS: Apple clang)
-OBJ_EXT = '.o' if MAC else '.obj'
-EXE = 'smo_native' if MAC else 'smo_native.exe'          # the program a person plays (scripts/run.py copies it)
-GAME_LIB = 'libsmo_game.dylib' if MAC else 'smo_game.dll'  # the lifted game (build_exe.py)
+# ---- the toolchain and file names of this system (Windows: clang 9 and the MSVC linker; macOS: Apple clang; Linux: the
+# system's clang and lld)
+OBJ_EXT = '.o' if POSIX else '.obj'
+EXE = 'smo_native' if POSIX else 'smo_native.exe'        # the program a person plays (scripts/run.py copies it)
+GAME_LIB = 'libsmo_game.dylib' if MAC else 'libsmo_game.so' if LINUX else 'smo_game.dll'  # the lifted game (build_exe.py)
+SHADER_LIB = 'libsmo_glslang.dylib' if MAC else 'libsmo_glslang.so' if LINUX else 'smo_glslang.dll'
 
 
 def clang():
-    """The C compiler: LLVM_ROOT's clang when set; else clang 9 in C:/llvm-9.0.0 on Windows, Apple clang on macOS."""
+    """The C compiler: LLVM_ROOT's clang when set; else clang 9 in C:/llvm-9.0.0 on Windows, Apple clang on macOS, the
+    system's clang on Linux."""
     root = os.environ.get('LLVM_ROOT')
-    if MAC:
+    if POSIX:
         return os.path.join(root, 'bin', 'clang') if root else 'clang'
     return os.path.join(root or 'C:/llvm-9.0.0', 'bin', 'clang.exe')
 
@@ -56,6 +64,8 @@ def vulkan_sdk():
     import glob
     if os.environ.get('VULKAN_SDK'):
         return os.environ['VULKAN_SDK']
+    if LINUX:
+        return ''                                       # Linux: the system's Vulkan headers and loader (no SDK needed)
     if MAC:
         return next(iter(sorted(glob.glob(os.path.expanduser('~/VulkanSDK/*/macOS')))[-1:]), '')
     return next(iter(sorted(glob.glob('C:/VulkanSDK/*'))[-1:]), '')
@@ -65,6 +75,8 @@ def vulkan_headers():
     """The folder holding vulkan/vulkan.h (VULKAN_HEADERS wins), or ''."""
     if os.environ.get('VULKAN_HEADERS'):
         return os.environ['VULKAN_HEADERS']
+    if LINUX and not os.environ.get('VULKAN_SDK'):
+        return '/usr/include' if os.path.exists('/usr/include/vulkan/vulkan.h') else ''
     sdk = vulkan_sdk()
     return os.path.join(sdk, 'include' if MAC else 'Include') if sdk else ''
 
@@ -72,6 +84,9 @@ def vulkan_headers():
 def sdl3():
     """SDL3 3.4.x: SDL3_ROOT, else deps/SDL3-3.4.18 on Windows and Homebrew's on macOS: (include folder, library folder)."""
     root = os.environ.get('SDL3_ROOT')
+    if LINUX:
+        root = root or '/usr'
+        return os.path.join(root, 'include'), os.path.join(root, 'lib')
     if MAC:
         root = root or '/opt/homebrew/opt/sdl3'
         return os.path.join(root, 'include'), os.path.join(root, 'lib')
@@ -79,6 +94,10 @@ def sdl3():
     return os.path.join(root, 'include'), os.path.join(root, 'lib', 'x64')
 
 
+# what the host runtime links against on Linux: SDL3, FreeType (fonts), FFmpeg (movies), OpenSSL's libcrypto (MD5, SHA-1)
+LINUX_LIBS = ['-lSDL3', '-lfreetype', '-lavformat', '-lavcodec', '-lswscale', '-lswresample', '-lavutil', '-lcrypto',
+              '-lpthread', '-ldl', '-lm']
+LINUX_CFLAGS = ['-D_GNU_SOURCE', '-fno-omit-frame-pointer', '-I/usr/include/freetype2']   # frame pointers: host stacks in crash reports
 # what the host runtime links against on macOS (its Win32 calls come from runtime/compat/win32_posix.c)
 MAC_FRAMEWORKS = ['CoreFoundation', 'CoreGraphics', 'CoreText', 'AudioToolbox', 'IOKit', 'Foundation', 'AVFoundation', 'CoreMedia',
                   'CoreVideo', 'AppKit', 'WebKit']
