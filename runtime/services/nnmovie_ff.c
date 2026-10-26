@@ -1,6 +1,7 @@
 /* The movie reader on FFmpeg (nnmovie_src.h; Linux): what Media Foundation's source reader is to nnmovie_mf.c on Windows
- * and AVFoundation's asset reader on macOS (nnmovie_av.m). The file the game read into memory is demuxed in place
- * (libavformat over a memory reader), its tracks are described as the Windows reader describes them, and libavcodec
+ * and AVFoundation's asset reader on macOS (nnmovie_av.m). The file the game read is copied (the caller frees its buffer
+ * once mv_open returns, as SHCreateMemStream copies it on Windows) and demuxed from that copy (libavformat over a memory
+ * reader), its tracks are described as the Windows reader describes them, and libavcodec
  * decodes the selected ones: video to NV12 (libswscale; the format Media Foundation's H.264 decoder gives), audio to
  * interleaved 16-bit PCM at the track's own rate and channel count (libswresample).
  * One demuxer feeds every track: a packet of a selected track is decoded at once and its samples wait in that track's
@@ -31,7 +32,7 @@ typedef struct {
 } Track;
 
 struct MvSrc {
-    const unsigned char *data;                        /* the game's copy of the file (it lives until the extractor closes) */
+    unsigned char *data;                              /* our copy of the file, freed by mv_close */
     size_t size, pos;
     AVFormatContext *fmt;
     AVIOContext *io;
@@ -77,7 +78,9 @@ static const char *mime_of(enum AVCodecID id) {
 
 MvSrc *mv_open(const unsigned char *data, size_t size, const char *path, int64_t *duration_us, MvTrack *tracks, int *ntracks) {
     MvSrc *s = calloc(1, sizeof *s);
-    s->data = data; s->size = size;
+    s->data = malloc(size ? size : 1); s->size = size;
+    if (!s->data) { printf("movie: FFmpeg: out of memory for %s\n", path); free(s); return NULL; }
+    memcpy(s->data, data, size);
     unsigned char *buf = av_malloc(IO_BUF);
     s->io = buf ? avio_alloc_context(buf, IO_BUF, 0, s, io_read, NULL, io_seek) : NULL;
     s->fmt = avformat_alloc_context();
@@ -116,6 +119,7 @@ MvSrc *mv_open(const unsigned char *data, size_t size, const char *path, int64_t
 fail:
     if (s->fmt) avformat_close_input(&s->fmt);
     if (s->io) { av_freep(&s->io->buffer); avio_context_free(&s->io); } else av_free(buf);
+    free(s->data);
     free(s);
     return NULL;
 }
@@ -274,5 +278,6 @@ void mv_close(MvSrc *s) {
     av_frame_free(&s->frame);
     avformat_close_input(&s->fmt);
     if (s->io) { av_freep(&s->io->buffer); avio_context_free(&s->io); }
+    free(s->data);
     free(s);
 }
