@@ -789,7 +789,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned sr = MXB(i, 20, 8);
         const char *v;
         switch (sr) {
-        case 0x00: v = "gl_SubGroupInvocationARB"; break;
+        case 0x00: v = e->in->target == 1 ? "gl_SubgroupInvocationID" : "gl_SubGroupInvocationARB"; break;
         case 0x11: v = e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL ? "uint(gl_InvocationID)" : "0u"; break;
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
@@ -806,11 +806,11 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x25: v = "MX_GID_X"; break;
         case 0x26: v = "gl_WorkGroupID.y"; break;
         case 0x27: v = "gl_WorkGroupID.z"; break;
-        case 0x38: v = "uint(gl_SubGroupEqMaskARB)"; break;
-        case 0x39: v = "uint(gl_SubGroupLtMaskARB)"; break;
-        case 0x3a: v = "uint(gl_SubGroupLeMaskARB)"; break;
-        case 0x3b: v = "uint(gl_SubGroupGtMaskARB)"; break;
-        case 0x3c: v = "uint(gl_SubGroupGeMaskARB)"; break;
+        case 0x38: v = e->in->target == 1 ? "gl_SubgroupEqMask.x" : "uint(gl_SubGroupEqMaskARB)"; break;
+        case 0x39: v = e->in->target == 1 ? "gl_SubgroupLtMask.x" : "uint(gl_SubGroupLtMaskARB)"; break;
+        case 0x3a: v = e->in->target == 1 ? "gl_SubgroupLeMask.x" : "uint(gl_SubGroupLeMaskARB)"; break;
+        case 0x3b: v = e->in->target == 1 ? "gl_SubgroupGtMask.x" : "uint(gl_SubGroupGtMaskARB)"; break;
+        case 0x3c: v = e->in->target == 1 ? "gl_SubgroupGeMask.x" : "uint(gl_SubGroupGeMaskARB)"; break;
         case 0x50: case 0x52: v = "0u"; break;                   /* clocks */
         default: v = NULL; break;
         }
@@ -820,10 +820,15 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         break;
     }
     case MXOP_VOTE: {
-        const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), *f = MXB(i, 48, 2) == 0 ? "allInvocationsARB" : MXB(i, 48, 2) == 1 ? "anyInvocationARB" : "allInvocationsEqualARB";
+        /* Vulkan: the KHR subgroup operations (OpGroupNonUniform*). The ARB forms become OpSubgroupBallotKHR, which
+         * SPIRV-Cross (MoltenVK) turns into a Metal kernel declaring gl_SubgroupInvocationID twice when the stage also
+         * reads the lane id: the compute stage fails to compile. Same results: 32 lanes, the low word of the ballot. */
+        const int khr = e->in->target == 1, m = (int)MXB(i, 48, 2);
+        const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)),
+                   *f = khr ? (m == 0 ? "subgroupAll" : m == 1 ? "subgroupAny" : "subgroupAllEqual") : (m == 0 ? "allInvocationsARB" : m == 1 ? "anyInvocationARB" : "allInvocationsEqualARB");
         emit(e, "bool vp = %s;", p);
         if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s(vp);", PD(e, MXB(i, 45, 3)), f);
-        if (MXB(i, 0, 8) != 255) emit(e, " %s = uint(ballotARB(vp));", DST);
+        if (MXB(i, 0, 8) != 255) emit(e, khr ? " %s = subgroupBallot(vp).x;" : " %s = uint(ballotARB(vp));", DST);
         break;
     }
     case MXOP_NOP: case MXOP_DEPBAR: case MXOP_MEMBAR: case MXOP_VOTE_vtg: case MXOP_CCTL: case MXOP_CCTLL: case MXOP_SSY: case MXOP_PBK: case MXOP_PCNT:
@@ -1838,7 +1843,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (in->stage == MX_VERTEX) e->out_attr |= in->force_out;      /* declared and set to (0, 0, 0, 1) below */
         const int vk = in->target == 1;
         const char *set0 = vk ? "set = 0, " : "", *set1 = vk ? "set = 1, " : "";
-        if (vk) emit(&h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n#extension GL_EXT_texture_shadow_lod : enable\n#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n");
+        if (vk) emit(&h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n#extension GL_EXT_texture_shadow_lod : enable\n#extension GL_KHR_shader_subgroup_basic : enable\n#extension GL_KHR_shader_subgroup_ballot : enable\n#extension GL_KHR_shader_subgroup_vote : enable\n");
         else
         emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
