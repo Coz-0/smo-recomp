@@ -585,13 +585,31 @@ static VkFlags layout_access(VkImageLayout l) {
     default: return 0;
     }
 }
+/* The stages that use an image in a layout: a layout change waits only for those before it and holds only those after
+ * it. With ALL_COMMANDS on both sides every change waited for the whole GPU to drain (on AMD a full partial flush of
+ * every shader kind). GENERAL (feedback passes, storage images, macOS) keeps ALL_COMMANDS: anything may use it.
+ * SMO_VK_FULL_STAGES=1: ALL_COMMANDS everywhere, as before (A/B). */
+static int full_stage_barriers(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_FULL_STAGES") && atoi(getenv("SMO_VK_FULL_STAGES")); return on; }
+static VkFlags layout_stage(VkImageLayout l, int src) {
+    switch (l) {
+    case VK_IMAGE_LAYOUT_UNDEFINED: return src ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return VK_PIPELINE_STAGE_TRANSFER_BIT;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+               (D.f2.features.geometryShader ? VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT : 0);      /* valid only with the feature on */
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    default: return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+}
 static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     DBG_ASSERT(!R.in_pass, "debug: an image layout change inside a render pass");
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = img;
     b.subresourceRange.aspectMask = aspect; b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS; b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     b.srcAccessMask = layout_access(from); b.dstAccessMask = layout_access(to); b.oldLayout = from; b.newLayout = to;
-    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    if (full_stage_barriers()) { vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b); return; }
+    vkCmdPipelineBarrier(R.cmd, layout_stage(from, 1), layout_stage(to, 0), 0, 0, NULL, 0, NULL, 1, &b);
 }
 static void vt_layout(VTex *vt, VkImageLayout to) {
     if (vt->layout == to) return;
