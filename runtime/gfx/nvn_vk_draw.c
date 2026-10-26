@@ -316,6 +316,7 @@ static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_play[FRSTAT_N];
 static LONG64 g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
 void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
+static void rep_land(void);
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
     LONG64 t0 = tk();
@@ -331,6 +332,7 @@ static void slot_wait(Slot *s) {
     }
     s->pending = 0;
     if (s->serial > R.done) R.done = s->serial;
+    rep_land();
 }
 static void garbage_collect(void);
 static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
@@ -1512,6 +1514,31 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
     nvn_front_ccmp_landed();                       /* SMO_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
     g_tm[1] += tk() - t0;
+    rep_land();
+}
+/* A timestamp report (counter type 0, "bottom of pipe": after the work before it) is written when
+ * its submission has finished and the compute results recorded before it are in guest memory, instead of submitting and
+ * waiting for the GPU right there (cb_sync). The game reads a report after its fence, and the fence wait lands what is
+ * due (vk_sync_wait_). Reports land in the order they were recorded; with the queue full, the old way.
+ * SMO_VK_REPORT_DEFER=0: the old way always (A/B). */
+static struct { uint64_t addr, serial; uint32_t epoch; int need_cb; } g_rep[512];
+static int g_rep_head, g_rep_n;
+static int rep_defer_on(void) { static int on = -1; if (on < 0) on = !getenv("SMO_VK_REPORT_DEFER") || atoi(getenv("SMO_VK_REPORT_DEFER")); return on; }
+static int rep_defer(uint64_t addr) {
+    if (!rep_defer_on() || g_rep_n == 512) return 0;
+    int i = (g_rep_head + g_rep_n++) % 512;
+    g_rep[i].addr = addr; g_rep[i].serial = R.serial + 1;          /* the submission the commands recorded now go into */
+    g_rep[i].need_cb = g_cb_live || g_cb_pending; g_rep[i].epoch = g_cb_epoch;
+    return 1;
+}
+static void rep_land(void) {
+    while (g_rep_n) {
+        int i = g_rep_head;
+        if (R.done < g_rep[i].serial || (g_rep[i].need_cb && g_cb_epoch == g_rep[i].epoch)) return;      /* its work, or the copy-back of what that work wrote, is not done */
+        uint64_t d[2] = {0, vk_now_ns()};
+        memcpy(P(g_rep[i].addr), d, 16); host_wrote(g_rep[i].addr, 16, GEN_REPORT);
+        g_rep_head = (g_rep_head + 1) % 512; g_rep_n--;
+    }
 }
 static void cb_ring_wrap(void) { if (g_cb_pending) cb_land(0); else cb_masks(); }      /* after cmd_wait_all: the mask words in the ring are about to be reused */
 static void cb_poll(void) {                        /* pending CBs whose submission has finished are copied back; never waits */
@@ -2680,6 +2707,7 @@ static void exec(const Cmd *m, int depth) {
             break;
         }
         if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferReportCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); break; }
+        if (a[1] && a[0] == 0 && rep_defer(a[1])) break;
         if (a[1]) { if (a[0] == 0) cb_sync(); uint64_t d[2] = {0, vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
         break;
     case OP_CONSRASTER: if (a[0] & 1) nvn_vk_missing("conservative rasterisation (nvnCommandBufferSetConservativeRasterEnable)"); break;
@@ -2903,7 +2931,7 @@ static void vk_sync_wait_(SyncJob *j) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
         VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, j->timeout);
-        if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); } else j->result = r == VK_TIMEOUT ? 2 : 3;
+        if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); rep_land(); } else j->result = r == VK_TIMEOUT ? 2 : 3;
         return;
     }
     j->result = 0;                                  /* its command buffer was reused: finished long ago */
