@@ -468,6 +468,20 @@ static uint64_t c2_ring(int s) {
     return off;
 }
 
+/* Constant buffer 0 of a graphics stage: the driver's block, of which the translated stages read one word: the largest
+ * point size at byte 0x610 (96 vertex stages of the game: gl_PointSize = min(size, c0[0x610]), the point sprites of
+ * alPointSpriteShader). It was not bound, so those sprites had an undefined size. 2047, the largest NVN point size, as
+ * nxnative found for this game (dm/games/0100000000010000/README.md). Constant; copied again when a generation begins. */
+static struct { uint64_t off; uint32_t gen; int valid; } g_c0r;
+static uint64_t c0_ring(void) {
+    static uint32_t c0[0x614 / 4];
+    if (g_c0r.valid && g_c0r.gen == R.gen) return g_c0r.off;
+    float psize = 2047.0f;
+    memcpy(&c0[0x610 / 4], &psize, 4);
+    g_c0r.off = ring_raw(c0, sizeof c0); g_c0r.gen = R.gen; g_c0r.valid = 1;
+    return g_c0r.off;
+}
+
 /* ---------------------------------------------------------------- formats */
 static VkFormat comp_fmt(int comps, int i) {
     static const int b8[4] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}, b16[4] = {VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16A16_UNORM},
@@ -2055,11 +2069,12 @@ static int draw_prepare(unsigned prim) {
         VStage *v = sv[s];
         if (!v) continue;
         Stage *st = &R.prog[s]->st[s];
-        for (unsigned n = 1; n < 18; n++) {
+        for (unsigned n = 0; n < 18; n++) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
+            if (n == 0) { b->off = c0_ring(); b->size = 0x614; }
+            else if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
             else b->zero = 1;
@@ -2176,7 +2191,7 @@ static int draw_prepare(unsigned prim) {
         for (int s = 0; s < 3; s++) {
             VStage *v = sv[s];
             if (!v) continue;
-            for (unsigned n = 1; n < 34; n++) {
+            for (unsigned n = 0; n < 34; n++) {
                 unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
