@@ -39,6 +39,7 @@ def main():
         'static List *g_lists;\n'
         'static int g_list_count, *g_live, g_live_n;\n'
         'static LONG64 g_list_reuse_drops, g_list_reuse_events, g_imax_scans;\n'
+        'static int g_idx_restart;\n'
         'static SRWLOCK g_list_lock = SRWLOCK_INIT;\n'
         'static struct { uint32_t gen; int restart; } R;\n'
         'static uint8_t *g_mem;\n'
