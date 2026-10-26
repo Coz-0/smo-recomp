@@ -28,7 +28,7 @@ import target as T  # noqa: E402
 ROM = T.build('romfs')
 OUT = T.build('shaders_all')
 BIN = T.build('bin')
-CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
+CLANG = T.clang()
 sys.path.insert(0, os.path.join(REPO, 'tools', 'dev'))
 from sarc import yaz0  # noqa: E402
 
@@ -214,9 +214,10 @@ def main():
     print('stages found: %d, distinct: %d, not delimited: %d -> %s' % (total, written, unpaired_all, OUT))
     if a.extract_only:
         sys.exit(1 if unpaired_all else 0)
-    exe = os.path.join(BIN, 'mx_all.exe')
+    exe = os.path.join(BIN, 'mx_all' if T.POSIX else 'mx_all.exe')
+    posix = [T.runtime('compat', 'win32_posix.c'), '-lpthread', '-ldl', '-lm'] + (T.LINUX_CFLAGS if T.LINUX else []) if T.POSIX else []
     r = subprocess.run([CLANG, '-O1', '-w'] + T.runtime_includes() + [os.path.join(REPO, 'tests', 'mx_all.c'),
-                        T.runtime('gfx', 'mx_translate.c'), '-o', exe], capture_output=True, text=True)
+                        T.runtime('gfx', 'mx_translate.c')] + posix + ['-o', exe], capture_output=True, text=True)
     if r.returncode:
         print((r.stdout + r.stderr)[-3000:])
         sys.exit('check_all_shaders: build of mx_all.exe failed')
