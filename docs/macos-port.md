@@ -18,8 +18,23 @@ Vulkan drivers on Metal, from `vulkaninfo` (LunarG SDK 1.4.363.0 and Homebrew Mo
 | `geometryShader`, `wideLines` | no | no |
 | BC and ASTC textures | yes | yes |
 
-KosmicKrisp is the target driver, MoltenVK the fallback. Neither driver has dynamic vertex input, so on macOS the vertex
-layout is part of the pipeline key ("The vertex layout in the pipeline key").
+MoltenVK is the default driver, KosmicKrisp the alternative (`SMO_VK_DRIVER=kosmickrisp`). Neither driver has dynamic
+vertex input, so on macOS the vertex layout is part of the pipeline key ("The vertex layout in the pipeline key").
+
+Why MoltenVK (measured 2026-10-26, Cap Kingdom with `tests/cap_kingdom.seq`, the same frames on both): the game ends
+70-90 render passes a frame, and a pass has a fixed cost of 25-80 us on MoltenVK against 100-170 us on KosmicKrisp
+(`tests/macos/vk_pass_cost.c`).
+
+| Frames 3600-7200 (opening, Top-Hat Tower) | KosmicKrisp | MoltenVK |
+|---|---|---|
+| fps | 26-43 | 42-60 |
+| GPU time per frame | 18-19 ms | 6-8 ms |
+
+What MoltenVK does not have changes nothing the game draws in that run: logic ops are never set to anything but copy
+(0 calls of unimplemented operations), and Metal restarts lists at the all-ones index by itself. Two things it needed:
+the Vulkan shaders use the KHR subgroup operations (the ARB ballot becomes `OpSubgroupBallotKHR`, which SPIRV-Cross
+turns into a compute kernel declaring `gl_SubgroupInvocationID` twice), and its pipeline cache write reports
+`VK_INCOMPLETE` ("Failed to write 4 bytes") while the file it writes reads back whole.
 
 ## Order of work
 
@@ -83,7 +98,7 @@ Each step builds and is checked before the next one starts.
    border colours, the geometry stage of the Ruined Kingdom's lightning.
    Done so far: the window (`display.c`: SDL3 on the main thread, which pumps its events while it waits for the game;
    events are taken as they are queued, since `nnpad_sdl.c` flushes SDL's queue), the Metal surface, the Vulkan loader
-   and driver choice (KosmicKrisp by default, `SMO_VK_DRIVER=moltenvk`), the freeze watchdog's thread report (Mach
+   and driver choice (MoltenVK by default, `SMO_VK_DRIVER=kosmickrisp`), the freeze watchdog's thread report (Mach
    threads, `dladdr` names), the index scan in NEON (200,000 random buffers equal to the scalar rule). The OpenGL
    renderer cannot run on macOS (OpenGL 4.6 and NVIDIA extensions): its file compiles against `compat/GL/gl.h` and
    the renderer is always Vulkan. Graphics memory pools that show heap pages at a second address (virtual pools,

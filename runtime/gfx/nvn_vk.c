@@ -250,8 +250,10 @@ static void *vk_sym(const char *name) {
 
 #ifndef _WIN32
 /* macOS: the Vulkan loader and the driver it loads. The driver: VK_DRIVER_FILES / VK_ICD_FILENAMES when set; else
- * SMO_VK_DRIVER=kosmickrisp (the default: Vulkan 1.3 conformant, on Metal; the LunarG SDK's) or moltenvk, from the
- * Vulkan SDK found (VULKAN_SDK, ~/VulkanSDK). The loader: libvulkan.1.dylib next to the program, in that SDK, or
+ * SMO_VK_DRIVER=moltenvk (the default) or kosmickrisp (Vulkan 1.3 conformant, on Metal), from the Vulkan SDK found
+ * (VULKAN_SDK, ~/VulkanSDK). MoltenVK is the default for speed: a render pass costs 25-80 us there against 100-170 us on
+ * KosmicKrisp, and the game ends 70-90 passes a frame (Cap Kingdom, M4: GPU 6-8 ms a frame against 18-19 ms, 42-60 fps
+ * against 26-43 over the same frames). The loader: libvulkan.1.dylib next to the program, in that SDK, or
  * Homebrew's. docs/macos-port.md has what each driver offers the renderer. */
 static void mac_loader_and_driver(void) {
     char exe[MAX_PATH] = "", path[4096], sdk[2048] = "";
@@ -269,7 +271,7 @@ static void mac_loader_and_driver(void) {
             if (best[0]) snprintf(sdk, sizeof sdk, "%s/VulkanSDK/%s/macOS", getenv("HOME"), best);
         }
     }
-    int moltenvk = want && !_stricmp(want, "moltenvk");
+    int moltenvk = !(want && !_stricmp(want, "kosmickrisp"));
     if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES") && sdk[0]) {
         snprintf(path, sizeof path, "%s/share/vulkan/icd.d/%s", sdk, moltenvk ? "MoltenVK_icd.json" : "libkosmickrisp_icd.json");
         if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) setenv("VK_DRIVER_FILES", path, 1);
