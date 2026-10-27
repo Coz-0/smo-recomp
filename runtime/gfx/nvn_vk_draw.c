@@ -741,6 +741,7 @@ struct VTex {
     int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
     int rs; float sx, sy;                          /* rs = 1 when the image is smaller than the game's texture (w, h are the image's; sx, sy = image / game) */
     int storage;                                   /* made with VK_IMAGE_USAGE_STORAGE_BIT (NVN_TEXTURE_FLAGS_IMAGE): it can be bound as an image */
+    int cleared;                                   /* cleared to zero when it was made (every texel defined) */
     VView *views; VTex *next, *prev;
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
@@ -1144,6 +1145,18 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
 static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
+static LONG64 g_zs_skips, g_zs_bytes, g_zs_checked;
+static int zero_skip_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_ZERO_SKIP"); on = !(e && e[0] && !atoi(e)); } return on; }
+static int mem_is_zero(const uint8_t *p, size_t n) {       /* 64 bytes at a time, out at the first non-zero byte */
+    g_zs_checked++;
+    size_t k = 0;
+    for (; k + 64 <= n; k += 64) {
+        uint64_t a[8]; memcpy(a, p + k, 64);
+        if (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) return 0;
+    }
+    for (; k < n; k++) if (p[k]) return 0;
+    return 1;
+}
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -1224,12 +1237,19 @@ static VTex *vt_get2(Tex *t, int sync) {
             VkImageSubresourceRange sr = {vt->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             if (vt->samples == 1) {
+                vt->cleared = 1;
                 if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &z, 1, &sr); }
                 else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, LAYOUT(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &z, 1, &sr); }
             }
         }
     }
     vt_check(vt);
+    /* A new image starts cleared to zero (above). Where the texture's memory holds only zeros too, reading it out (hash,
+     * de-swizzle, ring copy: 5.6 MB for a 1600x900 buffer) changes nothing: one pass over the memory instead. Only in
+     * CPU_NO_ACCESS pools, where the texture is not hashed again after its first look, so skipping that look leaves it as
+     * if it had been read (SMO: agl's screen buffers, made again every frame). SMO_VK_ZERO_SKIP=0: read it out as before. */
+    if (tu0 && vt->cleared && sync && !t->gpu_written && !t->uploaded && (t->pool_flags & 1) && t->mem && !t->b.packaged && zero_skip_on() &&
+        (!t->limit || t->mem + t->data_size <= t->limit) && mem_is_zero(t->mem, t->data_size)) { t->uploaded = 1; g_zs_skips++; g_zs_bytes += (LONG64)t->data_size; }
     if (sync && nvn_front_tex_changed(t)) {
         if (!tu0) tu0 = tk();
         g_put_vt = vt;
@@ -4200,6 +4220,7 @@ static void vkd_shutdown(void) {
            (long long)g_vtx_over, g_vtxgrow > 0 ? " (copied as far as they read)" : g_vtxgrow == 0 ? " (SMO_VK_VTXGROW=0: left as bound)" : "", (long long)g_vtx_capped, (long long)g_imax_scans);
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
+    printf("nvn_vk: new textures of CPU_NO_ACCESS pools whose memory was all zero, not read out (SMO_VK_ZERO_SKIP): %lld of %lld looked at (%lld MB)\n", (long long)g_zs_skips, (long long)g_zs_checked, (long long)(g_zs_bytes >> 20));
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
     printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
