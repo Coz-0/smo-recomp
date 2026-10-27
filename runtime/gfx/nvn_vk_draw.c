@@ -3894,7 +3894,8 @@ swap: ;
             cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated);
         }
     }
-    int ok = V.swapchain || swapchain_create();
+    int ok = V.swapchain != NULL;
+    if (!ok && (ok = swapchain_create())) printf("nvn_vk: swapchain made again: %ux%u\n", (unsigned)V.extent.width, (unsigned)V.extent.height);
     InterlockedIncrement64(&g_wd_try);
     if (ok) {
         g_wd_where = 2;

@@ -408,7 +408,11 @@ void recomp_set_key_source(int (*down)(int vk));  /* display: key states from it
 static inline int GetWindowTextA(HWND w, LPSTR s, int n) { (void)w; if (n > 0) s[0] = 0; return 0; }
 static inline BOOL SetWindowTextA(HWND w, LPCSTR s) { (void)w; (void)s; return FALSE; }
 typedef struct { LONG left, top, right, bottom; } RECT;
-static inline BOOL GetClientRect(HWND w, RECT *r) { (void)w; memset(r, 0, sizeof *r); return FALSE; }
+/* The game's window (the only one) in pixels, from SDL (display.c). It answered FALSE, so the renderer's check of the
+ * window's size before a present never fired: a window gone full screen (F11, or full screen from graphics.ini) kept
+ * the swapchain of its first size and the compositor stretched that over the screen. */
+void display_pixel_size(int *w, int *h);
+static inline BOOL GetClientRect(HWND w, RECT *r) { (void)w; int pw = 0, ph = 0; display_pixel_size(&pw, &ph); r->left = r->top = 0; r->right = pw; r->bottom = ph; return pw > 0 && ph > 0; }
 
 /* ---- message boxes: a CoreFoundation alert, modal and blocking on any thread as on Windows. Without a user to
  * answer (no window server) it returns at once with the default button. */
