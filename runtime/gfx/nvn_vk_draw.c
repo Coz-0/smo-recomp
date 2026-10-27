@@ -16,6 +16,9 @@
 #include "tex_decode.h"
 #include "smo_ui.h"                                    /* UiMenuJob: the amiibo menu's pictures (vk_menu) */
 static int have_targets_live(void);
+static void rec_report(LONG64 frame, int frames, double k);      /* nvn_vk_rec.c */
+static uint64_t rec_pos(void);
+static void rec_reach(uint64_t pos);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
@@ -214,7 +217,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1, rec_end; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted; rec_end: the recorder's ring after its submission */
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -360,14 +363,16 @@ static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_play[FRSTAT_N];
 static LONG64 g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
 void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
+static int fence_done(Slot *s) { rec_reach(s->rec_end); return vkGetFenceStatus(V.device, s->fence) == VK_SUCCESS; }
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
     LONG64 t0 = tk();
     nvn_tl(13, (int)(s - R.slot));
+    rec_reach(s->rec_end);                         /* the recorder has returned from its vkQueueSubmit: the fence is used by one thread at a time */
     VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, 20000000000ull);
     nvn_tl(14, (int)(s - R.slot));
-    g_tm[0] += tk() - t0;
     if (r != VK_SUCCESS) vkd_fail("a submitted command buffer did not finish within 20 s (%s): the GPU is stuck or the device is lost", vk_result_name(r));
+    g_tm[0] += tk() - t0;
     VKC(vkResetFences(V.device, 1, &s->fence));
     if (g_ts_on > 0) {                             /* SMO_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
         uint64_t ts[2] = {0, 0};
@@ -419,7 +424,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
     nvn_tl(15, (int)R.frame_draws);               /* SMO_FRAMETL: a submission, with the draws of the frame so far */
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
-    s->pending = 1; s->serial = ++R.serial;
+    s->pending = 1; s->serial = ++R.serial; s->rec_end = rec_pos();
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
@@ -1921,7 +1926,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
 static void cb_ring_wrap(void) { if (g_cb_pending) cb_land(0); else cb_masks(); }      /* after cmd_wait_all: the mask words in the ring are about to be reused */
 static void cb_poll(void) {                        /* pending CBs whose submission has finished are copied back; never waits */
     if (!g_cb_pending) return;
-    if (R.done < g_cb_serial) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && vkGetFenceStatus(V.device, R.slot[i].fence) == VK_SUCCESS) slot_wait(&R.slot[i]);
+    if (R.done < g_cb_serial) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && fence_done(&R.slot[i])) slot_wait(&R.slot[i]);
     if (R.done >= g_cb_serial) cb_land(0);
 }
 /* why a copy-back was forced (CB_SYNC), counted per reason: forced in a batch, waits for the GPU and their time */
@@ -2034,7 +2039,7 @@ static int occ_done(uint64_t serial, int wait) {
     if (wait && serial > R.serial) cmd_submit(NULL, NULL);
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
-        if (s->pending && s->serial <= serial && (wait || vkGetFenceStatus(V.device, s->fence) == VK_SUCCESS)) slot_wait(s);
+        if (s->pending && s->serial <= serial && (wait || fence_done(s))) slot_wait(s);
     }
     if (wait) { if (R.done < serial) R.done = serial; g_occ_waits++; g_occ_wait_ticks += tk() - t0; }
     return serial <= R.done;
@@ -3382,6 +3387,7 @@ static void vk_sync_wait_(SyncJob *j) {
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
+        rec_reach(s->rec_end);
         VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, j->timeout);
         if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); } else j->result = r == VK_TIMEOUT ? 2 : 3;
         return;
@@ -4003,6 +4009,7 @@ swap: ;
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+        rec_report(frame, 300, k);
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
         { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         {   static LONG64 kl[5];
@@ -4096,6 +4103,7 @@ static VkImageView dummy_view(VTex *vt, VkImageViewType type, uint32_t layers) {
  * SPIR-V files, pipelines through the driver's pipeline cache kept in ..\cache\vk\pipelines_<gpu>.bin). The render thread
  * waits for them before it replays its first batch, so the tables are never shared with a running worker. */
 #include "nvn_vk_watchdog.c"                       /* the freeze watchdog (wd_start / wd_stop) */
+#include "nvn_vk_rec.c"                            /* the recorder thread (SMO_VK_RECORDER=1) */
 static void vkd_init(void) {
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)
@@ -4108,6 +4116,7 @@ static void vkd_init(void) {
         if (D.f2.features.depthClamp) { X3(vkCmdSetDepthClampEnableEXT) }
 #undef X3
     }
+    rec_start();
     printf("nvn_vk: descriptors: buffers (set 0) %s, textures (set 1) one set per distinct binding list %s\n", D.has_push ? "pushed (VK_KHR_push_descriptor)" : "one allocated set per draw",
            tc_on() ? "kept across command buffers" : "per command buffer (SMO_VK_TSET_CACHE=0)");
     vkGetPhysicalDeviceMemoryProperties(V.gpu, &D.mp);
@@ -4166,6 +4175,7 @@ static void frstat_report(void) {
            (double)w[n / 2], (double)w[n * 99 / 100], (double)w[n - 1], slow, wsum > 0 ? 1000.0 * n / wsum : 0.0);
 }
 static void vkd_shutdown(void) {
+    rec_drain();
     wd_stop();
     if (!R.ring) return;
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);

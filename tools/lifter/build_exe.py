@@ -30,7 +30,7 @@ WEBVIEW2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path
 VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
 
 # The host runtime's build units by subsystem folder (runtime/<folder>/<file>). Not listed: nvn_vk_draw.c,
-# nvn_vk_pipelines.c and nvn_vk_watchdog.c (included by nvn_vk.c), game_shim.c (part of the game DLL) and
+# nvn_vk_pipelines.c, nvn_vk_watchdog.c and nvn_vk_rec.c (included by nvn_vk.c), game_shim.c (part of the game DLL) and
 # vk_shaderc_shim.c (smo_glslang.dll).
 HOST_SOURCES = {
     'core': ['hostrt.c', 'boot.c', 'gamedll.c', 'sdklift_rt.c', 'hitch.c'],
@@ -44,7 +44,7 @@ HOST_SOURCES = {
     'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmovie_mf.c'],
     'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c'],
 }
-INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c')]
+INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c', 'nvn_vk_rec.c')]
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 # RECOMP_HOST_OPT (default -O2) and RECOMP_ARCH (as build_main.py: e.g. -march=znver2) for the runtime; a change of them
 # recompiles nothing by itself: delete build\obj\host (or touch a runtime header) first
