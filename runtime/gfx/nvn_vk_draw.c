@@ -4040,9 +4040,10 @@ swap: ;
         if (lo >= 0 && frame >= lo && frame <= hi)
             printf("nvn_vk_frame: %lld draws %lld skipped %lld (render off %lld) conditional %lld (off %lld) passes %lld texture barriers %lld vertex over-reads %lld ring wraps %lld streamed %lld KB condhash %016llx\n", (long long)frame, (long long)R.frame_draws,
                    (long long)R.frame_skipped, (long long)g_fr_offskip, (long long)g_fr_cond, (long long)g_fr_condoff, (long long)g_fr_passes, (long long)g_fr_texbar, (long long)g_fr_vtxover, (long long)g_fr_wraps, (long long)(g_ring_bytes - g_fr_ring0) >> 10, (unsigned long long)g_fr_condhash);
-        {   char buf[256] = ""; int k = 0;
+        {   char buf[256] = ""; int k = 0;      /* counted every frame, printed in the SMO_VK_FRAMELOG range only */
             for (int i = 0; i < g_pe_n; i++) { if (g_pe[i].n) k += snprintf(buf + k, sizeof buf - (size_t)k, " L%d:%lld", g_pe[i].line, g_pe[i].n); g_pe[i].n = 0; }
-            printf("nvn_vk_frame: pass ends by source line:%s | target sets that kept the pass %lld\n", k ? buf : " none", g_retarget_same); g_retarget_same = 0;
+            if (lo >= 0 && frame >= lo && frame <= hi) printf("nvn_vk_frame: pass ends by source line:%s | target sets that kept the pass %lld\n", k ? buf : " none", g_retarget_same);
+            g_retarget_same = 0;
         }
         g_fr_cond = g_fr_condoff = g_fr_offskip = g_fr_passes = g_fr_texbar = g_fr_wraps = g_fr_vtxover = 0; g_fr_ring0 = g_ring_bytes; g_fr_condhash = 1469598103934665603ull;
     }
