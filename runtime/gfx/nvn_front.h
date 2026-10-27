@@ -6,7 +6,11 @@
 #define NVN_FRONT_H
 #include <stdio.h>
 #include <stdint.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <GL/gl.h>
 #include "mx_translate.h"
 

@@ -5,7 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -153,7 +160,10 @@ static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }
  * addresses show the same bytes, as the GPU address space does on the console. A request without a physical pool turns
  * the range back into a placeholder. The storage class is the GPU memory kind; the host has none to apply.
  * Stops with the request printed (never maps approximately) when: the physical memory is not in the heap, an offset or
- * size is not a multiple of 64 KB (the host's mapping granularity), or a Windows call fails. */
+ * size is not a multiple of 64 KB (the host's mapping granularity), or a Windows call fails.
+ * macOS: the same with Mach VM (vp_* below). A placeholder is reserved memory (PROT_NONE); a view is the heap's own pages
+ * at a second address, mach_vm_remap without copying (the heap is plain reserved memory there, smo_nn.c); splitting and
+ * joining placeholders needs nothing. 64 KB stays the granularity, so both systems accept and refuse the same requests. */
 #define VP_GRAN 0x10000ull
 #define VP_MAXSEG 4096
 typedef struct { uint64_t start, size; int mapped; uint64_t sec_off; } VpSeg;     /* start: offset in the virtual pool */
@@ -163,6 +173,20 @@ typedef struct VPool { uint64_t key, base, size; int nseg, used, direct; VpSeg s
 static VPool *g_vpools;
 static SRWLOCK g_vp_lock = SRWLOCK_INIT;
 static unsigned long long g_vp_maps, g_vp_unmaps;
+int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);     /* smo_nn.c */
+int smo_heap_section_handle(HANDLE *h);                       /* smo_nn.c */
+static void vp_fail(Ctx *c, const char *what, uint64_t a, uint64_t b) {
+#ifdef _WIN32
+    const char *os = "Windows";
+#else
+    const char *os = "Mach";
+#endif
+    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; %s error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, os, (unsigned long)GetLastError());
+    guest_trap("nvnMemoryPoolMapVirtual: request that cannot be mapped exactly", c ? c->x[30] - 4 : 0);
+}
+/* The operating system's part: reserve a placeholder range, show section pages in a placeholder, take a view out again
+ * (back to a placeholder), split / join placeholders, release a whole placeholder range. Each answers 1 when it worked. */
+#ifdef _WIN32
 typedef PVOID (WINAPI *VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
 typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void *, ULONG);
 typedef BOOL (WINAPI *UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
@@ -175,11 +199,6 @@ static UnmapViewOfFile2Fn p_UnmapViewOfFile2;
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
 #define MEM_COALESCE_PLACEHOLDERS 0x00000001
 #endif
-int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);     /* smo_nn.c */
-static void vp_fail(Ctx *c, const char *what, uint64_t a, uint64_t b) {
-    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; Windows error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, GetLastError());
-    guest_trap("nvnMemoryPoolMapVirtual: request that cannot be mapped exactly", c ? c->x[30] - 4 : 0);
-}
 static void vp_load(Ctx *c) {
     if (p_MapViewOfFile3) return;
     HMODULE k = GetModuleHandleA("kernelbase.dll");
@@ -188,6 +207,38 @@ static void vp_load(Ctx *c) {
     p_UnmapViewOfFile2 = (UnmapViewOfFile2Fn)(void *)GetProcAddress(k, "UnmapViewOfFile2");
     if (!p_VirtualAlloc2 || !p_MapViewOfFile3 || !p_UnmapViewOfFile2) vp_fail(c, "placeholder API missing (Windows 10 1803 or newer is needed)", 0, 0);
 }
+static uint64_t vp_reserve(uint64_t size) {
+    return (uint64_t)(uintptr_t)p_VirtualAlloc2(GetCurrentProcess(), NULL, (SIZE_T)size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+}
+static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {
+    return p_MapViewOfFile3(sec, GetCurrentProcess(), (PVOID)(uintptr_t)at, sec_off, (SIZE_T)size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) == (PVOID)(uintptr_t)at;
+}
+static int vp_unview(uint64_t at, uint64_t size) { (void)size; return p_UnmapViewOfFile2(GetCurrentProcess(), (PVOID)(uintptr_t)at, MEM_PRESERVE_PLACEHOLDER) != 0; }
+static int vp_split_placeholder(uint64_t at, uint64_t size) { return VirtualFree((PVOID)(uintptr_t)at, (SIZE_T)size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0; }
+static int vp_join_placeholders(uint64_t at, uint64_t size) { return VirtualFree((PVOID)(uintptr_t)at, (SIZE_T)size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0; }
+static int vp_release(uint64_t at, uint64_t size) { (void)size; return VirtualFree((PVOID)(uintptr_t)at, 0, MEM_RELEASE) != 0; }
+#else
+static void vp_load(Ctx *c) { (void)c; }
+static uint64_t vp_reserve(uint64_t size) {
+    void *p = mmap(NULL, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? 0 : (uint64_t)(uintptr_t)p;
+}
+static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {   /* sec: the heap's base (smo_nn.c) */
+    mach_vm_address_t to = at;
+    vm_prot_t cur, max;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &to, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)sec + sec_off, FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS || to != at) { SetLastError((DWORD)kr); return 0; }
+    if ((cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) { SetLastError(0); return 0; }   /* heap pages not committed */
+    return 1;
+}
+static int vp_unview(uint64_t at, uint64_t size) {
+    return mmap((void *)(uintptr_t)at, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED;
+}
+static int vp_split_placeholder(uint64_t at, uint64_t size) { (void)at; (void)size; return 1; }
+static int vp_join_placeholders(uint64_t at, uint64_t size) { (void)at; (void)size; return 1; }
+static int vp_release(uint64_t at, uint64_t size) { return munmap((void *)(uintptr_t)at, (size_t)size) == 0; }
+#endif
 static VPool *vp_find(uint64_t key) { VPool *v = g_vpools; while (v && v->key != key) v = v->next; return v; }
 /* Make segment boundaries at off (splits the segment containing it). Views are split by unmapping and mapping the two
  * halves again; placeholders by VirtualFree(MEM_PRESERVE_PLACEHOLDER). */
@@ -201,32 +252,27 @@ static void vp_split(Ctx *c, VPool *v, uint64_t off) {
         VpSeg left = *s, right = *s;
         left.size = off - s->start;
         right.start = off; right.size = s->start + s->size - off; right.sec_off = s->sec_off + left.size;
-        if (s->mapped) {
-            if (!p_UnmapViewOfFile2(GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap for a split", v->base + s->start, s->size);
-        }
-        if (!VirtualFree((PVOID)(uintptr_t)(v->base + left.start), (SIZE_T)left.size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "placeholder split", v->base + left.start, left.size);
+        if (s->mapped && !vp_unview(v->base + s->start, s->size)) vp_fail(c, "unmap for a split", v->base + s->start, s->size);
+        if (!vp_split_placeholder(v->base + left.start, left.size)) vp_fail(c, "placeholder split", v->base + left.start, left.size);
         v->seg[i] = left; v->seg[i + 1] = right; v->nseg++;
         if (left.mapped) { vp_map_view(c, v, &v->seg[i]); vp_map_view(c, v, &v->seg[i + 1]); }
         return;
     }
 }
-int smo_heap_section_handle(HANDLE *h);                       /* smo_nn.c */
 static int vp_map_view(Ctx *c, VPool *v, VpSeg *s) {
     HANDLE sec;
     if (!smo_heap_section_handle(&sec)) vp_fail(c, "no heap section", 0, 0);
-    PVOID r = p_MapViewOfFile3(sec, GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), s->sec_off, (SIZE_T)s->size,
-                               MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-    if (r != (PVOID)(uintptr_t)(v->base + s->start)) vp_fail(c, "MapViewOfFile3", v->base + s->start, s->size);
+    if (!vp_view(sec, v->base + s->start, s->sec_off, s->size)) vp_fail(c, "view of heap pages", v->base + s->start, s->size);
     return 1;
 }
 static void pool_virtual_init(Ctx *c, NvnObj *p) {
     vp_load(c);
     if (p->memory) vp_fail(c, "a virtual pool was given memory of its own", p->memory, p->size);
     if (!p->size || p->size % VP_GRAN) vp_fail(c, "virtual pool size is not a multiple of 64 KB", p->size, 0);
-    PVOID base = p_VirtualAlloc2(GetCurrentProcess(), NULL, (SIZE_T)p->size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+    uint64_t base = vp_reserve(p->size);
     if (!base) vp_fail(c, "placeholder reservation", p->size, 0);
     VPool *v = calloc(1, sizeof *v);
-    v->key = p->key; v->base = (uint64_t)(uintptr_t)base; v->size = p->size;
+    v->key = p->key; v->base = base; v->size = p->size;
     v->nseg = 1; v->seg[0].start = 0; v->seg[0].size = p->size;
     AcquireSRWLockExclusive(&g_vp_lock); v->next = g_vpools; g_vpools = v; ReleaseSRWLockExclusive(&g_vp_lock);
     p->memory = v->base;
@@ -261,7 +307,7 @@ static void pool_map_virtual(Ctx *c) {
                 if (n != 1 || voff != 0 || size != v->size || v->nseg != 1 || v->seg[0].mapped || v->used)
                     vp_fail(c, in_heap ? "physical offset in the heap is not a multiple of 64 KB, and the request is not a whole-pool mapping of an unused pool"
                                        : "physical memory is not inside the memory heap, and the request is not a whole-pool mapping of an unused pool", pp->memory + poff, size);
-                if (!VirtualFree((PVOID)(uintptr_t)v->base, 0, MEM_RELEASE)) vp_fail(c, "placeholder release", v->base, v->size);
+                if (!vp_release(v->base, v->size)) vp_fail(c, "placeholder release", v->base, v->size);
                 v->direct = 1;
                 v->base = pp->memory + poff;
                 nobj(pool)->memory = v->base;
@@ -282,12 +328,12 @@ static void pool_map_virtual(Ctx *c) {
             if (first < 0) first = i;
             last = i;
             if (s->mapped) {
-                if (!p_UnmapViewOfFile2(GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap", v->base + s->start, s->size);
+                if (!vp_unview(v->base + s->start, s->size)) vp_fail(c, "unmap", v->base + s->start, s->size);
                 s->mapped = 0; g_vp_unmaps++;
             }
         }
         if (last > first) {
-            if (!VirtualFree((PVOID)(uintptr_t)(v->base + voff), (SIZE_T)size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) vp_fail(c, "placeholder coalesce", v->base + voff, size);
+            if (!vp_join_placeholders(v->base + voff, size)) vp_fail(c, "placeholder coalesce", v->base + voff, size);
             memmove(&v->seg[first + 1], &v->seg[last + 1], sizeof(VpSeg) * (size_t)(v->nseg - last - 1));
             v->nseg -= last - first;
         }

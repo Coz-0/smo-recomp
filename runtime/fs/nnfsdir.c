@@ -16,7 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "sdklift.h"
 
 #define A0 (c->x[0])

@@ -14,7 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -37,7 +41,14 @@ static const char *const free_files[FONT_TYPES][4] = {
     {"NotoSans-Regular.ttf", "NotoSans-Regular.otf", "NotoSans[wdth,wght].ttf", NULL},
 };
 /* Windows' own, in %WINDIR%\Fonts: Segoe UI, Microsoft YaHei, Microsoft JhengHei, Malgun Gothic */
+#ifdef _WIN32
 static const char *const windows_files[FONT_TYPES] = {"segoeui.ttf", "msyh.ttc", "msyh.ttc", "msjh.ttc", "malgun.ttf", "segoeui.ttf", "segoeui.ttf"};
+#endif
+/* macOS's own, in /System/Library/Fonts: Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo (NOT VERIFIED in the
+ * game yet: the Windows fonts above were) */
+static const char *const mac_files[FONT_TYPES] = {"Supplemental/Arial Unicode.ttf", "Hiragino Sans GB.ttc", "Hiragino Sans GB.ttc",
+                                                  "STHeiti Light.ttc", "AppleSDGothicNeo.ttc", "Supplemental/Arial Unicode.ttf",
+                                                  "Supplemental/Arial Unicode.ttf"};
 static struct { void *data; size_t size; int tried; } g_fonts[FONT_TYPES];
 static CRITICAL_SECTION g_lock;
 
@@ -69,16 +80,23 @@ static void load_font(unsigned type) {
             snprintf(path, sizeof path, "..\\..\\deps\\fonts\\%s", free_files[type][k]);
             if ((ok = read_font(type, path))) from = "a free font (deps\\fonts)";
         }
+#ifdef _WIN32
         if (!ok) {
             char windir[MAX_PATH] = "C:\\Windows";
             GetWindowsDirectoryA(windir, sizeof windir);
             snprintf(path, sizeof path, "%s\\Fonts\\%s", windir, windows_files[type]);
             if ((ok = read_font(type, path))) from = "Windows' own (no dumped or free font found)";
         }
+#else
+        if (!ok) {
+            snprintf(path, sizeof path, "/System/Library/Fonts/%s", mac_files[type]);
+            if ((ok = read_font(type, path))) from = "macOS's own (no dumped or free font found)";
+        }
+#endif
         printf("nn::pl: shared font %u %s (%s, %zu bytes)%s%s\n", type, ok ? "loaded" : "NOT FOUND", path, g_fonts[type].size,
                ok ? ": " : "", ok ? from : "");
         if (!ok) {
-            printf("nn::pl: no font for shared font type %u (not in your dump, deps\\fonts or %%WINDIR%%\\Fonts): stopping\n", type);
+            printf("nn::pl: no font for shared font type %u (not in your dump, deps\\fonts or the system's fonts): stopping\n", type);
             fflush(stdout);
             report_and_exit(7);
         }

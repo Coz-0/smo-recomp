@@ -19,7 +19,11 @@
  *     reference for this game's driver version; a guess could misplace textures in memory pools silently). */
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "hostrt.h"
 #include "nvn_sdk.h"
 #include "tex_decode.h"

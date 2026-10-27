@@ -28,7 +28,14 @@
  *       come next, so for now nothing is heard (the frames are processed and timed).
  * Lifted code reached from the frame thread stops with the name of anything it needs (sdklift_rt.c). */
 #include <stdio.h>
+#ifdef _WIN32
 #include <windows.h>
+#include <mmsystem.h>
+#else
+#include "win32_posix.h"
+/* macOS: the sound goes out through an SDL3 audio stream in place of waveOut, with the same rules (sink_* below) */
+#include <SDL3/SDL.h>
+#endif
 #include "hostrt.h"
 #include "sdklift.h"
 
@@ -85,7 +92,9 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
      * boundary and then call SwitchToThread in a loop: 2 of every 5 ms busy on a time-critical thread (69% of a core in
      * all, measured), taken from the game's threads when the PC is busy. The output has 120 ms queued, so a frame a
      * fraction of a millisecond late changes nothing; the schedule stays on the performance counter. */
+#ifdef _WIN32
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#endif
     double period = 0;
     long long tick = 0;                          /* frames since t0: the schedule (g_frames only counts) */
     for (;;) {
@@ -112,10 +121,15 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
             double due = frame * p;
             if (!n || t >= due) { if (t > due + 10 * p) { t0 = now; tick = 0; } break; }
             double left = due - t;
+#ifdef _WIN32
             LARGE_INTEGER rel;
             rel.QuadPart = -(LONGLONG)(left * 1e7) - 1;              /* relative, 100 ns units */
             if (timer && SetWaitableTimer(timer, &rel, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100);
             else if (left > 0.002) Sleep(1); else SwitchToThread();
+#else
+            struct timespec ts = {(time_t)left, (long)((left - (double)(time_t)left) * 1e9) + 1};    /* nanosleep is good to tens of us */
+            nanosleep(&ts, NULL);
+#endif
         }
         if (!n) Sleep(1);
     }
@@ -151,12 +165,20 @@ static void rs_Stop(Ctx *c) {
  * samples, buffer i at GetMixBuffers() + i * sample count; the device takes them as 16-bit (clamped). Frames of 5 ms are
  * gathered into blocks of 40 ms; 16 blocks in flight at most (the oldest pending audio is dropped and counted if the
  * device falls behind; a block the device finished before the next one was ready is counted as an underrun). */
-#include <mmsystem.h>
 static float g_dev_volume[3];                    /* defined with its values below (the device layer) */
 #define SINK_BLOCK 1920                           /* frames per waveOut block (40 ms at 48 kHz) */
 #define SINK_NBLK 16
+#ifdef _WIN32
 static HWAVEOUT g_wo;
 static WAVEHDR g_wh[SINK_NBLK];
+#define SINK_FULL() ((g_wh[g_wcur].dwFlags & WHDR_PREPARED) && !(g_wh[g_wcur].dwFlags & WHDR_DONE))   /* the block to fill is still queued */
+#else
+/* macOS: an SDL3 audio stream. The rules of the waveOut blocks, on the bytes it has queued: 16 blocks of 40 ms at most
+ * (beyond that the frame is dropped and counted), playing starts once 3 blocks are queued, and a block that arrives at an
+ * empty queue while playing is an underrun. */
+static SDL_AudioStream *g_stream;
+#define SINK_FULL() (SDL_GetAudioStreamQueued(g_stream) >= SINK_NBLK * SINK_BLOCK * 4)
+#endif
 static int16_t g_wbuf[SINK_NBLK][SINK_BLOCK * 2];
 static int g_wcur, g_wfill, g_wopen = -1, g_wstarted;
 static LONG64 g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
@@ -175,28 +197,56 @@ static void wav_header(void) {
 }
 static void sink_open(void) {
     if (getenv("SMO_AUDIO_WAV")) { g_wav = fopen(getenv("SMO_AUDIO_WAV"), "wb"); if (g_wav) wav_header(); }
-    WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
     if (getenv("SMO_AUDIO") && !atoi(getenv("SMO_AUDIO"))) { g_wopen = 0; printf("smo_audio: sound output off (SMO_AUDIO=0)\n"); return; }
+#ifdef _WIN32
+    WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
     MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
     g_wopen = r == MMSYSERR_NOERROR;
     printf("smo_audio: sound output: %s\n", g_wopen ? "waveOut, 48000 Hz, 16-bit stereo, 40 ms blocks" : "waveOutOpen FAILED: no sound");
+#else
+    SDL_AudioSpec spec = {SDL_AUDIO_S16LE, 2, 48000};
+    g_stream = SDL_InitSubSystem(SDL_INIT_AUDIO) ? SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL) : NULL;
+    g_wopen = g_stream != NULL;
+    printf("smo_audio: sound output: %s%s\n", g_wopen ? "SDL3 audio stream, 48000 Hz, 16-bit stereo, 40 ms blocks" : "SDL3 audio FAILED: no sound (", g_wopen ? "" : SDL_GetError());
+#endif
     if (g_wopen) {
+#ifdef _WIN32
         waveOutPause(g_wo);
+#else
+        SDL_PauseAudioStreamDevice(g_stream);
+#endif
         /* Test copies are silent, as nnaudio.c's AudioOut: only the copies a person plays (smo_native.exe, smo_user.exe)
          * are audible. The device stays open and is fed as with sound, so the timing, the dropped-sample and underrun
          * counts and an SMO_AUDIO_WAV capture are the same. SMO_VOLUME=<0..100> overrides either way. */
         char exe[MAX_PATH] = "";
         GetModuleFileNameA(NULL, exe, sizeof exe);
         const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SMO_VOLUME");
+#ifdef _WIN32
         int percent = vol ? atoi(vol) : (!_stricmp(base, "smo_native.exe") || !_stricmp(base, "smo_user.exe")) ? 100 : 0;
+#else
+        int percent = vol ? atoi(vol) : (!strcmp(base, "smo_native") || !strcmp(base, "smo_user")) ? 100 : 0;
+#endif
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
+#ifdef _WIN32
         DWORD level = (DWORD)(0xffff * percent / 100);
         waveOutSetVolume(g_wo, level | level << 16);
+#else
+        SDL_SetAudioStreamGain(g_stream, (float)percent / 100.0f);
+#endif
         printf("smo_audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SMO_VOLUME=<0..100> to change)");
     }
 }
 static void sink_submit(void) {                   /* the block g_wcur is full */
+#ifndef _WIN32
+    int was_empty = SDL_GetAudioStreamQueued(g_stream) == 0;
+    SDL_PutAudioStreamData(g_stream, g_wbuf[g_wcur], SINK_BLOCK * 4);
+    g_sink_blocks++;
+    if (!g_wstarted && g_sink_blocks >= 3) { SDL_ResumeAudioStreamDevice(g_stream); g_wstarted = 1; }    /* 120 ms queued before playing */
+    else if (g_wstarted && was_empty) g_sink_underruns++;                                                   /* the device waited for us */
+    g_wcur = (g_wcur + 1) % SINK_NBLK; g_wfill = 0;
+    return;
+#else
     WAVEHDR *h = &g_wh[g_wcur];
     if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(g_wo, h, sizeof *h);
     memset(h, 0, sizeof *h);
@@ -211,6 +261,7 @@ static void sink_submit(void) {                   /* the block g_wcur is full */
         if (!busy) g_sink_underruns++;
     }
     g_wcur = (g_wcur + 1) % SINK_NBLK; g_wfill = 0;
+#endif
 }
 /* The command header and the device sink command, as each SDK writes them:
  *   3.5.1 [sdk 0x18aab8 GenerateDeviceSinkCommand]: {u32 magic 0xcafebabe, u16 size, u16 type (0xf: device sink), u32
@@ -258,7 +309,7 @@ static void audio_sink_out(const Sink *s, uint64_t mb, uint32_t ns) {
         l *= vol; r *= vol;
         int32_t li = (int32_t)(l < -32768.f ? -32768.f : l > 32767.f ? 32767.f : l), ri = (int32_t)(r < -32768.f ? -32768.f : r > 32767.f ? 32767.f : r);
         uint32_t a = (uint32_t)(li < 0 ? -li : li); if (a > g_sink_peak) g_sink_peak = a;
-        if (g_wfill == 0 && (g_wh[g_wcur].dwFlags & WHDR_PREPARED) && !(g_wh[g_wcur].dwFlags & WHDR_DONE)) { g_sink_dropped += ns - i; return; }    /* all 16 blocks still queued */
+        if (g_wfill == 0 && SINK_FULL()) { g_sink_dropped += ns - i; return; }    /* all 16 blocks still queued */
         g_wbuf[g_wcur][g_wfill * 2] = (int16_t)li; g_wbuf[g_wcur][g_wfill * 2 + 1] = (int16_t)ri;
         if (g_wav) { int16_t fr[2] = {(int16_t)li, (int16_t)ri}; fwrite(fr, 4, 1, g_wav); g_wav_frames++; }
         if (++g_wfill == SINK_BLOCK) sink_submit();

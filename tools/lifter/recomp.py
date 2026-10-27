@@ -27,10 +27,13 @@ sys.path.insert(0, os.path.join(_REPO, 'tools'))
 import target as _T  # noqa: E402
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
-BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
+BASE = int(os.environ.get('RECOMP_BASE', hex(_T.GUEST_BASE)), 16)
 FILE_OFF = 0x1000
 
-IMG = open(ELF, 'rb').read()
+# RECOMP_ELF=none: no module (tools/lifter/difftest.py with DIFFTEST_MODULES=macho:..., run without a dump): Fn.lift of
+# single words works, anything that reads the image does not
+NO_ELF = ELF == 'none'
+IMG = b'' if NO_ELF else open(ELF, 'rb').read()
 
 
 def _elf_layout(img):
@@ -50,7 +53,7 @@ def _elf_layout(img):
     return sec, dt
 
 
-_SEC, _DT = _elf_layout(IMG)
+_SEC, _DT = ({'.text': (0, 0)}, {5: 0, 6: 0, 7: 0, 8: 0}) if NO_ELF else _elf_layout(IMG)
 TEXT_SIZE = _SEC['.text'][1]
 RELA, RELASZ = _DT[7], _DT[8]
 JMPREL, PLTRELSZ = _DT.get(23, 0), _DT.get(2, 0)
@@ -199,6 +202,8 @@ class Fn:
         if op0 in (10, 11):
             return self.branch(w, pc)
         if op0 in (4, 6, 12, 14):
+            if w & 0x3ffffc00 == 0x38bfc000:              # LDAPR / LDAPRH / LDAPRB (ARMv8.3 RCPC): not on the Cortex-A57
+                return 'guest_trap("undefined instruction", 0x%xULL);' % pc
             return self.loadstore(w, pc)
         if op0 in (5, 13):
             return self.dp_reg(w, pc)
@@ -790,8 +795,8 @@ class Fn:
                       (0, 1, 0x0e): 'F1_CMLT0', (1, 1, 0x0d): 'F1_CMLE0'}.get((u, a, opc))
                 if op:
                     return 'v_f1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, sz, fcount())
-                if (u, opc) == (0, 0x12) and not scalar and size < 3:
-                    return 'v_xtn(%s, %s, %d);' % (V(rd), V(rn), size)
+                if (u, opc) == (0, 0x12) and not scalar and size < 3:     # XTN, XTN2 (Q = 1: into the upper half)
+                    return 'v_%s(%s, %s, %d);' % ('xtn2' if bits(w, 30, 30) else 'xtn', V(rd), V(rn), size)
                 op = {(1, 0x05): 'I1_NOT', (0, 0x05): 'I1_CNT', (1, 0x0b): 'I1_NEG', (0, 0x0b): 'I1_ABS',
                       (0, 0x09): 'I1_CMEQ0', (0, 0x00): 'I1_REV64'}.get((u, opc))
                 if op is None or (op in ('I1_NOT', 'I1_CNT') and size):

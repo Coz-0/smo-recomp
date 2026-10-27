@@ -7,8 +7,12 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 

@@ -24,9 +24,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 /* the Khronos headers of the Vulkan SDK (VULKAN_HEADERS, -I in build_exe.py) */
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#else
+#define VK_USE_PLATFORM_METAL_EXT      /* macOS: the surface is the window's CAMetalLayer (display.c) */
+#endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "nvn_front.h"
@@ -49,6 +57,11 @@ int display_wait_refresh(void);
 void display_before_present(void);
 
 /* ---------------------------------------------------------------- the loader's functions */
+#ifdef _WIN32
+#define VKF_SURFACE(X) X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
+#else
+#define VKF_SURFACE(X) X(VkResult, vkCreateMetalSurfaceEXT, (VkInstance, const VkMetalSurfaceCreateInfoEXT *, const VkAllocationCallbacks *, VkSurfaceKHR *))
+#endif
 #define VKF(X) \
     X(VkResult, vkEnumerateInstanceLayerProperties, (uint32_t *, VkLayerProperties *)) \
     X(VkResult, vkEnumerateInstanceExtensionProperties, (const char *, uint32_t *, VkExtensionProperties *)) \
@@ -59,7 +72,7 @@ void display_before_present(void);
     X(void, vkGetPhysicalDeviceProperties, (VkPhysicalDevice, VkPhysicalDeviceProperties *)) \
     X(void, vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *)) \
     X(VkResult, vkEnumerateDeviceExtensionProperties, (VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *)) \
-    X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *)) \
+    VKF_SURFACE(X) \
     X(void, vkDestroySurfaceKHR, (VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceSupportKHR, (VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceCapabilitiesKHR, (VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *)) \
@@ -193,7 +206,11 @@ static int swapchain_create(void) {
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
+#ifdef _WIN32
     if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
+#else
+    if (ext.width == 0xffffffffu) { void display_pixel_size(int *w, int *h); int w, h; display_pixel_size(&w, &h); ext.width = (uint32_t)w; ext.height = (uint32_t)h; }
+#endif
     if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
     if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
     if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
@@ -227,9 +244,52 @@ static int swapchain_create(void) {
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
-    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
+    if (!p) { printf("nvn_vk: the Vulkan loader does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
+
+#ifndef _WIN32
+/* macOS: the Vulkan loader and the driver it loads. The driver: VK_DRIVER_FILES / VK_ICD_FILENAMES when set; else
+ * SMO_VK_DRIVER=moltenvk (the default) or kosmickrisp (Vulkan 1.3 conformant, on Metal), from the Vulkan SDK found
+ * (VULKAN_SDK, ~/VulkanSDK). MoltenVK is the default for speed: a render pass costs 25-80 us there against 100-170 us on
+ * KosmicKrisp, and the game ends 70-90 passes a frame (Cap Kingdom, M4: GPU 6-8 ms a frame against 18-19 ms, 42-60 fps
+ * against 26-43 over the same frames). The loader: libvulkan.1.dylib next to the program, in that SDK, or
+ * Homebrew's. docs/macos-port.md has what each driver offers the renderer. */
+static void mac_loader_and_driver(void) {
+    char exe[MAX_PATH] = "", path[4096], sdk[2048] = "";
+    const char *env_sdk = getenv("VULKAN_SDK"), *want = getenv("SMO_VK_DRIVER");
+    if (env_sdk && env_sdk[0]) snprintf(sdk, sizeof sdk, "%s", env_sdk);
+    else {
+        WIN32_FIND_DATAA fd;
+        char pat[1024];
+        snprintf(pat, sizeof pat, "%s/VulkanSDK/*", getenv("HOME") ? getenv("HOME") : "");
+        HANDLE h = FindFirstFileA(pat, &fd);                   /* the newest SDK: the last name in order */
+        if (h != INVALID_HANDLE_VALUE) {
+            char best[256] = "";
+            do if (fd.cFileName[0] != '.' && strcmp(fd.cFileName, best) > 0) snprintf(best, sizeof best, "%s", fd.cFileName); while (FindNextFileA(h, &fd));
+            FindClose(h);
+            if (best[0]) snprintf(sdk, sizeof sdk, "%s/VulkanSDK/%s/macOS", getenv("HOME"), best);
+        }
+    }
+    int moltenvk = !(want && !_stricmp(want, "kosmickrisp"));
+    if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES") && sdk[0]) {
+        snprintf(path, sizeof path, "%s/share/vulkan/icd.d/%s", sdk, moltenvk ? "MoltenVK_icd.json" : "libkosmickrisp_icd.json");
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) setenv("VK_DRIVER_FILES", path, 1);
+    }
+    printf("nvn_vk: Vulkan driver %s\n", getenv("VK_DRIVER_FILES") ? getenv("VK_DRIVER_FILES") : getenv("VK_ICD_FILENAMES") ? getenv("VK_ICD_FILENAMES") : "the loader's own search");
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    char *sl = strrchr(exe, '\\');
+    if (sl) *sl = 0;
+    const char *tries[3] = {exe, sdk[0] ? sdk : NULL, "/opt/homebrew"};
+    for (int i = 0; i < 3 && !V.loader; i++) {
+        if (!tries[i]) continue;
+        snprintf(path, sizeof path, i ? "%s/lib/libvulkan.1.dylib" : "%s\\libvulkan.1.dylib", tries[i]);
+        recomp_path(path, sizeof path, path);
+        V.loader = LoadLibraryA(path);
+    }
+    if (!V.loader) { printf("nvn_vk: no Vulkan loader (libvulkan.1.dylib next to the program, in the Vulkan SDK or Homebrew's)\n"); fflush(stdout); ExitProcess(5); }
+}
+#endif
 
 /* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
 int nvn_vk_init(void *hwnd) {
@@ -238,8 +298,12 @@ int nvn_vk_init(void *hwnd) {
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+#ifdef _WIN32
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+#else
+    mac_loader_and_driver();
+#endif
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
@@ -252,10 +316,18 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
-    const char *exts[4], *layers[1];
+    const char *exts[6], *layers[1];
     uint32_t next = 0, nlayers = 0;
-    exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
-    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
+#ifdef _WIN32
+    const char *surface_ext = "VK_KHR_win32_surface";
+#else
+    const char *surface_ext = "VK_EXT_metal_surface";
+#endif
+    exts[next++] = "VK_KHR_surface"; exts[next++] = surface_ext;
+    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, surface_ext)) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / %s\n", surface_ext); fflush(stdout); ExitProcess(5); }
+    /* a "portability" driver (MoltenVK) is listed only to an instance that asks for them */
+    int portability = has_name(iext, niext, "VK_KHR_portability_enumeration");
+    if (portability) exts[next++] = "VK_KHR_portability_enumeration";
     { const char *e = getenv("SMO_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -273,6 +345,7 @@ int nvn_vk_init(void *hwnd) {
     memset(&ici, 0, sizeof ici);
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.pApplicationInfo = &app;
     ici.enabledLayerCount = nlayers; ici.ppEnabledLayerNames = layers; ici.enabledExtensionCount = next; ici.ppEnabledExtensionNames = exts;
+    if (portability) ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     r = vkCreateInstance(&ici, NULL, &V.instance);
     if (r != VK_SUCCESS) vk_fatal("vkCreateInstance", r);
     if (V.validate) {
@@ -288,11 +361,19 @@ int nvn_vk_init(void *hwnd) {
         printf("nvn_vk: validation layer on (VK_LAYER_KHRONOS_validation); messages are printed as vk-validation:\n");
     }
 
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
     r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
     if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+#else
+    VkMetalSurfaceCreateInfoEXT si;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT; si.pLayer = hwnd;
+    r = vkCreateMetalSurfaceEXT(V.instance, &si, NULL, &V.surface);
+    if (r != VK_SUCCESS) vk_fatal("vkCreateMetalSurfaceEXT", r);
+#endif
 
     /* device: discrete > integrated > virtual > other; needs one queue family with graphics + compute that can present to the window */
     VkPhysicalDevice gpus[16];
@@ -552,6 +633,9 @@ void nvn_vk_selftest_hook(void) {
         nvn_render_run(job_selftest_frame, &i);
         display_pace();
         display_wait_refresh();
+#ifndef _WIN32
+        { void display_pump(void); display_pump(); }          /* macOS: this runs on the main thread, which owns the window's events */
+#endif
         if (i >= 0) { QueryPerformanceCounter(&now); dt[i] = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)f.QuadPart; sum += dt[i]; prev = now; }
     }
     qsort(dt, (size_t)n, sizeof *dt, cmp_double);

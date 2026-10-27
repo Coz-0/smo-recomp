@@ -10,7 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <SDL3/SDL.h>
 #include "nnpad.h"
 

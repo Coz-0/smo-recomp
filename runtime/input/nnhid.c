@@ -10,7 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+int display_window_foreground(void);                  /* display (macOS): the game window is the active one */
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
@@ -446,10 +451,14 @@ static int keyboard_ours(void) {
     if (mode < 0) mode = (getenv("SMO_SEQ") || getenv("SMO_PLAY")) && !getenv("SMO_SEQ_KEYBOARD") ? 0 : 1;
     if (!mode) return 0;
     if (checked_at != g_sampling) {                       /* once per poll */
+        checked_at = g_sampling;
+#ifdef _WIN32
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
-        checked_at = g_sampling;
         ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+#else
+        ours = display_window_foreground();
+#endif
     }
     return ours;
 }
@@ -906,9 +915,13 @@ void hid_menu_closed(void) { for (int i = 0; i < 8; i++) { g_menu_mask[i] = g_me
  * this process has the foreground window (as keyboard_ours, checked here every call: the game does not poll meanwhile) */
 int hid_menu_key(int which) {
     static int was[2];
+#ifdef _WIN32
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
     int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId() && !scripted_run();
+#else
+    int ours = display_window_foreground() && !scripted_run();
+#endif
     int on = ours && (GetAsyncKeyState(which ? VK_RETURN : VK_ESCAPE) & 0x8000) != 0, hit = on && !was[which & 1];
     was[which & 1] = on;
     return hit;

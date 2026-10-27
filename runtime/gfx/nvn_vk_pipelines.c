@@ -12,7 +12,9 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#ifdef _WIN32
 #include <psapi.h>
+#endif
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -27,7 +29,7 @@ typedef struct VStage {
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
-#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+#define MX_VK_VERSION 13u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
@@ -406,7 +408,11 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
 }
 
 /* ---------------------------------------------------------------- pipelines */
-typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; } PKey;
+typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8];
+#ifndef _WIN32
+    VLay vl;                                       /* without dynamic vertex input: the vertex layout (nvn_vk_vlayout.c); zero with it */
+#endif
+} PKey;
 static uint64_t pkey_hash(const PKey *k) { return hmix(0xcbf29ce484222325ULL, k, sizeof *k); }      /* the table of pipelines (g_pipes, in memory only) */
 typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* see gs_pipe_get */; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
@@ -819,6 +825,10 @@ static double pipe_build(Pipe *p) {
     if (fs) { st[nst].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[nst].module = stage_mod_get(fs); if (p->gs && g_gs_dbg_fs) st[nst].module = g_gs_dbg_fs; st[nst++].pName = "main"; }
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+#ifndef _WIN32
+    VlState vls;                                   /* without dynamic vertex input: the layout of the key */
+    if (!D.has_vids && !vl_state(&k->vl, &vls, D.has_vad)) nvn_vk_missing("an instance divisor above 1 on a device without VK_EXT_vertex_attribute_divisor");
+#endif
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1; vp.pNext = vk_vp_next();
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -847,7 +857,7 @@ static double pipe_build(Pipe *p) {
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT};
-    uint32_t ndyn = 20;
+    uint32_t ndyn = D.has_vids ? 20 : 19;          /* the vertex input is the last of them */
     if (D.has_eds3) {
         dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
         dyn[ndyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_SAMPLE_MASK_EXT;
@@ -864,6 +874,9 @@ static double pipe_build(Pipe *p) {
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &ri; gi.stageCount = nst; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
+#ifndef _WIN32
+    if (!D.has_vids) gi.pVertexInputState = &vls.vi;
+#endif
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
     stage_mod_put(vs); if (p->gs) stage_mod_put(p->gs); if (fs) stage_mod_put(fs);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, geometry stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, p->gs ? p->gs->id : 0, k->ncolor, k->dfmt, vk_result_name(r));
@@ -904,6 +917,9 @@ static PairRec *pair_get(VStage *vs, VStage *fs) {                 /* g_sh_lock 
 static int sig_note(const PKey *k, int *idx) {     /* g_sh_lock held: the index of the signature when it is NEW, else -1; *idx: its index either way (-1: table full) */
     PKey s = *k;
     s.vs = s.fs = 0; s.topo_class = 2; s.sshade = 0;
+#ifndef _WIN32
+    memset(&s.vl, 0, sizeof s.vl);                 /* a pass signature has no vertex layout */
+#endif
     for (int i = 0; i < g_nsig; i++) if (!memcmp(&g_sig[i].k, &s, sizeof s)) { g_sig[i].uses++; *idx = i; return -1; }
     *idx = -1;
     if (g_nsig == 64) return -1;
@@ -1461,7 +1477,17 @@ static void prewarm_start(void) {
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
-    {   HMODULE m = LoadLibraryA("smo_glslang.dll");
+    {
+#ifdef _WIN32
+        HMODULE m = LoadLibraryA("smo_glslang.dll");
+#else
+        HMODULE m = NULL;                                 /* macOS: libsmo_glslang.dylib beside the program */
+        {   char path[MAX_PATH + 32];
+            GetModuleFileNameA(NULL, path, MAX_PATH);
+            char *sl = strrchr(path, '\\');
+            if (sl) { strcpy(sl + 1, "libsmo_glslang.dylib"); recomp_path(path, sizeof path, path); m = LoadLibraryA(path); }
+        }
+#endif
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("smo_glslang.dll cannot be loaded (the link step writes it beside the exe)");
     }
@@ -1528,7 +1554,11 @@ static void prewarm_start(void) {
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a new scene) is spread over all cores instead of done one by one at the draws.
  * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig;
+#ifndef _WIN32
+    VStream vstream[32]; uint32_t vbound;          /* without dynamic vertex input the key holds the layout: the streams and which have a buffer (draw_prepare) */
+#endif
+} Scan;
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);
@@ -1541,6 +1571,10 @@ static void scan_begin(Scan *s) {
     g_scan_ti[0] = (uint32_t)R.tex_int[0]; g_scan_ti[1] = (uint32_t)R.tex_int[1]; g_scan_tsi[0] = (uint32_t)R.tex_sint[0]; g_scan_tsi[1] = (uint32_t)R.tex_sint[1];
     s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->gprog = R.prog[2]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
+#ifndef _WIN32
+    memcpy(s->vstream, R.vstream, sizeof s->vstream);
+    s->vbound = 0; for (int i = 0; i < 16; i++) if (R.vbuf[i].addr && R.vbuf[i].size) s->vbound |= 1u << i;
+#endif
     scan_sig(s);
 }
 static void scan_draw(Scan *s, unsigned prim) {
@@ -1559,6 +1593,11 @@ static void scan_draw(Scan *s, unsigned prim) {
     uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
                      (uint64_t)s->ints << 32 | s->sints, (uint64_t)g_scan_ti[0] << 32 | g_scan_ti[1]};
     uint64_t tag = hmix(0xcbf29ce484222325ULL, w, sizeof w) | 1;
+#ifndef _WIN32
+    VLay vl;                                       /* without dynamic vertex input the layout is part of the key: of what was met too */
+    memset(&vl, 0, sizeof vl);
+    if (!D.has_vids) { vl_of(&vl, s->nattr, s->vattr, s->ints, s->sints, s->vstream, s->vbound); tag = hmix(tag, &vl, sizeof vl) | 1; }
+#endif
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
@@ -1568,6 +1607,9 @@ static void scan_draw(Scan *s, unsigned prim) {
     int vs_made = fs_made && vs && vs->state == 2 && key_fits(0, key0, vs->key, vs->dep, vs->tex_units) && vs->fo == (fs && fs->ok ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0);
     PKey k = s->sig;
     k.topo_class = tclass[prim]; k.logic = s->logic; k.sshade = p1 ? (uint8_t)p1->sample_shading : 0;
+#ifndef _WIN32
+    k.vl = vl;
+#endif
     if (vs_made && fs_made) {
         if (!vs->ok || (fs && !fs->ok)) return;
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
@@ -1618,6 +1660,11 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
             break;
         }
         case OP_VATTR: s->nattr = (int)a[0] < 32 ? (int)a[0] : 32; memcpy(s->vattr, BLOB(m), (size_t)s->nattr * 4); s->attr_new = 1; break;
+#ifndef _WIN32
+        case OP_VSTREAM: for (int i = 0; i < (int)a[0] && i < 32; i++) memcpy(&s->vstream[i], BLOB(m) + i * 8, 8); break;
+        case OP_VBUF: for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) { uint64_t r[2]; memcpy(r, BLOB(m) + i * 16, 16);
+                          if (r[0] && r[1]) s->vbound |= 1u << (a[0] + i); else s->vbound &= ~(1u << (a[0] + i)); } break;
+#endif
         case OP_COLOR: s->logic = ((const uint8_t *)&a[0])[1]; break;
         case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: scan_draw(s, (unsigned)a[0]); break;
         case OP_CALL: for (int i = 0; i < (int)a[0]; i++) { uint64_t h; memcpy(&h, BLOB(m) + i * 8, 8); if (depth < 8) scan_list(h, depth + 1, s); } break;

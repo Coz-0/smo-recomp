@@ -6,8 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#include "core_model.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -33,6 +38,9 @@ typedef struct Obj {
     uint64_t core_mask;
     struct Obj *alias;                       /* system event attached by handle: the event object it shares */
     uint32_t rhandle, whandle;               /* kernel-style handles of a system event created here */
+#ifndef _WIN32
+    struct CmThread *cm;                     /* threads: their place in the core model (core_model.c) */
+#endif
 } Obj;
 
 #define BUCKETS 65536
@@ -79,23 +87,42 @@ static DWORD ns_to_ms(int64_t ns) { return ns <= 0 ? 0 : (DWORD)((ns + 999999) /
 /* nn::os::SleepThread takes nanoseconds and the console's timer is good to a few microseconds. Sleep() counts whole
  * milliseconds on a 1 ms (or 15.6 ms) grid, so the wait runs on a high-resolution waitable timer (100 ns units,
  * Windows 10 1803 and later); Sleep() is only the fallback. A zero or negative span yields, as on the console. */
+static int console_cores(void);
 static void sleep_ns(int64_t ns) {
     static __declspec(thread) HANDLE timer;
     static __declspec(thread) int no_timer;
     LARGE_INTEGER due;
+#ifdef _WIN32
     if (ns <= 0) { SwitchToThread(); return; }
+#else
+    if (ns <= 0) { if (console_cores()) cm_yield(); else SwitchToThread(); return; }   /* SleepThread(0) yields, as on the console */
+#endif
+#ifdef _WIN32
     if (!timer && !no_timer) {
         timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!timer) no_timer = 1;
     }
+#else
+    (void)no_timer;
+#endif
     due.QuadPart = -((ns + 99) / 100);
     /* SMO_SLEEP_LOG=1: a line for every sleep that lasted 2 ms longer than asked (first 200). */
     static int lg = -1; static LONG nl;
     if (lg < 0) lg = getenv("SMO_SLEEP_LOG") && atoi(getenv("SMO_SLEEP_LOG"));
     LARGE_INTEGER q0, q1, fq;
     if (lg) QueryPerformanceCounter(&q0);
+#ifdef _WIN32
     if (!timer || !SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) Sleep(ns_to_ms(ns));
     else WaitForSingleObject(timer, INFINITE);
+#else
+    {   /* macOS: nanosleep is good to tens of microseconds, no timer object needed */
+        struct timespec ts = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
+        (void)due;
+        cm_block_begin();                                 /* the core goes to another thread meanwhile (core_model.c) */
+        while (nanosleep(&ts, &ts) && errno == EINTR) {}
+        cm_block_end();
+    }
+#endif
     if (lg) {
         extern long long nvn_front_frame_next(void);
         QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
@@ -104,12 +131,12 @@ static void sleep_ns(int64_t ns) {
             static __declspec(thread) long long fr0, cnt; static __declspec(thread) double a_sum, s_sum, a_max; static LONG nf;
             long long fr = nvn_front_frame_next();
             if (fr != fr0) {
-                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
+                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, (unsigned long)GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
                 fr0 = fr; cnt = 0; a_sum = s_sum = a_max = 0;
             }
             cnt++; a_sum += asked; s_sum += ms; if (asked > a_max) a_max = asked;
         }
-        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
+        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), (unsigned long)GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
     }
 }
 
@@ -167,6 +194,16 @@ static DWORD_PTR core_slot(DWORD_PTR proc) {           /* the first free slot of
     return proc;
 }
 static int console_cores(void) {
+#ifndef _WIN32
+    /* macOS has no processor affinity: the model there is core_model.c, a token per console core that a guest thread holds
+     * while it runs lifted code (docs/macos-port.md "The console core model on macOS"). SMO_OS_CONSOLE_CORES=0 off. */
+    if (g_cc < 0) {
+        g_cc = cm_enabled();
+        if (g_cc) recomp_set_block_hooks(cm_block_begin, cm_block_end);
+        printf("nn::os: console core model %s (macOS: core tokens; SMO_OS_CONSOLE_CORES=0 turns it off)\n", g_cc ? "ON" : "OFF");
+    }
+    return g_cc;
+#endif
     if (g_cc < 0) {
         int n = 0, on = 0;
         const char *cc = getenv("SMO_OS_CONSOLE_CORES"), *cpus = getenv("SMO_OS_HOST_CPUS");
@@ -315,8 +352,14 @@ static DWORD WINAPI thread_main(LPVOID arg) {
     c->x[0] = o->arg;
     trace_printf("--- thread %llx started (entry %llx, name %s)\n", (unsigned long long)o->key, (unsigned long long)o->fn,
                  o->name ? (const char *)(uintptr_t)o->name : "?");
+#ifndef _WIN32
+    if (o->cm) cm_enter(o->cm);                       /* lifted code from here on runs on a console core (core_model.c) */
+#endif
     call_guest(c, o->fn);
     tls_run_destructors(c);
+#ifndef _WIN32
+    if (o->cm) cm_leave();
+#endif
     trace_printf("--- thread %llx finished\n", (unsigned long long)o->key);
     EnterCriticalSection(&o->cs);
     o->finished = 1;
@@ -370,6 +413,9 @@ static void oslog(const char *fmt, ...) {
     g_oslog_lock = 0;
 }
 void os_thread_report(FILE *out) {
+#ifndef _WIN32
+    cm_report(out);
+#endif
     if (!g_oslog_n) return;
     fprintf(out, "nn::os threads of this run (priority 0 highest .. 31 lowest; cores 0..2 exist on the console):\n%.*s", (int)g_oslog_n, g_oslog);
 }
@@ -378,6 +424,9 @@ static void os_StartThread(Ctx *c) {
     oslog("  start  %-28s entry %llx priority %2d ideal core %d mask %llx stack 0x%llx (called from %llx)\n", o->name ? (const char *)(uintptr_t)o->name : "?",
           (unsigned long long)o->fn, o->priority, o->ideal_core, (unsigned long long)o->core_mask, (unsigned long long)o->stack_size, (unsigned long long)c->x[30]);
     InterlockedIncrement(&g_thread_count);
+#ifndef _WIN32
+    if (console_cores() && !o->cm) o->cm = cm_new(o->priority, o->core_mask, o->name ? (const char *)(uintptr_t)o->name : "?");
+#endif
     o->thread = CreateThread(NULL, (SIZE_T)256 << 20, thread_main, o, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, NULL);
     if (o->thread) { SetThreadPriority(o->thread, host_priority(o->priority)); apply_sched(o->thread, o->core_mask); ResumeThread(o->thread); }
 }
@@ -397,9 +446,17 @@ static void process_priority(void) {
     printf("nn::os: process priority class ABOVE_NORMAL%s (SMO_PRIORITY_CLASS=normal for the NORMAL class)\n", ok ? "" : ": REFUSED");
 }
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
+static Obj *thread_obj(uint64_t key);
 void os_apply_main_sched(void) {
     process_priority();
     if (!console_cores()) return;
+#ifndef _WIN32
+    {   /* the guest's main thread (boot.c) takes core 0, as main.npdm says, before the game's first instruction */
+        Obj *m = thread_obj(0);
+        if (!m->cm) m->cm = cm_new(OS_DEFAULT_PRIORITY, 1ull << OS_DEFAULT_CORE, "main");
+        cm_enter(m->cm);
+    }
+#endif
     apply_sched(GetCurrentThread(), 1ull << OS_DEFAULT_CORE);
     SetThreadPriority(GetCurrentThread(), host_priority(OS_DEFAULT_PRIORITY));
 }
@@ -408,25 +465,34 @@ static void os_DestroyThread(Ctx *c) { Obj *o = obj(A0); if (o->thread) { CloseH
 static void os_SetThreadName(Ctx *c) {               /* the guest string may be a temporary: keep a copy */
     char *copy = _strdup((const char *)(uintptr_t)A1);
     obj(A0)->name = (uint64_t)(uintptr_t)copy;
+#ifndef _WIN32
+    cm_set_name(obj(A0)->cm, copy);
+#endif
 }
 static void os_GetCurrentThread(Ctx *c) {
     if (!t_thread && !rd64((uint64_t)(uintptr_t)g_main_thread + 0x50) && g_main_stack_base)      /* the main thread's ThreadType, once its stack is known (boot.c) */
         thread_type_fill((uint64_t)(uintptr_t)g_main_thread, 0, 0, g_main_stack_base, g_main_stack_size, OS_DEFAULT_PRIORITY);
     RET(t_thread ? t_thread : (uint64_t)g_main_thread);
 }
-static Obj *thread_obj(uint64_t key);
 static void os_GetThreadPriority(Ctx *c) { RET((int64_t)thread_obj(A0 == (uint64_t)(uintptr_t)g_main_thread ? 0 : A0)->priority); }
 static void os_ChangeThreadPriority(Ctx *c) {
     Obj *o = obj(A0);
     int old = o->priority;
     oslog("  change priority of %s: %d -> %d (called from %llx)\n", A0 == (uint64_t)(uintptr_t)g_main_thread ? "the main thread" : o->name ? (const char *)(uintptr_t)o->name : "?", old, (int)A1, (unsigned long long)c->x[30]);
     o->priority = (int)A1;
+#ifndef _WIN32
+    cm_set_priority(o->cm, o->priority);
+#endif
     if (o->thread) SetThreadPriority(o->thread, host_priority(o->priority));
     else if (A0 == (uint64_t)(uintptr_t)g_main_thread || A0 == t_thread) SetThreadPriority(GetCurrentThread(), host_priority(o->priority));
     RET((int64_t)old);
 }
 static void os_GetThreadId(Ctx *c) { Obj *o = obj(A0); RET(o->thread ? GetThreadId(o->thread) : GetCurrentThreadId()); }
+#ifdef _WIN32
 static void os_YieldThread(Ctx *c) { (void)c; SwitchToThread(); }
+#else
+static void os_YieldThread(Ctx *c) { (void)c; if (console_cores()) cm_yield(); else SwitchToThread(); }
+#endif
 static void os_SleepThread(Ctx *c) { sleep_ns((int64_t)A0); }
 static void os_GetCurrentStackInfo(Ctx *c) {
     Obj *o = t_thread ? obj(t_thread) : NULL;
@@ -450,12 +516,17 @@ static void os_SetThreadCoreMask(Ctx *c) {            /* (ThreadType*, int ideal
           ideal, (unsigned long long)mask, o->ideal_core, (unsigned long long)o->core_mask, o->thread ? "running" : "not started", (unsigned long long)c->x[30]);
     int is_self = t_thread ? A0 == t_thread : (!A0 || A0 == (uint64_t)(uintptr_t)g_main_thread);      /* the calling thread names itself */
     HANDLE h = o->thread ? o->thread : is_self ? GetCurrentThread() : NULL;                             /* NULL: not started yet (applied at StartThread) */
-    if (ideal == -2) { o->ideal_core = OS_DEFAULT_CORE; o->core_mask = 1ull << OS_DEFAULT_CORE; apply_sched(h, o->core_mask); return; }   /* IdealCoreUseDefaultValue: mask is ignored */
-    if (ideal == -3) { o->core_mask = mask; apply_sched(h, o->core_mask); return; }                           /* IdealCoreNoUpdate */
-    o->core_mask = mask;
-    if (ideal == -1) { if (!(mask >> (o->ideal_core & 63) & 1)) o->ideal_core = mask ? (int)__builtin_ctzll(mask) : OS_DEFAULT_CORE; }   /* IdealCoreDontCare */
-    else o->ideal_core = ideal;
+    if (ideal == -2) { o->ideal_core = OS_DEFAULT_CORE; o->core_mask = 1ull << OS_DEFAULT_CORE; }   /* IdealCoreUseDefaultValue: mask is ignored */
+    else if (ideal == -3) o->core_mask = mask;                                                        /* IdealCoreNoUpdate */
+    else {
+        o->core_mask = mask;
+        if (ideal == -1) { if (!(mask >> (o->ideal_core & 63) & 1)) o->ideal_core = mask ? (int)__builtin_ctzll(mask) : OS_DEFAULT_CORE; }   /* IdealCoreDontCare */
+        else o->ideal_core = ideal;
+    }
     apply_sched(h, o->core_mask);
+#ifndef _WIN32
+    cm_set_mask(o->cm, o->core_mask);               /* a running thread moves at its next safe point */
+#endif
 }
 static void os_GetThreadCoreMask(Ctx *c) {            /* (int *outIdealCore, Bit64 *outMask, const ThreadType*) */
     Obj *o = thread_obj(A2);
@@ -463,6 +534,9 @@ static void os_GetThreadCoreMask(Ctx *c) {            /* (int *outIdealCore, Bit
     if (A1) wr64(A1, o->core_mask);
 }
 static void os_GetCurrentCoreNumber(Ctx *c) {
+#ifndef _WIN32
+    if (console_cores() && cm_current_core() >= 0) { RET(cm_current_core()); return; }   /* the core whose token it holds */
+#endif
     if (console_cores()) {                                /* the core the thread is on now, as the console answers */
         DWORD_PTR here = (DWORD_PTR)1 << GetCurrentProcessorNumber();
         for (int i = 0; i < 3; i++) if (g_cc_core[i] == here) { RET(i); return; }
@@ -676,7 +750,7 @@ int host_fixed_random(void *buffer, uint64_t size, const char *who, uint64_t lr)
     }
     LONG n = ++calls;
     InterlockedExchange(&lock, 0);
-    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, n, (unsigned long long)size, (unsigned long long)lr);
+    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, (long)n, (unsigned long long)size, (unsigned long long)lr);
     return 1;
 }
 static void os_GenerateRandomBytes(Ctx *c) {

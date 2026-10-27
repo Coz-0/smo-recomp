@@ -6,7 +6,11 @@
  * Environment switches of the test scripts (SMO_RENDERER, SMO_VK_DEVICE, SMO_VK_PRESENT) win over the file.
  * The controllers.ini reader of nnpad_sdl.c is built around its device sections and is not reusable here: this file has
  * its own 30-line reader (key = value, ';' or '#' comments, section headers ignored). */
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

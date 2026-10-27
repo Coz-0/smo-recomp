@@ -2,10 +2,18 @@
  * same pseudo-random state difftest.py gives to Unicorn and prints checksums. */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 
+#ifdef __APPLE__
+#define REGION 0x8200000000ULL      /* 0x10_0000_0000 higher on macOS, as the guest layout (difftest.py REGION) */
+#else
 #define REGION 0x7200000000ULL
+#endif
 #define REGION_SIZE 0x400000ULL
 #define CODE (REGION + 0x200000ULL)
 #define DATA (REGION + 0x300000ULL)

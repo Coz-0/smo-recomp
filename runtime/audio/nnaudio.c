@@ -3,7 +3,11 @@
  * the AudioRenderer's (smo_audio.c). */
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
