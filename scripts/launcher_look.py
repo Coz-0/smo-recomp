@@ -4,6 +4,7 @@ banner, rounded buttons, the navigation). Standard library only.
 Why clam styled by hand and not a theme package: every colour of every widget is set here, so the accent can be the
 game's red, and nothing depends on fonts only one system has.
 """
+import sys
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
@@ -25,10 +26,17 @@ SECOND_HOVER = '#40404a'
 def ui_family():
     """A UI font the system has: Tk's own default is a bitmap font on many Linux desktops."""
     families = set(tkfont.families())
+    if len(families) < 5 and not ui_family.warned:  # a Tk built without Xft (uv's standalone Python on Linux): no desktop fonts
+        ui_family.warned = True
+        print('launcher: this Python\'s Tk sees no desktop fonts, so the window falls back to a bitmap font; a virtual '
+              'environment made from the system\'s Python (its tk package) shows it as intended', file=sys.stderr)
     for f in ('Segoe UI', 'SF Pro Text', 'Inter', 'Noto Sans', 'Cantarell', 'Ubuntu', 'DejaVu Sans'):
         if f in families:
             return f
     return tkfont.nametofont('TkDefaultFont').actual()['family']
+
+
+ui_family.warned = False
 
 
 def apply_theme(root):
