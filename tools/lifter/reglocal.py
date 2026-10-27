@@ -33,12 +33,12 @@ CHECK = os.environ.get('RECOMP_REG_LOCALS_CHECK', '0') == '1'
 
 _REG = re.compile(r'c->x\[(\d+)\]')
 _WRITE = re.compile(r'c->x\[(\d+)\] (?:[-+*/%&|^]|<<|>>)?=(?!=)')
-_CALL = r'(?:(?:f_[0-9a-f]+|imp_\w+|h_\w+)\(c\);|call_indirect\(c, \w+\);|host_import\(c, \d+\);' \
+_CALL = r'(?:(?:f_[0-9a-f]+|imp_\w+|h_\w+)\(c\);|call_indirect\(c, \w+\);|ic_call\(c, t, &ic_[0-9a-f]+, 0x[0-9a-f]+ULL\);|host_import\(c, \d+\);' \
         r'|guest_svc\(c, 0x[0-9a-f]+\);|guest_(?:trap|unimpl)\([^;]*\);)'
 # everything that leaves the function or lets other code read the context; a following `return;` is a tail call
 _EXIT = re.compile(_CALL + r'(?: return;)?|\breturn;|goto L_dispatch;')
 # a line that is one call and nothing conditional (BL, BLR, an import): the context is in step after it
-_PLAIN_CALL = re.compile(r'^(?:L_[0-9a-f]+: )?\s*(?:\{ uint64_t t = [^;]*; )?(?:c->x\[30\] = 0x[0-9a-f]+ULL; )?'
+_PLAIN_CALL = re.compile(r'^(?:L_[0-9a-f]+: )?\s*(?:\{ (?:static uint64_t ic_[0-9a-f]+; )?uint64_t t = [^;]*; )?(?:c->x\[30\] = 0x[0-9a-f]+ULL; )?'
                          + _CALL + r'(?: \})?$')
 _LABEL = re.compile(r'^(L_[0-9a-f]+|L_dispatch):')
 _GOTO = re.compile(r'goto (L_[0-9a-f]+|L_dispatch);')
@@ -47,7 +47,7 @@ _ENDS = re.compile(r'^(?:L_[0-9a-f]+: )?\s*(?:goto L_\w+;|return;|\{ [^{}]*(?:re
                    r'|\{ uint64_t jt = [^{}]*switch \(jt\) \{[^{}]*\} \})$')
 # helpers that take the context but touch only the flags, the exclusive monitor or the SIMD registers (runtime.h, neon.h)
 _CTX_OK = {'adds32', 'adds64', 'logic32', 'logic64', 'set_nzcv', 'cond', 'fcmp', 'stx8', 'stx16', 'stx32', 'stx64',
-           'v_tbl', 'v_stn', 'call_indirect', 'host_import', 'guest_svc'}
+           'v_tbl', 'v_stn', 'call_indirect', 'ic_call', 'host_import', 'guest_svc'}
 _CTX_ARG = re.compile(r'\b(\w+)\(c[,)]')
 # NZCV: the AAPCS64 keeps no flags across a call or a return, so they live in a local `fl` (runtime.h `Nzcv`); the
 # context gets them only where control goes on in another function without coming back (B or BR out of the function,
