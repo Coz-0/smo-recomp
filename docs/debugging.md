@@ -91,7 +91,25 @@ The end of every log has the counts that tell whether a run was healthy:
 
 - Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
   ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
-  the GPU, present). `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why.
+  the GPU, present), `nvn_vk_hostmem:` (vertex and index data read in place from the game's heap or streamed, waits
+  before a write of the host into it), `nvn_vk_ring_kinds:` (what the stream ring copied a frame: uniform, storage,
+  vertex, index, other), `nvn_vk_vstage:` (stage lookups that missed the stage's last variant) and, when there were,
+  `nvn_vk_sync:` (fence waits that found compute results not yet in guest memory and landed them first); every 600
+  frames `copy-backs forced by` counts each reason a copy-back of compute results was forced, and the GPU waits it cost.
+  `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why.
+- Speed switches, each bringing back the way before (for comparisons): `SMO_VK_HOSTMEM=0` (vertex and index ranges
+  copied into the stream ring instead of read in place from the game's heap, imported into Vulkan with
+  VK_EXT_external_memory_host), `SMO_VK_TSET_CACHE=0` (texture descriptor sets per command buffer instead of kept
+  across them), `SMO_VK_OCC_LATE=0` (a conditional render waits for the occlusion count it compares instead of using the
+  last frame's), `SMO_VK_RT_UPLOAD=1` (a render target the game makes again is read from guest memory),
+  `SMO_VK_TEXAHEAD_LOAD=0` (no larger texture budget during loading screens), `SMO_VK_DYN_ALL=1` (every dynamic state
+  sent at every draw), `SMO_FAST_SKIP=0` (registerSampler's free-slot walk one lifted call per slot), `SMO_HOST_PIN=0`
+  (the render thread, the pipeline workers and the renderer's helper threads anywhere instead of away from the console
+  cores; `SMO_HOST_CPUS=<hex mask>` chooses their processors, `SMO_HOST_LAYOUT=1` gives the render thread a core of its
+  own). `SMO_VK_MT=1` (off by default) runs the look-ahead over a batch on a thread of its own beside the replay. The
+  build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default; `RECOMP_ARCH` adds target
+  flags (e.g. `-march=znver2`: the objects then run on that CPU family and later ones only). A change of them recompiles
+  nothing by itself: `tools\lifter\build_main.py --force`, or delete `build\obj\host`.
 - `nvn_vk_frames:` at exit counts the frames that drew a scene, i.e. had compute dispatches (in the Cap Kingdom run 40,164
   of 42,589; the others are boot and loading frames). Within 600 frames of such a frame the renderer does not hold the
   game's threads for its workers and makes only cheap textures ahead of their use; in a frame that draws a scene its
@@ -122,7 +140,7 @@ The end of every log has the counts that tell whether a run was healthy:
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
   `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
   the render thread), `SMO_VK_VTXGROW=0` (vertex streams are copied only as far as the range the game bound, even when
-  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=1` lets the present not wait for the render thread (one frame in flight);
+  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=0` makes the present wait for the render thread again (by default it does not: one frame in flight);
   `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
 
 ## Memory

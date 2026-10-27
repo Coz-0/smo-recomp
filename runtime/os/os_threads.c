@@ -225,6 +225,52 @@ static int console_cores(void) {
     }
     return g_cc;
 }
+/* The processors for the runtime's own busy threads (the render thread, the pipeline workers and the helper threads of the
+ * renderer): the process's minus the console cores' processors and the second hardware threads of their cores, so that
+ * no game thread pinned there (the main thread, the presentation thread at priority 7 ...) preempts them and they do not
+ * share a core with one. Without this the render thread was found "not on a CPU" in frames that missed the 60 Hz refresh
+ * (SMO_HITCH). 0 when that would leave nothing, or with SMO_HOST_PIN=0; SMO_HOST_CPUS=<hex mask> chooses them. */
+uint64_t os_host_cpu_mask(void) {
+    static uint64_t mask = 1;
+    if (mask == 1) {
+        const char *pin = getenv("SMO_HOST_PIN"), *cpus = getenv("SMO_HOST_CPUS");
+        DWORD_PTR proc = 0, sys = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+        mask = 0;
+        if (pin && atoi(pin) == 0) {}
+        else if (cpus && cpus[0]) mask = (uint64_t)_strtoui64(cpus, NULL, 16) & proc;
+        else if (console_cores()) {
+            uint64_t game = 0;
+            for (int i = 0; i < 3; i++) game |= g_cc_core[i] | (g_cc_core[i] & 0xaaaaaaaaaaaaaaaaull ? g_cc_core[i] >> 1 : g_cc_core[i] << 1);
+            mask = (uint64_t)proc & ~game;
+        }
+        printf("nn::os: the runtime's own threads (render, pipeline workers, helpers) on processors %llx%s\n", (unsigned long long)mask,
+               mask ? " (away from the console cores and their second hardware threads; SMO_HOST_PIN=0: anywhere)" : ": anywhere");
+    }
+    return mask;
+}
+/* SMO_HOST_LAYOUT=1: the render thread gets the lowest core of that mask to itself (one processor of it, the core's second
+ * hardware thread left idle) and the runtime's other threads the rest, so that no helper shares a core with it. */
+static int host_layout(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_HOST_LAYOUT"); on = e && atoi(e) > 0; } return on; }
+static uint64_t render_core_mask(void) {          /* both processors of the lowest core in the host mask, or 0 */
+    uint64_t m = os_host_cpu_mask();
+    if (!m) return 0;
+    int b = 0;
+    while (!(m >> b & 1)) b++;
+    return (3ull << (b & ~1)) & m;
+}
+void os_pin_host_thread(void) {
+    uint64_t m = os_host_cpu_mask();
+    if (m && host_layout() && (m & ~render_core_mask())) m &= ~render_core_mask();
+    if (m) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+}
+void os_pin_render_thread(void) {
+    uint64_t rc = render_core_mask();
+    if (!host_layout() || !rc) { os_pin_host_thread(); return; }
+    uint64_t one = rc & (~rc + 1);                 /* the core's first processor only */
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)one);
+    printf("nn::os: SMO_HOST_LAYOUT=1: the render thread alone on processor mask %llx, the runtime's other threads on %llx\n", (unsigned long long)one, (unsigned long long)(os_host_cpu_mask() & ~rc));
+}
 static void apply_sched(HANDLE h, uint64_t core_mask) {
     DWORD_PTR m = 0;
     if (!console_cores() || !h) return;
