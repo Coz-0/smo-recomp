@@ -135,6 +135,9 @@ The end of every log has the counts that tell whether a run was healthy:
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
   by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
+- `SMO_YAZ0=0` leaves the game's own Yaz0 decoders (sead's `SZSDecompressor`, every `.szs` the game opens) where
+  `runtime/game/smo_yaz0.c` decodes in host code; the lifter puts the call there (`tools/lifter/game_patches.py`), and
+  the exit report counts the chunks and files it decoded. `tests/check_yaz0.py` compares the two on every `.szs`.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),

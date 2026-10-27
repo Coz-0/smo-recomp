@@ -1021,7 +1021,8 @@ def lift_function(env, entry):
     while pc < end:
         w = word(pc)
         try:
-            stmt = patches.get(pc) or fn.lift(w, pc)
+            p = patches.get(pc)
+            stmt = p if isinstance(p, str) else p[1] + ' ' + fn.lift(w, pc) if p else fn.lift(w, pc)   # ('before', C)
         except Unimpl as e:
             stmt = 'guest_unimpl(0x%xULL, 0x%08xU, "%s");' % (pc, w, e)
             bad.append((pc, w, str(e)))
