@@ -207,9 +207,10 @@ static int swapchain_create(void) {
     ci.minImageCount = caps.minImageCount + 1 < 3 ? 3 : caps.minImageCount + 1;
     if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
     ci.imageFormat = V.format.format; ci.imageColorSpace = V.format.colorSpace;
+    { void smo_aspect_window(int w, int h); smo_aspect_window((int)ext.width, (int)ext.height); }      /* the game's views follow the window's shape (smo_aspect.c) */
     ci.imageExtent = ext;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);      /* (read back by SMO_SWAPSHOT) */
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;

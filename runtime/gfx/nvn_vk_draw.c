@@ -2336,6 +2336,72 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     }
 }
 /* Everything of a draw up to the draw call. topo: NVN primitive. Returns 0 when the draw cannot be done (counted as skipped). */
+static LONG64 g_hud_fixed;                         /* HUD layer draws given the matrix for the window's shape (hud_fix) */
+/* The HUD's and menus' layers at the window's shape (smo_aspect.c fits the world's cameras to it; the layers are left
+ * 16:9 there, as they draw into the game's 16:9 images). A draw whose vertex c3 is nn::ui2d's block - a 16:9 perspective
+ * matrix with its view folded in (c3[0-3]: fovy 15, the camera 2734 units away), the pane's transform in c3[4-6], its
+ * rectangle (width, height, left, top) in c3[33] - gets, in a copy of the block, the matrix that undoes the window's
+ * stretch: on a window taller than 16:9 (16:10) its height times the shape, so the HUD keeps its shape in the middle of
+ * the window; on a wider one its width divided by it. A pane that covers the whole 16:9 height (or width) - a fade, a
+ * background, a screen's picture - keeps the 16:9 matrix and with it fills the window. SMO_ASPECT_HUD=0: off. */
+static int hud_fix(uint64_t addr, uint64_t size, BufRef *b) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("SMO_ASPECT_HUD") && !atoi(getenv("SMO_ASPECT_HUD")));
+    float smo_aspect_shape(void);
+    float sh = smo_aspect_shape();
+    if (!on || sh == 1.0f || size < 64 || !R.col[0].tex || !rs_screen_class(R.col[0].tex->b.width, R.col[0].tex->b.height)) return 0;
+    const float *g = (const float *)(uintptr_t)addr;
+    /* A layer is known by the rows its 16:9 view leaves alone: depth and w (-1.0002, 2733.02 / -1, 2734.47: fovy 15, the
+     * camera 2734 units away). Rows x and y carry the pane's own transform too (a rotated piece - the life meter's
+     * number - has m01, m10; some layers draw upside down, m11 < 0), so the whole row is scaled. */
+    if (!(g[8] == 0 && g[9] == 0 && fabsf(g[10] + 1.0002f) < 1e-4f && fabsf(g[11] - 2733.02f) < 0.05f && g[12] == 0 && g[13] == 0 && g[14] == -1 && fabsf(g[15] - 2734.47f) < 0.05f)) return 0;
+    int tall = sh < 1.0f;
+    float edge = 0;                                /* -1 / +1: the pane reaches the bottom (left) / top (right) edge */
+    /* A frame that draws no scene (the controller and loading screens, the title's menus) is a 2D screen laid out for
+     * 16:9: all of it goes into the 16:9 box, with bars, as on a 16:9 screen (with the rules below its rows came apart:
+     * text as wide as the screen anchored to an edge, its pictures in the box). In play the scene fills the window and
+     * the rules below fit the HUD over it. (g_in_scene: the last frame had compute dispatches.) */
+    if (size >= 136 * 4 && g_in_scene) {                         /* the pane's corners in normalized device coordinates */
+        const float *mv = g + 16, *rc = g + 132;
+        float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
+        for (int k = 0; k < 4 && rc[0] > 0 && rc[1] > 0; k++) {
+            float x = (float)(k & 1) * rc[0] + rc[2], y = rc[3] - (float)(k >> 1) * rc[1];
+            float wx = mv[0] * x + mv[1] * y + mv[3], wy = mv[4] * x + mv[5] * y + mv[7], wz = mv[8] * x + mv[9] * y + mv[11];
+            float cw = g[12] * wx + g[13] * wy + g[14] * wz + g[15];
+            if (cw <= 0) { lo[0] = 1e9f; break; }
+            float n[2] = {(g[0] * wx + g[1] * wy + g[2] * wz + g[3]) / cw, (g[4] * wx + g[5] * wy + g[6] * wz + g[7]) / cw};
+            for (int a = 0; a < 2; a++) { if (n[a] < lo[a]) lo[a] = n[a]; if (n[a] > hi[a]) hi[a] = n[a]; }
+        }
+        /* the whole screen (a fade, a background, the scene's picture): stretched with the window; any smaller pane
+         * stays in the 16:9 box, so a 2D screen keeps its layout whole (a pane over the whole height only - the side
+         * panel of the controller screen - stretched alone and the screen came apart) */
+        if (lo[0] <= -0.99f && hi[0] >= 0.99f && lo[1] <= -0.99f && hi[1] >= 0.99f) return 0;
+        /* A pane as wide as the screen (as tall, on a wider window) - measured by its size: the title's map slides in
+         * from the side in two halves - is a background or a band. Over nearly the whole height: a background,
+         * stretched with the window. Touching an edge - the dark band behind the hints, the loading screen's band at the
+         * bottom: anchored to that edge rather than to the middle. Anything else stays with the 16:9 box: a band that
+         * merely lies in the lower half is often a row of text as wide as the screen (the controller screen's), whose
+         * pictures are in the box (anchoring all of the lower half took its text off its pictures). Known miss: the
+         * loading screen's thin line just above its band stays in the box, a few pixels above the band. */
+        int a = tall ? 1 : 0;
+        if (!tall && hi[0] - lo[0] >= 1.98f) return 0;      /* wider than 16:9: a band as wide as the screen stretches to the window's width */
+        if (hi[1 - a] - lo[1 - a] >= 1.98f) {
+            if (lo[a] <= -0.9f && hi[a] >= 0.9f) return 0;
+            if (lo[a] <= -0.99f) edge = -1; else if (hi[a] >= 0.99f) edge = 1;
+        }
+    }
+    static float buf[0x10000 / 4];
+    uint64_t n = size > sizeof buf ? sizeof buf : size;
+    memcpy(buf, g, n);
+    /* ndc' = f * ndc + edge * (1 - f): row' = f * row + edge * (1 - f) * row w (g[12..15], whose product is the clip w) */
+    float f = tall ? sh : 1.0f / sh;
+    int r0 = tall ? 4 : 0;
+    for (int k = 0; k < 4; k++) buf[r0 + k] = f * g[r0 + k] + edge * (1.0f - f) * g[12 + k];
+
+    b->zero = 0; b->size = size; b->buf = R.ring; b->off = ring_raw(buf, n);
+    g_hud_fixed++;
+    return 1;
+}
 static int draw_prepare(unsigned prim) {
     {   /* with SMO_VK_PASSSHOT: the state of each draw of that frame (every draw kind passes here) */
             static int want = -2;
@@ -2406,6 +2472,7 @@ static int draw_prepare(unsigned prim) {
             b->zero = 0; b->buf = R.ring;
             if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
+            else if (n == 3 && s == 0 && R.ubo[0][0].addr && R.ubo[0][0].size && hud_fix(R.ubo[0][0].addr, R.ubo[0][0].size, b)) {}      /* a HUD layer at the window's shape */
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) { g_rp_kind = 0; buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b); g_rp_kind = 4; }
             else b->zero = 1;
         }
@@ -3832,11 +3899,77 @@ swap: ;
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
             b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + s4[2]; b.srcOffsets[1].y = s4[1] + s4[3]; b.srcOffsets[1].z = 1;
             b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
+            {   /* A 2D screen (no scene in the frame) on a window that is not 16:9: its layout is in the 16:9 box (hud_fix);
+                 * only that part of the picture is shown, the rest black, so what the world's wider or taller view adds
+                 * around it (the title's 3D Mario below the menu, the loading screen's icon) does not spill into the bars. */
+                float smo_aspect_shape(void);
+                float shp = smo_aspect_shape();
+                if (shp != 1.0f && !g_in_scene && !progress) {
+                    VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f;
+                    vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr);
+                    VkImageMemoryBarrier wb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    wb.srcQueueFamilyIndex = wb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; wb.image = V.images[index]; wb.subresourceRange = sr;
+                    wb.srcAccessMask = wb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; wb.oldLayout = wb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &wb);
+                    if (shp < 1.0f) {                  /* taller: the middle rows */
+                        float m = (1.0f - shp) / 2.0f;
+                        int sh0 = b.srcOffsets[1].y - b.srcOffsets[0].y;
+                        b.srcOffsets[0].y += (int32_t)(m * (float)sh0 + 0.5f); b.srcOffsets[1].y -= (int32_t)(m * (float)sh0 + 0.5f);
+                        b.dstOffsets[0].y = (int32_t)(m * (float)V.extent.height + 0.5f); b.dstOffsets[1].y = (int32_t)V.extent.height - b.dstOffsets[0].y;
+                    } else {                           /* wider: the middle columns */
+                        float m = (1.0f - 1.0f / shp) / 2.0f;
+                        int sw0 = b.srcOffsets[1].x - b.srcOffsets[0].x;
+                        b.srcOffsets[0].x += (int32_t)(m * (float)sw0 + 0.5f); b.srcOffsets[1].x -= (int32_t)(m * (float)sw0 + 0.5f);
+                        b.dstOffsets[0].x = (int32_t)(m * (float)V.extent.width + 0.5f); b.dstOffsets[1].x = (int32_t)V.extent.width - b.dstOffsets[0].x;
+                    }
+                }
+            }
             vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         overlay_draw(index);
+        /* SMO_SWAPSHOT=<frame> (debug aid): the window's image as presented in that frame, to <SMO_SHOT_DIR>/swap_<frame>.bmp
+         * (the game's own screenshots are its picture before the present: they do not show what the present does) */
+        static int swf = -2;
+        if (swf == -2) swf = getenv("SMO_SWAPSHOT") ? atoi(getenv("SMO_SWAPSHOT")) : -1;
+        VkBuffer swbuf = NULL; VMem swmem; memset(&swmem, 0, sizeof swmem);
+        if (swf >= 0 && frame == swf && !progress) {
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            VkMemoryRequirements rq;
+            bi.size = (VkDeviceSize)V.extent.width * V.extent.height * 4; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VKC(vkCreateBuffer(V.device, &bi, NULL, &swbuf));
+            vkGetBufferMemoryRequirements(V.device, swbuf, &rq);
+            swmem = vmem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
+            VKC(vkBindBufferMemory(V.device, swbuf, swmem.mem, swmem.off));
+            image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy c; memset(&c, 0, sizeof c);
+            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
+            c.imageExtent.width = V.extent.width; c.imageExtent.height = V.extent.height; c.imageExtent.depth = 1;
+            vkCmdCopyImageToBuffer(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swbuf, 1, &c);
+            image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        } else
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         cmd_submit(acq, rend);
+        if (swbuf) {
+            cmd_wait_all();
+            char path[400]; const char *dir = getenv("SMO_SHOT_DIR");
+            snprintf(path, sizeof path, "%s%sswap_%lld.bmp", dir ? dir : "", dir ? "/" : "", (long long)frame);
+            int w = (int)V.extent.width, h = (int)V.extent.height, bgr = V.format.format == VK_FORMAT_B8G8R8A8_UNORM || V.format.format == VK_FORMAT_B8G8R8A8_SRGB;
+            uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, fsize = 54 + row * (uint32_t)h, v;
+            uint8_t head[54] = {'B', 'M'}, *img = malloc((size_t)row * h);
+            FILE *f = img ? fopen(path, "wb") : NULL;
+            if (f) {
+                memcpy(head + 2, &fsize, 4); v = 54; memcpy(head + 10, &v, 4); v = 40; memcpy(head + 14, &v, 4); memcpy(head + 18, &w, 4); memcpy(head + 22, &h, 4); head[26] = 1; head[28] = 24;
+                for (int y = 0; y < h; y++) {
+                    const uint8_t *src = (const uint8_t *)swmem.map + (size_t)(h - 1 - y) * w * 4;
+                    uint8_t *d = img + (size_t)y * row;
+                    for (int x = 0; x < w; x++) { d[x * 3] = src[x * 4 + (bgr ? 0 : 2)]; d[x * 3 + 1] = src[x * 4 + 1]; d[x * 3 + 2] = src[x * 4 + (bgr ? 2 : 0)]; }
+                }
+                fwrite(head, 1, 54, f); fwrite(img, 1, (size_t)row * h, f); fclose(f);
+                printf("nvn_vk: SMO_SWAPSHOT: the window's image of frame %lld saved to %s (%dx%d)\n", (long long)frame, path, w, h);
+            }
+            free(img);
+            vkDestroyBuffer(V.device, swbuf, NULL); vmem_free(swmem);
+        }
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;
@@ -4052,6 +4185,7 @@ static void frstat_report(void) {
            (double)w[n / 2], (double)w[n * 99 / 100], (double)w[n - 1], slow, wsum > 0 ? 1000.0 * n / wsum : 0.0);
 }
 static void vkd_shutdown(void) {
+    if (g_hud_fixed) printf("nvn_vk: HUD layer draws drawn at the window's shape (hud_fix): %lld\n", (long long)g_hud_fixed);
     wd_stop();
     if (!R.ring) return;
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
