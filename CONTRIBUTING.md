@@ -83,6 +83,8 @@ Say in the pull request which of these you ran:
   (`runtime/gfx/nvn_gl.c`):** `tests\check_fast_paths.py` (`PASS`: both equal to the plain code on random input).
 - **Changes to the Yaz0 decoders (`runtime/game/smo_yaz0.c`):** `tests\check_yaz0.py` (`PASS`: the same answers,
   contexts and output as the game's own decoders, lifted, on every `.szs` of the RomFS).
+- **Changes to the shader archive walks (`runtime/game/smo_sharc.c`):** `tests\run_cap_kingdom.py <new run name> --env
+  SMO_SHARC=2` (the game walks as well; the exit report must say `0 differ`).
 - **Anything that can change game behaviour, rendering or timing:** `tests\run_cap_kingdom.py <new run name>` must
   print `RESULT: PASS`.
 - **Renderer, threading or anything a stage, a kingdom or a scenario the scripted run does not reach could meet:**

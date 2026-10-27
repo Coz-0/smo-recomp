@@ -138,6 +138,10 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_YAZ0=0` leaves the game's own Yaz0 decoders (sead's `SZSDecompressor`, every `.szs` the game opens) where
   `runtime/game/smo_yaz0.c` decodes in host code; the lifter puts the call there (`tools/lifter/game_patches.py`), and
   the exit report counts the chunks and files it decoded. `tests/check_yaz0.py` compares the two on every `.szs`.
+- `SMO_SHARC=0` leaves to the game its walks to the k-th shader binary of agl's shader archives (at boot, InitSystem:
+  every program and stage walked the list from its start, 1.7 s in one frame), which `runtime/game/smo_sharc.c` goes on
+  from the last walk of the same list; `SMO_SHARC=2` lets the game walk and compares the two at the end of each walk
+  (`smo_sharc: ... differ` in the exit report).
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),

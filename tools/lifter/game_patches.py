@@ -14,6 +14,13 @@ by its first words (an ADRP's page left out, which moves with the code); a nonze
 zero runs the lifted code. sead's two Yaz0 decoders (runtime/game/smo_yaz0.c): SZSDecompressor::streamDecomp, its
 first 24 words, and the whole-buffer decoder, all of it. Such a patch is a tuple ('before', C), the instruction's own
 C after it.
+
+agl's shader archive set-up (runtime/game/smo_sharc.c): the function found by its first 16 words, and in it four walks
+to a list's k-th record, each one an `add x22, xN, #0x158` (the list's start) and then a `cbz` on the count (k) to the
+instruction after the walk; before each cbz, the walk done in host code and a jump past it (SMO_SHARC=2: the
+game walks, and the instruction after the walk compares). The registers are written as c->x[n], which the register
+locals of tools/lifter/reglocal.py rename like the lifted code's own. Every site is checked
+(the add, the cbz, its register and its target) and the function is left alone when one is not as expected.
 """
 LDR_S0_98, FADD_S0 = 0xbd409800, 0x1e202800
 LDR_S1_98, FADD_S1, FMOV_S0_HALF = 0xbd409801, 0x1e212821, 0x1e2c1000
@@ -39,6 +46,34 @@ FUNCS = [
      'h_yaz0_whole'),
 ]
 ADRP_MASK, ADRP = 0x9f000000, 0x90000000
+
+SHARC_FUNC = [0xd10243ff, 0xa9036ffc, 0xa90467fa, 0xa9055ff8, 0xa90657f6, 0xa9074ff4, 0xa9087bfd, 0x910203fd, 0xaa0003ea,
+              0x721e007f, 0xaa0003f5, 0xf8028d41, 0x7940a548, 0x121f3909, 0x32000108, 0x1a880128]
+SHARC_WALKS = [(0x200, 10), (0x30c, 10), (0x418, 9), (0x518, 9)]   # (the cbz's offset in the function, its count register)
+
+
+def sharc_patches(word, base, text_size):
+    """{address: ('before', C)} for agl's shader archive walks, or {} (said on stdout) when the code is not as expected."""
+    hits = [base + off for off in range(0, text_size - 4 * len(SHARC_FUNC), 4)
+            if word(base + off) == SHARC_FUNC[0] and all(word(base + off + 4 * i) == w for i, w in enumerate(SHARC_FUNC))]
+    if len(hits) != 1:
+        print('game_patches: sharc_walk: the function found %d times, expected 1: left to the lifted code' % len(hits))
+        return {}
+    f = hits[0]
+    out = {f: ('before', '{ extern int rt_sharc_on(void); extern void rt_sharc_reset(void); if (rt_sharc_on()) rt_sharc_reset(); }  /* %#x: agl shader archive set-up, walks in host code */' % f)}
+    for off, reg in SHARC_WALKS:
+        add, cbz = word(f + off - 4), word(f + off)
+        exit_ = f + off + (((cbz >> 5) & 0x7ffff) << 2)
+        if add & 0xfffffc1f != 0x91056016 or cbz & 0xff00001f != 0x34000000 | reg:
+            print('game_patches: sharc_walk: no walk at %#x as expected: left to the lifted code' % (f + off))
+            return {}
+        out[f + off] = ('before', '{ extern int rt_sharc_on(void); extern uint64_t rt_sharc_walk(uint64_t, uint32_t); '
+                                   'extern void rt_sharc_expect(uint64_t, uint32_t); int on = rt_sharc_on(); '
+                                   'if (on == 2) rt_sharc_expect(c->x[22], (uint32_t)c->x[%d]); '
+                                   'else if (on) { c->x[22] = rt_sharc_walk(c->x[22], (uint32_t)c->x[%d]); goto L_%x; } }' % (reg, reg, exit_))
+        out[exit_] = ('before', '{ extern int rt_sharc_on(void); extern void rt_sharc_check(uint64_t); '
+                                'if (rt_sharc_on() == 2) rt_sharc_check(c->x[22]); }')
+    return out
 
 
 def same_word(have, want):
@@ -90,6 +125,9 @@ def find(word, base, text_size):
         h = next(f[2] for f in FUNCS if f[0] == name)
         out[a] = ('before', '{ extern int %s(Ctx *); if (%s(c)) return; }  /* %#x: %s in host code */' % (h, h, a, name))
         words[name] = 1
+    sharc = sharc_patches(word, base, text_size)
+    out.update(sharc)
+    words['sharc_walk'] = (len(sharc) - 1) // 2 if sharc else 0
     print('game_patches: %s' % ', '.join('%s x%d' % kv for kv in words.items()))
     return out
 
