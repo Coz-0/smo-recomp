@@ -3449,6 +3449,16 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
+/* A blit into the window image over what the blit before it wrote there (the frame, then the progress bar's track, then
+ * the bar): transfer writes to the same pixels in one command buffer are not ordered without a barrier between them
+ * (syncval: 200 WRITE_AFTER_WRITE on the swapchain images in 80 s of boot, every one of them in the bar's rectangle). */
+static void window_waw(uint32_t index) {
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = V.images[index];
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+    b.srcAccessMask = b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
 static void overlay_draw(uint32_t index) {
     if (g_menu.on && g_menu.img) {
         VkImageBlit b;
@@ -3456,6 +3466,7 @@ static void overlay_draw(uint32_t index) {
         b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
         b.srcOffsets[1].x = g_menu.w; b.srcOffsets[1].y = g_menu.h; b.srcOffsets[1].z = 1;
         b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
+        window_waw(index);
         vkCmdBlitImage(R.cmd, g_menu.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         return;
     }
@@ -3494,6 +3505,7 @@ static void overlay_draw(uint32_t index) {
         b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.dstSubresource.layerCount = 1;
         b.srcOffsets[1].x = 8; b.srcOffsets[1].y = 8; b.srcOffsets[1].z = 1;
         b.dstOffsets[0].x = pass ? x0 : x0 - 2; b.dstOffsets[0].y = pass ? y0 : y0 - 2; b.dstOffsets[1].x = pass ? xe : x1 + 2; b.dstOffsets[1].y = pass ? y1 : y1 + 2; b.dstOffsets[1].z = 1;
+        window_waw(index);
         vkCmdBlitImage(R.cmd, g_ovl.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     }
 }
