@@ -81,19 +81,27 @@ void print_devinfo_summary(FILE *out) {
 /* ---- memory pools and buffers: the game supplies the memory, so mapping must work for real.
  * Guest objects are opaque; what each one refers to is kept in a side table keyed by address. */
 typedef struct NvnObj { uint64_t key, memory, size, pool, offset, flags; struct NvnObj *next; } NvnObj;
-static NvnObj *g_objs[4096];
+/* Looked up on every nvnBufferGetAddress and the like (about 8% of the main thread's busy time in New Donk City with one
+ * exclusive lock and 4096 buckets): a shared lock for the lookup, the exclusive one only to add, 65536 buckets. */
+#define NOBJ_N 65536
+static NvnObj *g_objs[NOBJ_N];
 static SRWLOCK g_objs_lock = SRWLOCK_INIT;
 static NvnObj *nobj(uint64_t key) {
-    unsigned h = (unsigned)((key >> 3) * 2654435761u) & 4095;
-    AcquireSRWLockExclusive(&g_objs_lock);
+    unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
+    AcquireSRWLockShared(&g_objs_lock);
     NvnObj *o = g_objs[h];
+    while (o && o->key != key) o = o->next;
+    ReleaseSRWLockShared(&g_objs_lock);
+    if (o) return o;
+    AcquireSRWLockExclusive(&g_objs_lock);
+    o = g_objs[h];
     while (o && o->key != key) o = o->next;
     if (!o) { o = calloc(1, sizeof *o); o->key = key; o->next = g_objs[h]; g_objs[h] = o; }
     ReleaseSRWLockExclusive(&g_objs_lock);
     return o;
 }
 static void nobj_drop(uint64_t key) {                                   /* the object is finalized: forget what it referred to */
-    unsigned h = (unsigned)((key >> 3) * 2654435761u) & 4095;
+    unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
     AcquireSRWLockExclusive(&g_objs_lock);
     for (NvnObj **pp = &g_objs[h]; *pp; pp = &(*pp)->next)
         if ((*pp)->key == key) { NvnObj *o = *pp; *pp = o->next; free(o); break; }

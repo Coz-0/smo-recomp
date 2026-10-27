@@ -53,7 +53,9 @@ HOST_SOURCES = {
 }
 INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_vlayout.c', 'nvn_vk_watchdog.c')]
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
-HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing'] + T.runtime_includes() + ['-I', GEN, '-I', LIFT,
+# RECOMP_HOST_OPT (default -O2) and RECOMP_ARCH (as build_main.py: e.g. -march=znver2) for the runtime; a change of them
+# recompiles nothing by itself: delete build\obj\host (or touch a runtime header) first
+HOST_FLAGS = [os.environ.get('RECOMP_HOST_OPT', '-O2'), '-w', '-fno-strict-aliasing'] + os.environ.get('RECOMP_ARCH', '').split() + T.runtime_includes() + ['-I', GEN, '-I', LIFT,
               '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', SDL3_INC, '-I', VKH] + ([] if T.POSIX else ['-I', os.path.join(WEBVIEW2, 'build', 'native', 'include')])

@@ -37,7 +37,8 @@ scripted runs further through the game are welcome. Three rules apply to every c
 - Play with a physical controller and report what does not work.
 - Carry the scripted runs further: the rest of Cap Kingdom (Topper), then the other kingdoms
   ([`docs/scripted-runs.md`](docs/scripted-runs.md) shows how a route is found).
-- Speed: occlusion-query results without a GPU wait per report; profiling the game side in Top-Hat Tower.
+- Speed: the GPU wait at a conditional render while compute results wait to be copied back (once a frame at Cascade
+  Kingdom's first checkpoint, 1.2 ms each); profiling the game side in Top-Hat Tower.
 - Check the shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed `IPA`) against hardware.
 
 ## Building

@@ -12,7 +12,9 @@ Flags and the bounded-time rule are ssbu-recomp's (tools/lifter/build_opt.py, GP
   3. then the whole file at -O0.
 Only files whose object is missing or older than the source (or funcs.h / runtime headers) are compiled.
 Prints counts, fallbacks and the slowest files; writes build/obj/main/_report.txt. Exit code 1 if any file fails.
-Environment: LLVM_ROOT (default C:/llvm-9.0.0; macOS: Apple clang), RECOMP_OPT (-O1), RECOMP_OPTNONE_LINES (20000), RECOMP_TIME_LIMIT (180).
+Environment: LLVM_ROOT (default C:/llvm-9.0.0; macOS: Apple clang), RECOMP_OPT (-O2), RECOMP_OPTNONE_LINES (20000), RECOMP_TIME_LIMIT (180),
+RECOMP_ARCH (extra target flags, e.g. -march=znver2; the objects then run on that CPU family and later ones only).
+A change of these does not recompile by itself: run with --force.
 """
 import concurrent.futures
 import os
@@ -28,8 +30,8 @@ GEN = T.build('lift', 'main')
 OBJ = T.build('obj', 'main')
 RUNTIME = os.path.join(T.RUNTIME, 'core')        # runtime.h, neon.h, fpexact.h: what the lifted C includes
 CLANG = T.clang()
-OPT = os.environ.get('RECOMP_OPT', '-O1')
-EXTRA = ['-ffp-contract=off']
+OPT = os.environ.get('RECOMP_OPT', '-O2')       # -O2: New Donk City 20 -> 30-36 fps against -O1 (Ryzen 5 3600XT)
+EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_ARCH', '').split()   # e.g. RECOMP_ARCH=-march=znver2: this PC's CPU only
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 BASE_FLAGS = ['-w', '-fno-strict-aliasing', '-I', RUNTIME, '-I', GEN]

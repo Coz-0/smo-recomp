@@ -3987,12 +3987,15 @@ static void render_loop(void) {
     }
 }
 
+void os_pin_host_thread(void);                    /* os_threads.c: the runtime's busy threads away from the console cores */
+void os_pin_render_thread(void);
 static DWORD WINAPI render_thread(LPVOID arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SMO_JOBLOG") ? atoi(getenv("SMO_JOBLOG")) : 0;
     g_render_tid = GetCurrentThreadId();
     if (g_vk) {                                 /* no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
+        os_pin_render_thread();                 /* away from the console cores; with SMO_HOST_LAYOUT=1 on a core of its own (os_threads.c) */
         nvn_vk_init(g_hwnd);
         hitch_set_render();
         SetEvent(g_ready_event);
@@ -4873,7 +4876,7 @@ static void win_acquire(Ctx *c) {                       /* (window, sync, int *t
 }
 static void queue_acquire(Ctx *c) { c->x[0] = c->x[1]; c->x[1] = 0; win_acquire(c); }      /* nvnQueueAcquireTexture(queue, window, int *textureIndex) */
 static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop[0] = (int)A1; w->crop[1] = (int)A2; w->crop[2] = (int)A3; w->crop[3] = (int)A4; } }
-/* SMO_PRESENT_ASYNC=1 (off by default): the present does not wait for the render thread either. The game
+/* By default the present does not wait for the render thread either (SMO_PRESENT_ASYNC=0: it waits). The game
  * presents from a thread of its own and its main thread waits for that present (sead::Event in
  * al::GameFrameworkNx::procFrame_) before it starts the next frame, so with a waiting present the next frame's game work
  * could not begin until the render thread had replayed and shown this one: the two threads took turns (Cascade Kingdom:
@@ -4882,7 +4885,8 @@ static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop
  * on frame N+1, as the console's GPU does. The game's fences (SyncWait) still order everything the commands refer to.
  * Measured at Cascade Kingdom's first checkpoint (mw3 / mw4, 150 s each): 59.4-60.0 fps waiting, 58.0-59.6 queued, with
  * lower 1% lows queued (39-48 fps against 43-55): where neither thread is busy all the time, overlapping the frames only
- * makes the moments of the presents less even. Kept for scenes where both threads are busy. */
+ * makes the moments of the presents less even. Queued by default since the renderer's later speed changes: the same place
+ * then measured 60.0 fps in each of 20 windows of 300 frames (1% lows 55.8 at the lowest), and busy scenes gain. */
 static HANDLE g_present_ev;
 static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
@@ -4891,7 +4895,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();
-    if (g_present_sync < 0) g_present_sync = !(getenv("SMO_PRESENT_ASYNC") && atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();
+    if (g_present_sync < 0) g_present_sync = (getenv("SMO_PRESENT_ASYNC") && !atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();      /* async by default: the game draws the next frame while this one is replayed (New Donk City: 38-42 -> 44-54 fps); SMO_PRESENT_ASYNC=0: wait as before */
     if (g_present_sync) gl_run(g_rb->present, &j);
     else {
         if (!g_present_ev) g_present_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -4925,10 +4929,11 @@ int nvn_menu_job(UiMenuJob *m) { if (!g_rb->menu) return 0; gl_run(g_rb->menu, m
 
 /* ---- debug labels: kept for every object (nvn_label_get), and given to the OpenGL object where there is one */
 typedef struct LabelEnt { uint64_t key; char text[96]; struct LabelEnt *next; } LabelEnt;
-static LabelEnt *g_labels[1024];
+#define LABEL_N 65536                           /* (1024 buckets whose chains only grew: a finalized object left an empty entry) */
+static LabelEnt *g_labels[LABEL_N];
 static SRWLOCK g_label_lock = SRWLOCK_INIT;
 void nvn_label_set(uint64_t obj, const char *text) {
-    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & 1023;
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
     AcquireSRWLockExclusive(&g_label_lock);
     LabelEnt *e = g_labels[h];
     while (e && e->key != obj) e = e->next;
@@ -4937,14 +4942,20 @@ void nvn_label_set(uint64_t obj, const char *text) {
     ReleaseSRWLockExclusive(&g_label_lock);
 }
 const char *nvn_label_get(uint64_t obj) {
-    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & 1023;
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
     const char *r = "";
     AcquireSRWLockShared(&g_label_lock);
     for (LabelEnt *e = g_labels[h]; e; e = e->next) if (e->key == obj) r = e->text;
     ReleaseSRWLockShared(&g_label_lock);
     return r;
 }
-void nvn_label_drop(uint64_t obj) { if (nvn_label_get(obj)[0]) nvn_label_set(obj, ""); }
+void nvn_label_drop(uint64_t obj) {                  /* the object is finalized: its entry goes */
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
+    AcquireSRWLockExclusive(&g_label_lock);
+    for (LabelEnt **pp = &g_labels[h]; *pp; pp = &(*pp)->next)
+        if ((*pp)->key == obj) { LabelEnt *e = *pp; *pp = e->next; free(e); break; }
+    ReleaseSRWLockExclusive(&g_label_lock);
+}
 static void any_set_label(Ctx *c) {                     /* nvn<Object>SetDebugLabel(object, const char *label) */
     nvn_label_set(A0, A1 ? (const char *)P(A1) : "");
     Tex *t = hobj(A0, K_TEX);

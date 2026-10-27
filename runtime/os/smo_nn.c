@@ -55,6 +55,8 @@ int smo_heap_section_handle(HANDLE *h) { *h = g_heap_section; return g_heap_sect
 static int g_heap_fd = -1;                     /* Linux: the memfd the heap is a shared mapping of */
 int smo_heap_memfd(void) { return g_heap_fd; }
 #endif
+/* The committed heap: base and size (0 before SetMemoryHeapSize). */
+int smo_heap_range(uint64_t *base, uint64_t *size) { *base = (uint64_t)(uintptr_t)g_heap; *size = g_heap ? g_heap_size : 0; return g_heap != NULL; }
 
 /* The heap's section and the offset of [addr, addr+size) in it; 0 if the range is not inside the committed heap. */
 int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset) {

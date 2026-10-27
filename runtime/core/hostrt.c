@@ -223,7 +223,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
     }
     if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16) {
         int i = (int)((addr - HOSTFN_BASE) / 16);
-        if (InterlockedIncrement64(&g_hostfn[i].calls) == 1) g_hostfn[i].first = InterlockedIncrement64(&g_hostfn_seq);
+        if (g_hostfn[i].calls++ == 0) g_hostfn[i].first = InterlockedIncrement64(&g_hostfn_seq);      /* not atomic: 3 game threads made every NVN call a locked add on shared lines; the counts are for reports and traces */
         t_hostfn = i;
         const char *saved_name = c->in_import;
         uint64_t saved_from = c->import_from;
