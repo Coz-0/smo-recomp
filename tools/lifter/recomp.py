@@ -28,6 +28,8 @@ import target as _T  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jumptable  # noqa: E402
 import reglocal  # noqa: E402
+
+INLINE_LEAF = int(os.environ.get('RECOMP_INLINE_LEAF', '8'))     # Env.inline_leaf: 0 = off
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
 BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
@@ -278,6 +280,9 @@ class Fn:
         if bits(w, 30, 26) == 5:
             target = pc + sext(bits(w, 25, 0), 26) * 4
             if bits(w, 31, 31):
+                body = self.env.inline_leaf(target)
+                if body is not None:                     # a short straight-line leaf: its instructions here
+                    return 'c->x[30] = 0x%xULL; %s' % (pc + 4, body)
                 return 'c->x[30] = 0x%xULL; %s' % (pc + 4, self.env.call(target))
             return self.jump(target)
         if bits(w, 31, 24) == 0x54:
@@ -963,6 +968,35 @@ class Env:
             return 'imp_%s(c);' % mangle(name)
         self.wanted.setdefault(target, None)
         return 'f_%x(c);' % target
+
+    def inline_leaf(self, target):
+        """The C of a listed function that is a straight-line leaf of at most RECOMP_INLINE_LEAF instructions (no
+        branch, call, trap or system instruction before one final `ret`), to stand in for a BL to it; None otherwise.
+        Running its instructions in the caller is what the CPU does; the caller's locals then hold its registers and
+        the compiler optimises across (24 686 BL sites of main call such a leaf of <= 8 instructions)."""
+        if not INLINE_LEAF or target in self.overrides:
+            return None
+        if not hasattr(self, '_leaf_ends'):              # the list's exact ends (the full lift's workers have no `ends`)
+            with open(FUNCS, encoding='utf-8') as f:
+                next(f)
+                self._leaf_ends = {BASE + int(t[0], 16): BASE + int(t[1], 16) for t in (ln.split('\t') for ln in f)}
+        if target not in self._leaf_ends:
+            return None
+        cache = self.__dict__.setdefault('_leaf', {})
+        if target not in cache:
+            end = self._leaf_ends[target]
+            body = None
+            if 2 <= (end - target) // 4 <= INLINE_LEAF + 1 and word(end - 4) == 0xd65f03c0 and not self.plt_symbol(target):
+                if all(bits(word(a), 28, 25) not in (0, 1, 2, 3, 10, 11) for a in range(target, end - 4, 4)):
+                    fn = Fn(target, end, self)
+                    try:
+                        stmts = [fn.lift(word(a), a) for a in range(target, end - 4, 4)]
+                    except Unimpl:
+                        stmts = None
+                    if stmts and not any(k in t for t in stmts for k in ('goto', 'return', 'guest_', '(c);', 'call_indirect')):
+                        body = ' '.join(stmts)
+            cache[target] = body
+        return cache[target]
 
     def compute_starts(self):
         """Function entries and exact ends from the function list (module-relative hex in the TSV)."""
