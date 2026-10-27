@@ -31,7 +31,7 @@ def main():
         if 'straight' not in picks and t['kind'] == 'straight' and t['key'].startswith('add x, x, #') and ' + ' in st:
             picks['straight'] = (i, lambda s: s.replace(' + ', ' - ', 1))
         elif 'branch' not in picks and t['kind'] == 'branch' and 'if (cond(' in st:
-            picks['branch'] = (i, lambda s: s.replace('if (cond(', 'if (!cond(', 1))
+            picks['branch'] = (i, lambda s: s.replace('if (cond', 'if (!cond', 1))   # cond( or, with register locals, cond_l(
         elif 'trap' not in picks and t['kind'] == 'trap':
             picks['trap'] = (i, lambda s: s.replace('guest_trap(', '(void)(', 1))
         elif ('special' not in picks and t['kind'] == 'special' and 'fp_maxmin' in st and t['frm'] >= 0

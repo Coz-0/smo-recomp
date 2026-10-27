@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(_REPO, 'tools'))
 import target as _T  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jumptable  # noqa: E402
+import reglocal  # noqa: E402
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
 BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
@@ -1044,11 +1045,10 @@ def lift_function(env, entry):
             bad.append((pc, w, str(e)))
         lines.append((pc, stmt))
         pc += 4
-    out = ['void f_%x(Ctx *c) {' % entry, '  c->fn = 0x%xULL;' % entry]   # for crash reports
+    head = ['void f_%x(Ctx *c) {' % entry, '  c->fn = 0x%xULL;' % entry]   # for crash reports
     if fn.has_br:
-        out.append('  uint64_t jt = 0;')
-    for pc, stmt in lines:
-        out.append('L_%x: %s' % (pc, stmt))
+        head.append('  uint64_t jt = 0;')
+    out = ['L_%x: %s' % (pc, stmt) for pc, stmt in lines]
     ends_open = not lines[-1][1].startswith(('return;', 'goto', '{ jt', '{ uint64_t jt', '{ f_', '{ imp_', '{ h_'))
     listed = getattr(env, 'ends', None)
     if ends_open and end < BASE + TEXT_SIZE and (not listed or end in listed):
@@ -1061,7 +1061,10 @@ def lift_function(env, entry):
         out.append('L_dispatch: switch (jt) {')
         out.extend('  case 0x%xULL: goto L_%x;' % (pc, pc) for pc, _ in lines)
         out.append('  default: call_indirect(c, jt); return; }')
-    out.append('}')
+    if reglocal.ENABLED:
+        prologue, out = reglocal.localize(out)
+        head += prologue
+    out = head + out + ['}']
     if lines and ends_open and end < BASE + TEXT_SIZE and (not listed or end in listed):
         env.wanted.setdefault(end, None)
     return '\n'.join(out), len(lines), bad
