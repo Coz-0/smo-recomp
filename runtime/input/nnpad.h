@@ -22,8 +22,9 @@ int  nnpad_get(int player, NnPadState *out);     /* 0 = none */
 void nnpad_rumble(int player, float low, float high);   /* amplitudes 0..1 of the low and high band */
 int  nnpad_keyboard_player(void);                /* 0..7, -1 = nobody; fixed once resolved (see controllers.ini) */
 int  nnpad_kb_vk(int idx);                       /* configured virtual key: 0..15 = Pro buttons, 16..19 = left stick left/up/right/down, 20..23 = right stick; 0 = unbound */
-int  nnpad_hotkey_vk(int which);                 /* [hotkeys]: 0 = the amiibo menu's key (virtual key, 0 = none) */
+int  nnpad_hotkey_vk(int which);                 /* [hotkeys]: 0 = the amiibo menu's key, 1 = the shake key (virtual key, 0 = none) */
 unsigned nnpad_hotkey_combo(void);               /* [hotkeys]: Pro button bits a pad holds together to open the amiibo menu, 0 = none */
+unsigned nnpad_shake_combo(void);                /* [hotkeys]: Pro button bits a pad holds to shake (no motion sensor needed), 0 = none */
 int  nnpad_tool(int argc, char **argv);          /* --pad-test / --pad-map <n> / SMO_PAD_TEST: returns the exit code, or -1 if this is no tool request */
 
 /* self-test hooks implemented by nnhid.c (they call the handlers the game calls) */
