@@ -54,7 +54,10 @@ typedef struct {
      * the same unit: tex_base + 240 + u; a third fails with its name) instead of a bindless handle read from c2; the alpha
      * test operands and the point size come from the push-constant block MXPC { uvec2 mx_alpha; float mx_point_size; };
      * gl_VertexIndex / gl_InstanceIndex - gl_BaseInstance; gl_PointCoord.y flipped (the viewport is flipped by the back end);
-     * gl_PointSize is always the push constant's (the OpenGL path never enables program point size). */
+     * gl_PointSize is the push constant's unless the vertex stage writes a point size, as NVN draws with the shader's size
+     * then (the game's point sprites: clouds, ocean, alPointSpriteShader); that one is in game pixels and is divided by
+     * mx_fcs, the fourth word of the block (game pixels per image pixel of a scaled pass, 0 when unscaled). The OpenGL path
+     * never enables program point size. */
     int target;
     unsigned tex_base;
     /* vertex stage: generic outputs to declare (and leave at (0, 0, 0, 1)) although the code never writes them: the inputs

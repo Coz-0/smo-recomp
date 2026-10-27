@@ -127,6 +127,7 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
     if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* a geometry stage is translated for the draw's primitive class */
+    if (o->stage == 0 && o->code_len > 0x35 && (o->code[0x35] >> 3 & 1)) h = fnv(h, "ps1", 3);      /* a vertex stage whose program header says it writes a point size (output map B bit 3): translated to draw with it, another translation than the push constant's; every other stage keeps its hash */
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
     return fnv(h, &ver, 4);
 }

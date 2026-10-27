@@ -107,6 +107,9 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
         if (f == 0) { e->gubos |= 1u << n; e->cbufs |= 1u << (3 + n); return S(e, "0x%08xu", (17 + n) << 27); }
         return f == 2 ? "0x07fffffcu" : "0u";
     }
+    if (b == 0 && w == 0x610 / 4 && e->in->target == 1 && e->in->stage != MX_COMPUTE && e->in->stage != MX_FRAGMENT)
+        return "0x44ffe000u";      /* c0 byte 0x610: the driver's largest point size, which the compiler clamps a written point size to
+                                    * (the game's 96 point-size stages read it and nothing else of c0); no c0 is bound here: 2047.0 */
     e->cbufs |= 1u << b;
     return S(e, "c%u[%uu]", b, w);
 }
@@ -246,7 +249,10 @@ static void attr_out(Mx *e, unsigned a, const char *v) {
     if (a >= 0x70 && a < 0x80) emit(e, " gl_Position[%u] = F(%s);", c, v);
     else if (a >= 0x80 && a < 0x280) { e->out_attr |= 1u << ((a - 0x80) >> 4); emit(e, " out_attr%u[%u] = F(%s);", (a - 0x80) >> 4, c, v); }
     else if (a == 0x6c && e->in->stage == MX_GEOMETRY) emit(e, " gl_PointSize = F(%s);", v);      /* a geometry stage writes its own (no push constant) */
-    else if (a == 0x6c) { e->uses_psize = 1; emit(e, e->in->target == 1 ? " mx_psize = F(%s);" : " gl_PointSize = F(%s);", v); }
+    else if (a == 0x6c) {                         /* a vertex stage's point size: drawn at that size, in the pass's pixels (mx_fcs) */
+        e->uses_psize = 1;
+        emit(e, e->in->target == 1 ? " mx_psize = F(%s); gl_PointSize = mx_psize / (mx_fcs > 0.0 ? mx_fcs : 1.0);" : " gl_PointSize = F(%s);", v);
+    }
     else if (a >= 0x2c0 && a < 0x2e0) { e->clip_out |= 1u << ((a - 0x2c0) >> 2); emit(e, " gl_ClipDistance[%u] = F(%s);", (a - 0x2c0) >> 2, v); }
     else if (a == 0x64) { e->uses_layer_out = 1; emit(e, " gl_Layer = int(%s);", v); }
     else if (a == 0x68) { e->uses_vp_out = 1; emit(e, " gl_ViewportIndex = int(%s);", v); }
@@ -1840,6 +1846,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SHFL */
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* */
+        else if (vk && in->stage == MX_VERTEX && e->uses_psize) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* mx_fcs: 0 = unscaled pass */
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
         if (vk && e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
