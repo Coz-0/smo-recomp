@@ -29,6 +29,7 @@ SDK_BASE = 0x7500000000
 os.environ['RECOMP_ELF'] = T.elf('sdk')
 os.environ['RECOMP_FUNCS'] = T.build('functions', 'sdk_functions.tsv')
 os.environ['RECOMP_BASE'] = hex(SDK_BASE)
+os.environ['RECOMP_ICACHE'] = '0'                   # an indirect call here goes to sdk_dispatch; icache.h caches main's functions
 sys.path.insert(0, HERE)
 import recomp as R                                   # noqa: E402  (reads the three variables above at import)
 
