@@ -16,7 +16,7 @@ by git). Steps run in this order and are resumable: a step whose output exists i
     import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place  (tools/extract/extract.py)
     functions  every function of each module, with exact boundaries                            (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main                              (tools/lifter/recomp.py)
-    compile    the lifted C -> objects (clang -O1, incremental)                                (tools/lifter/build_main.py)
+    compile    the lifted C -> objects (clang -O2, incremental)                                (tools/lifter/build_main.py)
     tables     generated headers and tables                                     (tools/lifter/gen_tables.py, gen_sdktest.py)
     sdk        the system-library functions that are lifted too                                 (tools/lifter/sdklift.py)
     link       host runtime + game library -> build/bin/smo_native.exe                          (tools/lifter/build_exe.py)
