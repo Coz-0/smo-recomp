@@ -1,6 +1,9 @@
 # macOS on Apple silicon: port plan
 
-Status: started. Nothing below has run the game on a Mac yet. What was measured is said; the rest is the plan.
+Status: the game runs on Apple silicon. The scripted Cap Kingdom run (`tests/run_cap_kingdom.py`, from an empty save
+to the frog's capture) passes on an M4 with MoltenVK and a warm stage cache: every checkpoint, 0 host exceptions,
+0 Vulkan call failures, 0 audio underruns, 59 fps mean (2026-10-27). With a cold stage cache the checkpoints all pass
+but the audio underruns while shaders compile. What was measured is said; the rest is the plan.
 
 ## What was measured (Apple M4, macOS 27, 2026-10-25)
 
