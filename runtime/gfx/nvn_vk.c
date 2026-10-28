@@ -374,6 +374,7 @@ int nvn_vk_init(void *hwnd) {
     uint32_t ndext = 512;
     r = vkEnumerateDeviceExtensionProperties(V.gpu, NULL, &ndext, dext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateDeviceExtensionProperties", r);
+    { void perf_overlay_set_gpu(const char *name); perf_overlay_set_gpu(V.props.deviceName); }      /* perf_overlay.c */
     printf("nvn_vk: using device %d: %s (loader Vulkan %u.%u.%u); extensions of the design:", best, V.props.deviceName, VK_API_VERSION_MAJOR(loader_version), VK_API_VERSION_MINOR(loader_version),
            VK_API_VERSION_PATCH(loader_version));
     for (unsigned i = 1; i < sizeof k_wanted / sizeof *k_wanted; i++) printf(" %s=%s", k_wanted[i] + 3, has_name(dext, ndext, k_wanted[i]) ? "yes" : "NO");

@@ -116,6 +116,11 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
   and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]`.
 - The Capture button: F12, or a pad's share button, saves the frame as a BMP in the save folder's `album`.
+- F10: the performance overlay in the window's corner, cycling off, frame rate (frames per second and milliseconds) and
+  full: a graph of the last 120 frames, the GPU time of a frame, the size the game draws its 3D scene at (it lowers it
+  when the GPU falls behind), CPU time per frame of the main and render threads, frames over 33 ms in the last minute,
+  and the machine's CPU, memory and, on Linux with an AMD GPU, the GPU's use, temperature, power, clock and memory.
+  `perf_overlay = off | fps | full` in `graphics.ini` sets how it starts; screenshots never have it.
 - Translated shaders are cached in `build\cache\vk`. The first run compiles them as the game meets them and is slower;
   later runs reuse them.
 

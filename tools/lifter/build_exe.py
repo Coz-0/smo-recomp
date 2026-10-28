@@ -37,7 +37,7 @@ HOST_SOURCES = {
     'libc': ['clib.c', 'nnlibc2.c', 'libcxx.c', 'nncxxlib.c', 'nncxxrt.c', 'nniostream.c', 'nnunwind.c'],
     'os': ['os_threads.c', 'nnsdk.c', 'nntime.c', 'nnmisc.c', 'smo_nn.c'],
     'fs': ['nnfs.c', 'nnfsdir.c'],
-    'gfx': ['nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'nvn_misc.c', 'nvn_handles.c', 'nvn_layout.c', 'mx_translate.c',
+    'gfx': ['nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'perf_overlay.c', 'nvn_misc.c', 'nvn_handles.c', 'nvn_layout.c', 'mx_translate.c',
             'tex_decode.c', 'display.c', 'gfx_options.c'],
     'audio': ['nnaudio.c', 'smo_audio.c'],
     'input': ['nnhid.c', 'nnpad_sdl.c'],

@@ -15,6 +15,7 @@
 #include <emmintrin.h>
 #include "tex_decode.h"
 #include "smo_ui.h"                                    /* UiMenuJob: the amiibo menu's pictures (vk_menu) */
+#include "perf_overlay.h"                              /* the performance overlay (overlay_draw) */
 static int have_targets_live(void);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
@@ -214,7 +215,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; int ts_on; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -335,7 +336,18 @@ static uint64_t g_occ_total;                       /* samples of the count the r
 static int g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_cond_late, g_occ_present_waits, g_occ_late;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
-static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
+/* the performance overlay (perf_overlay.c), at any frame: the last 16 frames by frame & 15 - GPU ms (slot_wait), the size
+ * of the frame's main 3D pass (the pass with a depth target and the most draws: the game's dynamic resolution) */
+static float g_po_gpu[16]; static uint16_t g_po_vpw[16], g_po_vph[16]; static uint32_t g_po_vpdraws[16];
+static uint16_t g_pass_vpw, g_pass_vph; static LONG64 g_pass_draws0; static int g_pass_depth;      /* the pass being recorded: its largest viewport, draws so far at its start, depth target */
+static LONG64 g_cur_frame;
+static void pass_vp_note(void) {                   /* at a pass's end: the frame's main 3D pass so far */
+    LONG64 nd = R.frame_draws - g_pass_draws0;
+    if (!g_pass_depth || g_cur_frame < 0 || nd <= (LONG64)g_po_vpdraws[g_cur_frame & 15]) return;
+    int k = (int)(g_cur_frame & 15);
+    g_po_vpdraws[k] = (uint32_t)nd; g_po_vpw[k] = g_pass_vpw ? g_pass_vpw : (uint16_t)R.pass_w; g_po_vph[k] = g_pass_vph ? g_pass_vph : (uint16_t)R.pass_h;
+}
+static void pass_end(void) { if (R.in_pass) { pass_vp_note(); occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
@@ -358,7 +370,7 @@ static LONG64 g_ts_n;
 #define FRSTAT_N 40000
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_play[FRSTAT_N];
-static LONG64 g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
+static LONG64 g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
 void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
@@ -369,9 +381,9 @@ static void slot_wait(Slot *s) {
     g_tm[0] += tk() - t0;
     if (r != VK_SUCCESS) vkd_fail("a submitted command buffer did not finish within 20 s (%s): the GPU is stuck or the device is lost", vk_result_name(r));
     VKC(vkResetFences(V.device, 1, &s->fence));
-    if (g_ts_on > 0) {                             /* SMO_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
+    if (s->ts_on) {                                /* SMO_VK_GPUTIME=1 or the full performance overlay: the GPU's own clock at the first and the last command of this buffer */
         uint64_t ts[2] = {0, 0};
-        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) { double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod; g_ts_ns += ns; g_ts_n++; if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6); }
+        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) { double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod; g_ts_ns += ns; g_ts_n++; if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6); if (s->ts_frame >= 0) g_po_gpu[s->ts_frame & 15] += (float)(ns / 1e6); }
     }
     s->pending = 0;
     if (s->serial > R.done) R.done = s->serial;
@@ -399,10 +411,11 @@ static void cmd_begin(void) {
     R.cmd = s->cmd; R.recording = 1; R.in_pass = 0; R.pipe_bound = NULL; R.dyn_dirty = R.vi_dirty = 1; g_dyn_inval = 1;
     if (g_ts_on < 0) {
         g_ts_on = getenv("SMO_VK_GPUTIME") && atoi(getenv("SMO_VK_GPUTIME")) && V.props.limits.timestampComputeAndGraphics;
-        if (g_ts_on) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NSLOT * 2; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_ts_pool)); }
+        if (V.props.limits.timestampComputeAndGraphics) {      /* the pool also for the full performance overlay (perf_overlay_wants_gpu) */ VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NSLOT * 2; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_ts_pool)); }
     }
     s->ts_frame = g_cur_frame;
-    if (g_ts_on > 0) { vkCmdResetQueryPool(s->cmd, g_ts_pool, (uint32_t)R.cur * 2, 2); vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2); }
+    s->ts_on = g_ts_pool && (g_ts_on > 0 || perf_overlay_wants_gpu());
+    if (s->ts_on) { vkCmdResetQueryPool(s->cmd, g_ts_pool, (uint32_t)R.cur * 2, 2); vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2); }
     garbage_collect();
 }
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
@@ -410,7 +423,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
     pass_end();
     Slot *s = &R.slot[R.cur];
-    if (g_ts_on > 0) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
+    if (s->ts_on) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
     VKC(vkEndCommandBuffer(s->cmd));
     VkFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1523,6 +1536,7 @@ static int pass_begin(void) {
     vkCmdBeginRendering(R.cmd, &ri);
     g_fr_passes++;
     R.in_pass = 1; R.pass_w = w; R.pass_h = h;
+    g_pass_vpw = g_pass_vph = 0; g_pass_draws0 = R.frame_draws; g_pass_depth = R.depth.tex != NULL;
     return 1;
 }
 
@@ -1785,6 +1799,7 @@ static void set_dynamic_state(void) {
     vp.x = x; vp.y = y + h; vp.width = w; vp.height = -h; vp.minDepth = R.drange[0]; vp.maxDepth = R.drange[1];      /* NVN upper-left origin: clip y = +1 is row y (design, section 3) */
     if (vp.minDepth < 0) vp.minDepth = 0; if (vp.maxDepth > 1) vp.maxDepth = 1;
     DYNSET(vp, vp, vkCmdSetViewport(R.cmd, 0, 1, &vp));
+    if (R.have_viewport && R.viewport[2] * R.viewport[3] > (float)g_pass_vpw * (float)g_pass_vph) { g_pass_vpw = (uint16_t)R.viewport[2]; g_pass_vph = (uint16_t)R.viewport[3]; }
     int sx = R.have_scissor ? R.scissor[0] : 0, sy = R.have_scissor ? R.scissor[1] : 0, sw = R.have_scissor ? R.scissor[2] : R.pass_w, sh = R.have_scissor ? R.scissor[3] : R.pass_h;
     if (R.pass_rs && R.have_scissor) rs_rect(&sx, &sy, &sw, &sh);
     if (sx < 0) { sw += sx; sx = 0; } if (sy < 0) { sh += sy; sy = 0; }
@@ -3573,7 +3588,39 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
+/* the performance overlay (perf_overlay.c): its picture copied straight into the window image's top-left corner, from
+ * an upload buffer of the command buffer being recorded (one per slot: a slot is waited for before it records again) */
+static struct { VkBuffer buf; VMem mem; uint64_t size; } g_perf[NSLOT];
+static void perf_draw(uint32_t index) {
+    uint8_t *px; int w, h;
+    if (!perf_overlay_compose(&px, &w, &h, (int)V.extent.width, (int)V.extent.height)) return;
+    int x = h >= 300 ? 16 : 8;                     /* a margin, two letters' worth on a large window */
+    if (w + x > (int)V.extent.width || h + x > (int)V.extent.height) return;
+    uint64_t need = (uint64_t)w * h * 4;
+    if (g_perf[R.cur].size < need) {
+        if (g_perf[R.cur].buf) { vkDestroyBuffer(V.device, g_perf[R.cur].buf, NULL); vmem_free(g_perf[R.cur].mem); }
+        g_perf[R.cur].buf = vbuf_new(need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_perf[R.cur].mem);
+        g_perf[R.cur].size = need;
+    }
+    uint8_t *dst = g_perf[R.cur].mem.map;
+    if (V.format.format == VK_FORMAT_R8G8B8A8_UNORM || V.format.format == VK_FORMAT_R8G8B8A8_SRGB) {
+        for (uint64_t i = 0; i < need; i += 4) { dst[i] = px[i + 2]; dst[i + 1] = px[i + 1]; dst[i + 2] = px[i]; dst[i + 3] = px[i + 3]; }
+    } else memcpy(dst, px, need);
+    VkBufferImageCopy c;
+    memset(&c, 0, sizeof c);
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
+    c.imageOffset.x = x; c.imageOffset.y = x; c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
+    {   /* after the blit of the frame into the same image: two transfer writes need a barrier between them */
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = V.images[index];
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+        b.srcAccessMask = b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    }
+    vkCmdCopyBufferToImage(R.cmd, g_perf[R.cur].buf, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+}
 static void overlay_draw(uint32_t index) {
+    if (!g_menu.on) perf_draw(index);
     if (g_menu.on && g_menu.img) {
         VkImageBlit b;
         memset(&b, 0, sizeof b);
@@ -3984,6 +4031,14 @@ swap: ;
             g_fr_play[frame] = (uint8_t)play;
             g_fr_wall[frame] = t_prev ? (float)((double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
         }
+        {   /* the performance overlay: this frame's time, the GPU time of the frame NSLOT back (all its buffers have been
+             * waited for since: a slot is waited for before it records again), the last frame's main 3D pass */
+            LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            int kb = (int)((frame - NSLOT) & 15), kl = (int)((frame - 1) & 15), kn = (int)((frame + 1) & 15);
+            perf_overlay_frame(t_prev ? (double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart : 0, frame >= NSLOT ? g_po_gpu[kb] : -1.0f, g_po_vpw[kl], g_po_vph[kl]);
+            g_po_gpu[kb] = 0;
+            g_po_vpdraws[kn] = 0; g_po_vpw[kn] = g_po_vph[kn] = 0;
+        }
         t_prev = t_now;
         g_cur_frame = frame + 1;
     }
@@ -4202,6 +4257,7 @@ static void vkd_shutdown(void) {
     if (g_occ_pool) { vkDestroyQueryPool(V.device, g_occ_pool, NULL); g_occ_pool = NULL; g_occ_qn = 0; }
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
     tc_shutdown();
+    for (int i = 0; i < NSLOT; i++) if (g_perf[i].buf) { vkDestroyBuffer(V.device, g_perf[i].buf, NULL); vmem_free(g_perf[i].mem); g_perf[i].buf = NULL; g_perf[i].size = 0; }
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;

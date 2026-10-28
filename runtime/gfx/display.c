@@ -6,6 +6,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "perf_overlay.h"
 #include "gfx_options.h"
 
 #define A0 (c->x[0])
@@ -138,6 +139,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_KEYDOWN && w == VK_F10 && !(l & (1 << 30))) { perf_overlay_toggle(); return 0; }     /* F10 = the performance overlay (perf_overlay.c) */
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) {      /* F12 = the console's Capture button (once per press) */
         void smo_capture_request(void);
         smo_capture_request();
