@@ -756,6 +756,7 @@ static LONG64 g_storage_tex;                       /* textures whose image has s
 struct VTex {
     uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
     int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
+    uint32_t lvl_drawn[16];                        /* per mip level, the pass that last drew into it: which way a chain over its levels goes */
     int rs; float sx, sy;                          /* rs = 1 when the image is smaller than the game's texture (w, h are the image's; sx, sy = image / game) */
     int storage;                                   /* made with VK_IMAGE_USAGE_STORAGE_BIT (NVN_TEXTURE_FLAGS_IMAGE): it can be bound as an image */
     VView *views; VTex *next, *prev;
@@ -1466,6 +1467,7 @@ static int pass_begin(void) {
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { nvn_vk_missing("a depth format bound as colour target"); continue; }
         if (vt->is3d && ((t->b.format == 0x3f && vt->d <= 8) || getenv("SMO_VK_3DRT_ALL"))) { static int n; if (n++ < 40) printf("nvn_vk_3drt: pass %lld: 3D texture %dx%dx%d fmt 0x%x as colour %d, view set 0x%x layers %d+%d level %d\n", (long long)nvn_front_frame_next(), vt->w, vt->h, vt->d, t->b.format, i, R.col[i].view.set, R.col[i].view.lay0, R.col[i].view.nlay, target_level(&R.col[i])); }
         t->gpu_written = 1;
+        { static uint32_t pass_no; int l = target_level(&R.col[i]); if (l >= 0 && l < 16) vt->lvl_drawn[l] = ++pass_no; }
         vt_layout(vt, vt->feedback ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         ca[i].imageView = target_view(&R.col[i], vt); ca[i].imageLayout = vt->layout;
         if (!w) { w = lvl_(vt->w, target_level(&R.col[i])); h = lvl_(vt->h, target_level(&R.col[i])); if (vt->rs) { R.pass_rs = 1; R.pass_sx = vt->sx; R.pass_sy = vt->sy; } }
@@ -1721,6 +1723,22 @@ static void resolve_sampler(int s, VStage *v, int i) {
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
+        /* a texture sampled while one of its levels is the colour target, in a chain going down its levels (the bloom's
+         * downsample: level n - 1 drawn more recently than level n + 1, read; level n drawn into): the sampled view stops
+         * below the level drawn. With every level in the view, a sampler with mipmaps could read the level being drawn,
+         * as the last frame left it (from nmqx/smo-recomp: a white screen in New Donk City that grew until the stage
+         * changed). A chain going up (the bloom's upsample reads level n + 1) keeps every level: stopped below n, it read
+         * the wrong level (blocky halos). SMO_VK_FEEDBACK_LEVELS=0: every level always. */
+        if (attached) {
+            static int clip = -1;
+            if (clip < 0) clip = !(getenv("SMO_VK_FEEDBACK_LEVELS") && !atoi(getenv("SMO_VK_FEEDBACK_LEVELS")));
+            for (int k = 0; clip && k < R.ncol; k++) {
+                int l = R.col[k].tex == t ? target_level(&R.col[k]) : -1;
+                if (l <= e.lvl0 || e.lvl0 + e.nlvl <= l || l >= 15) continue;
+                if (vt->lvl_drawn[l + 1] > vt->lvl_drawn[l - 1]) continue;      /* going up */
+                e.nlvl = l - e.lvl0;
+            }
+        }
         int have = target_dim(e.target);
         int ok = have == dim || (dim == DIM_2D && (have == DIM_2DA || have == DIM_CUBE || have == DIM_CUBEA)) || (dim == DIM_2DA && (have == DIM_2D || have == DIM_CUBE || have == DIM_CUBEA)) ||
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||
