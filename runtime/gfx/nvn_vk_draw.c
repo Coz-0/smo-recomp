@@ -25,7 +25,7 @@ static int have_targets_live(void);
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetLineWidth) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetRasterizerDiscardEnable) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) \
-    X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
+    X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
     X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkResetQueryPool) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkDestroyPipelineCache)
 #define X(n) static PFN_##n n;
 VKD(X)
@@ -753,6 +753,7 @@ static VkFormat vertex_vkfmt(int nf) {
 /* ---------------------------------------------------------------- images */
 typedef struct VView { EView e; int vtype, attach; VkImageView view; uint64_t id; struct VView *next; } VView;      /* id: never given to another view (vt_view), unlike the handle a driver may give again once the view is destroyed */
 static LONG64 g_storage_tex;                       /* textures whose image has storage use (vt_get2) */
+typedef struct ShGrp { VkImage img; VMem mem; int refs; uint64_t hash; VkImageCreateInfo ci; VTex *members; struct ShGrp *next; } ShGrp;
 struct VTex {
     uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
     int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
@@ -760,6 +761,8 @@ struct VTex {
     int rs; float sx, sy;                          /* rs = 1 when the image is smaller than the game's texture (w, h are the image's; sx, sy = image / game) */
     int storage;                                   /* made with VK_IMAGE_USAGE_STORAGE_BIT (NVN_TEXTURE_FLAGS_IMAGE): it can be bound as an image */
     VView *views; VTex *next, *prev;
+    struct ShGrp *shg; VTex *sh_next;              /* one image for textures with the same texels (sh_join) */
+    VkImageCreateInfo *shci;                       /* its description while it may still join one (eligible, not read yet) */
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
  * A texture of the screen class (2D, one layer, attachable, the game's size about 16:9: rs_screen_class) gets an image
@@ -817,8 +820,10 @@ static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkIma
     b.srcAccessMask = layout_access(from); b.dstAccessMask = layout_access(to); b.oldLayout = from; b.newLayout = to;
     vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
+static int sh_layout(VTex *vt, VkImageLayout to);
 static void vt_layout(VTex *vt, VkImageLayout to) {
     if (vt->layout == to) return;
+    if (vt->shg && sh_layout(vt, to)) return;      /* a shared image: read layouts for all its textures at once; a write first gives it an image of its own */
     pass_end();
     cmd_begin();
     image_barrier(vt->img, vt->aspect, vt->layout, to);
@@ -961,10 +966,11 @@ static void tex_barrier(void) {
     g_texbar++; g_fr_texbar++;
 }
 static void vt_check(VTex *vt) { if (vt->magic != 0x56544558) vkd_fail("an image is used after it was destroyed (texture record %p)", (void *)vt); }
+static int sh_leave(VTex *vt);
 static void vt_destroy(VTex *vt) {
     for (VView *v = vt->views, *n; v; v = n) { n = v->next; vkDestroyImageView(V.device, v->view, NULL); free(v); }
-    vkDestroyImage(V.device, vt->img, NULL);
-    vmem_free(vt->mem);
+    free(vt->shci);
+    if (!vt->shg || !sh_leave(vt)) { vkDestroyImage(V.device, vt->img, NULL); vmem_free(vt->mem); }
     if (vt->prev) vt->prev->next = vt->next; else g_vtex_all = vt->next;
     if (vt->next) vt->next->prev = vt->prev;
     vt->magic = 0xDEADDEAD; R.images_live--;
@@ -1123,6 +1129,127 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
 static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
+/* ---- one image for textures with the same texels (SMO_VK_TEXSHARE, default on). In Top-Hat Tower 1,925 sampled
+ * textures (164 MB of the 1.2 GB of images) held exactly the texels of another one: the same file loaded for several
+ * objects. A texture of a memory pool the CPU never writes (its texels are read once), not a render target or storage
+ * image, keeps its image description when the image is made. At its first read (textures are made ahead of their first
+ * draw, before the game has loaded their texels) its bytes are hashed: if a texture with the same description and the
+ * same bytes has an image already read, it takes that image, reads nothing and its own goes to the garbage (sh_join);
+ * otherwise it is read as before and becomes the image others may take (sh_found). A layout change of a shared image to
+ * a write (a copy or a draw into it) first gives that texture an image of its own with a copy of the texels (sh_detach);
+ * the image goes with its last texture. SMO_VK_TEXSHARE=0: every texture its own image, as before. */
+static ShGrp *g_sh_tab[16384];
+static LONG64 g_sh_n, g_sh_bytes, g_sh_detach, g_sh_groups;
+static int sh_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_TEXSHARE"); on = !(e && e[0] && !atoi(e)); } return on; }
+static int sh_ok(Tex *t, VTex *vt, int can_color) {      /* the image can be shared: sampled only, its texels read once from memory the CPU never writes */
+    return sh_on() && !can_color && !vt->storage && vt->samples == 1 && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && (t->pool_flags & 1) && !t->gpu_written &&
+           !t->b.packaged && t->mem && t->data_size && (!t->limit || t->mem + t->data_size <= t->limit);
+}
+static uint64_t sh_hash(Tex *t) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)t->data_size; const uint8_t *m = t->mem; size_t n = t->data_size, i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t x; memcpy(&x, m + i, 8); h = (h ^ x) * 1099511628211ull; h ^= h >> 29; }
+    for (; i < n; i++) h = (h ^ m[i]) * 1099511628211ull;
+    return h;
+}
+static int sh_same_ci(const VkImageCreateInfo *a, const VkImageCreateInfo *b) {
+    return a->imageType == b->imageType && a->format == b->format && a->extent.width == b->extent.width && a->extent.height == b->extent.height &&
+           a->extent.depth == b->extent.depth && a->mipLevels == b->mipLevels && a->arrayLayers == b->arrayLayers && a->samples == b->samples &&
+           a->flags == b->flags && a->usage == b->usage;
+}
+static ShGrp *sh_find(uint64_t h, const VkImageCreateInfo *ci, Tex *t) {
+    for (ShGrp *g = g_sh_tab[h & 16383]; g; g = g->next) {
+        if (g->hash != h || !sh_same_ci(&g->ci, ci) || !g->members) continue;
+        VTex *o = g->members;
+        if (!o->t || o->t->data_size != t->data_size || !o->t->mem || memcmp(o->t->mem, t->mem, t->data_size)) continue;      /* the bytes themselves, not only the hash */
+        return g;
+    }
+    return NULL;
+}
+static void sh_new(VTex *vt, uint64_t h, const VkImageCreateInfo *ci) {
+    ShGrp *g = calloc(1, sizeof *g);
+    g->img = vt->img; g->mem = vt->mem; g->refs = 1; g->hash = h; g->ci = *ci; g->ci.pNext = NULL;
+    g->members = vt; vt->shg = g; vt->sh_next = NULL;
+    g->next = g_sh_tab[h & 16383]; g_sh_tab[h & 16383] = g; g_sh_groups++;
+}
+static void sh_unlink(VTex *vt) {
+    ShGrp *g = vt->shg;
+    for (VTex **p = &g->members; *p; p = &(*p)->sh_next) if (*p == vt) { *p = vt->sh_next; break; }
+    vt->shg = NULL; vt->sh_next = NULL; g->refs--;
+}
+static int sh_leave(VTex *vt) {                    /* vt_destroy: 1 = the image stays (other textures hold it) */
+    ShGrp *g = vt->shg;
+    sh_unlink(vt);
+    if (g->refs > 0) return 1;
+    for (ShGrp **p = &g_sh_tab[g->hash & 16383]; *p; p = &(*p)->next) if (*p == g) { *p = g->next; break; }
+    free(g); g_sh_groups--;
+    return 0;
+}
+static void sh_detach(VTex *vt) {
+    ShGrp *g = vt->shg;
+    if (g->refs <= 1) { sh_leave(vt); return; }    /* the only holder: the image is simply its own again */
+    VkImageCreateInfo ci = g->ci;
+    VkImage img; VkMemoryRequirements rq;
+    VKC(vkCreateImage(V.device, &ci, NULL, &img));
+    vkGetImageMemoryRequirements(V.device, img, &rq);
+    VMem mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VKC(vkBindImageMemory(V.device, img, mem.mem, mem.off));
+    pass_end(); cmd_begin();
+    VkImageLayout was = vt->layout;
+    image_barrier(g->img, vt->aspect, was, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    image_barrier(img, vt->aspect, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy rg[16]; int nr = 0;
+    for (uint32_t l = 0; l < ci.mipLevels && nr < 16; l++, nr++) {
+        memset(&rg[nr], 0, sizeof rg[nr]);
+        rg[nr].srcSubresource.aspectMask = vt->aspect; rg[nr].srcSubresource.mipLevel = l; rg[nr].srcSubresource.layerCount = ci.arrayLayers; rg[nr].dstSubresource = rg[nr].srcSubresource;
+        rg[nr].extent.width = ci.extent.width >> l ? ci.extent.width >> l : 1; rg[nr].extent.height = ci.extent.height >> l ? ci.extent.height >> l : 1; rg[nr].extent.depth = ci.extent.depth >> l ? ci.extent.depth >> l : 1;
+    }
+    vkCmdCopyImage(R.cmd, g->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)nr, rg);
+    image_barrier(g->img, vt->aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, was);
+    {   /* the views of the shared image may still be named by command buffers in flight: they go with a holder later */
+        VTex *old = calloc(1, sizeof *old);
+        old->magic = 0x56544558; old->views = vt->views; old->mem.block = -1;
+        old->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = old; g_vtex_all = old; R.images_live++;
+        if (g_ngarbage == g_garbage_cap) { g_garbage_cap = g_garbage_cap ? g_garbage_cap * 2 : 256; g_garbage = realloc(g_garbage, sizeof *g_garbage * (size_t)g_garbage_cap); }
+        g_garbage[g_ngarbage].vt = old; g_garbage[g_ngarbage++].serial = R.serial + 1;
+    }
+    vt->views = NULL;
+    sh_unlink(vt);
+    vt->img = img; vt->mem = mem; vt->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    g_sh_detach++;
+}
+/* at the first read of an eligible texture (its texels now in memory): 1 = it took the image of a group with the same
+ * texels (its own, never written, goes when the command buffers naming it are done) and nothing is read */
+static int sh_join(Tex *t, VTex *vt) {
+    if (!vt->shci) return 0;
+    uint64_t h = sh_hash(t);
+    ShGrp *g = sh_find(h, vt->shci, t);
+    if (!g) return 0;
+    VTex *old = calloc(1, sizeof *old);            /* the image made for it, never written: a holder takes it to the garbage */
+    old->magic = 0x56544558; old->img = vt->img; old->mem = vt->mem; old->views = vt->views;
+    old->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = old; g_vtex_all = old; R.images_live++;
+    if (g_ngarbage == g_garbage_cap) { g_garbage_cap = g_garbage_cap ? g_garbage_cap * 2 : 256; g_garbage = realloc(g_garbage, sizeof *g_garbage * (size_t)g_garbage_cap); }
+    g_garbage[g_ngarbage].vt = old; g_garbage[g_ngarbage++].serial = R.serial + 1;
+    vt->views = NULL; vt->img = g->img; vt->mem = g->mem; vt->layout = g->members->layout;
+    vt->shg = g; vt->sh_next = g->members; g->members = vt; g->refs++;
+    free(vt->shci); vt->shci = NULL;
+    g_sh_n++; g_sh_bytes += (LONG64)g->mem.size;
+    return 1;
+}
+static void sh_found(Tex *t, VTex *vt) {           /* after its first read: the group others may join */
+    sh_new(vt, sh_hash(t), vt->shci);
+    free(vt->shci); vt->shci = NULL;
+}
+static int sh_layout(VTex *vt, VkImageLayout to) {      /* vt_layout of a shared image: 1 = done here */
+    ShGrp *g = vt->shg;
+    int write = to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL || to == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL || to == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+                to == VK_IMAGE_LAYOUT_GENERAL;
+    if (g->refs <= 1) { if (write) sh_leave(vt); return 0; }      /* the only holder: the normal path; it stays the group's image until written */
+    if (write) { sh_detach(vt); return 0; }        /* then the normal path changes its own image's layout */
+    pass_end(); cmd_begin();
+    image_barrier(g->img, vt->aspect, vt->layout, to);
+    for (VTex *m = g->members; m; m = m->sh_next) m->layout = to;
+    return 1;
+}
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -1188,6 +1315,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (ci.imageType == VK_IMAGE_TYPE_2D && vt->w == vt->h && vt->layers >= 6 && vt->samples == 1) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         if (vt->is3d && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;      /* its slices can be render targets */
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        int sh = sh_ok(t, vt, can_color);
         VkResult r = vkCreateImage(V.device, &ci, NULL, &vt->img);
         if (r != VK_SUCCESS) vkd_fail("vkCreateImage (NVN format 0x%x -> %d, target %d, %dx%dx%d, %d levels, %d layers, %d samples): %s", b->format, (int)vt->fmt, b->target, vt->w, vt->h, vt->d, vt->levels, vt->layers, vt->samples, vk_result_name(r));
         VkMemoryRequirements rq;
@@ -1197,6 +1325,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         vt->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         vt->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = vt; g_vtex_all = vt;
         t->vk = vt;
+        if (sh) { vt->shci = malloc(sizeof ci); *vt->shci = ci; vt->shci->pNext = NULL; }      /* sh_join at its first read */
         R.images++; R.images_live++; nvn_front_count(5, 1);
         g_fmt_hist[b->format & 255]++;
         if (can_color || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {      /* an image nothing was written to reads as zero (the OpenGL driver's behaviour, which the comparison saw) */
@@ -1209,11 +1338,12 @@ static VTex *vt_get2(Tex *t, int sync) {
         }
     }
     vt_check(vt);
-    if (sync && nvn_front_tex_changed(t)) {
+    if (sync && nvn_front_tex_changed(t) && !sh_join(t, vt)) {
         if (!tu0) tu0 = tk();
         g_put_vt = vt;
         cmd_begin();
         if (!nvn_front_tex_read(t, vt->decode, vt_put)) { static int n; if (n++ < 20) printf("nvn_vk: texture %dx%d format 0x%x: its memory is not readable; not uploaded\n", t->b.width, t->b.height, t->b.format); }
+        if (vt->shci) sh_found(t, vt);              /* its texels: the image others with the same ones will share */
         R.uploads++;
     }
     if (tu0 && !g_ta_inside) {                     /* made or read again at its use (a draw, a copy, a target): the frame pays */
@@ -4211,6 +4341,7 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
+    printf("nvn_vk: textures sharing the image of another with the same texels (SMO_VK_TEXSHARE): %lld (%lld MB not allocated), %lld groups left, %lld given an image of their own when written\n", (long long)g_sh_n, (long long)(g_sh_bytes >> 20), (long long)g_sh_groups, (long long)g_sh_detach);
     printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (g_occ_reports || g_occ_folds) {
