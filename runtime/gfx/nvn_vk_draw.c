@@ -1872,6 +1872,7 @@ static int g_cb_used;                              /* slots taken into use so fa
 static CDisp g_cdisp[2048];
 static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
+static uint64_t g_cb_carry_from;                   /* cb_carry: the oldest submission whose compute results are bound into later batches, not in guest memory yet; 0: none */
 static void cb_masks(void) {                       /* every recorded dispatch has run: which buffers did each one write? */
     for (int i = 0; i < g_ncdisp; i++) {
         uint32_t wm;
@@ -1914,6 +1915,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
         c->busy = midbatch ? R.serial + 1 : 0;
     }
     g_cb_live = g_cb_pending = 0;
+    g_cb_carry_from = 0;
     nvn_front_ccmp_landed();                       /* SMO_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
     g_tm[1] += tk() - t0;
@@ -2150,6 +2152,34 @@ static void cb_batch_end(void) {
  * state 1 sets g_cb_live to 0). Every range a draw reads is looked up here while compute results are live, about 10,000
  * a frame: walking the 256 slots for the dozen CBs of a frame cost 0.5-0.7 ms a frame once they stayed live longer. */
 static int16_t g_cb_live_list[CB_MAX];
+/* At the start of a batch, compute buffers of the batch before whose submission has not finished stay bound for this one
+ * (state 1 again: buf_ref binds them; a range that only partly lies in one still syncs) instead of the render thread
+ * waiting for the GPU to copy them back (cb_sync). In New Donk City going down into the streets the render thread waited
+ * there almost every frame (343 waits, 2.6 s over 350 frames). A barrier makes what compute and copies wrote before
+ * visible to this batch's reads. They are copied back when a later batch's submission has finished, or when the game
+ * waits for a fence of the submission that wrote them (cb_carry_land). Not carried, as before: a range the guest has
+ * written since the buffer was filled (the buffer lacks that write, and its memory cannot change while the GPU may still
+ * write it). SMO_VK_CB_CARRY=0: the batch waits, as before. */
+static LONG64 g_cb_carried, g_cb_carry_refused, g_cb_carry_due;
+static int cb_carry_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_CB_CARRY"); on = !(e && e[0] && !atoi(e)); } return on; }
+static void cb_carry(void) {
+    cb_poll();                                     /* finished already: copied back as before */
+    if (!g_cb_pending) return;
+    for (int i = 0; i < g_cb_used; i++) {
+        const CB *c = &g_cb[i];
+        if (c->state == 2 && (!c->snap || memcmp(P(c->addr), c->snap, (size_t)c->size))) { g_cb_carry_refused++; CB_SYNC(0); return; }
+    }
+    if (!g_cb_carry_from) g_cb_carry_from = g_cb_serial;
+    int n = 0;
+    for (int i = 0; i < g_cb_used; i++) if (g_cb[i].state == 2) { g_cb[i].state = 1; g_cb_live_list[n++] = (int16_t)i; }
+    g_cb_live = n; g_cb_pending = 0; g_cb_carried++;
+    cmd_begin();
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
 static CB *cb_inside(uint64_t addr, uint64_t size) {
     for (int k = 0; k < g_cb_live; k++) { CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr >= c->addr && addr + size <= c->addr + c->size) return c; }
     return NULL;
@@ -3345,7 +3375,8 @@ static void vk_submit(void *arg) {
     if (!V.alive) return;                          /* after the shutdown at exit: the device is gone */
     prewarm_wait();
     LONG64 t0 = tk();
-    CB_SYNC(0);                                     /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
+    if (cb_carry_on()) cb_carry();                  /* still running: its compute buffers stay bound for this batch */
+    else CB_SYNC(0);                                /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
     if (g_occ_qn) occ_resolve(0);                  /* occlusion counts whose submissions have finished */
     LONG64 t1 = tk();
     nvn_front_batch_begin();
@@ -3374,19 +3405,22 @@ static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) 
  * through waits that do not land them (the occlusion wait at the present, slot_wait in cmd_begin). The game reads what the
  * fence covers as soon as the wait returns, so what has finished is landed first (cb_poll never waits). */
 static LONG64 g_sync_pending_cb;
+/* after a game fence wait for submission `want`: compute results of it that cb_carry kept bound are not in guest memory
+ * yet (the fence has passed, they land with a later submission): landed now, as the game may read them next */
+static void cb_carry_land(uint64_t want) { if (g_cb_carry_from && g_cb_carry_from <= want) { g_cb_carry_due++; CB_SYNC(0); } }
 static void vk_sync_wait_(SyncJob *j) {
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
-    if (want <= R.done) { if (g_cb_pending && g_cb_serial <= want) g_sync_pending_cb++; cb_poll(); j->result = 0; return; }
+    if (want <= R.done) { if (g_cb_pending && g_cb_serial <= want) g_sync_pending_cb++; cb_poll(); cb_carry_land(want); j->result = 0; return; }
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
         VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, j->timeout);
-        if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); } else j->result = r == VK_TIMEOUT ? 2 : 3;
+        if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); cb_carry_land(want); } else j->result = r == VK_TIMEOUT ? 2 : 3;
         return;
     }
-    cb_poll();
+    cb_poll(); cb_carry_land(want);
     j->result = 0;                                  /* its command buffer was reused: finished long ago */
 }
 static void vk_sync_wait(void *arg) { vk_sync_wait_(arg); if (V.alive && g_occ_qn) occ_resolve(0); }      /* occlusion counts the fence covers are in guest memory when the game goes on */
@@ -4048,6 +4082,8 @@ swap: ;
                 printf(" %s %lld/%lld/%.0f;", k_cbw_name[i], (long long)g_cbw_forced[i], (long long)g_cbw_waits[i], (double)g_cbw_tk[i] * 1000.0 / (double)fq.QuadPart);
             printf("\n");
         }
+        if (g_cb_carried) printf("nvn_vk: batches that kept the last batch's compute buffers bound instead of waiting (SMO_VK_CB_CARRY): %lld; waited instead because the guest had written into a range: %lld; copied back at a game fence wait: %lld\n",
+                                 (long long)g_cb_carried, (long long)g_cb_carry_refused, (long long)g_cb_carry_due);
     }
     if (frame % 600 == 0) { printf("nvn_vk: images made per NVN texture format (format:count):"); for (int i = 0; i < 256; i++) if (g_fmt_hist[i]) printf(" 0x%x:%u", i, g_fmt_hist[i]); printf("\n"); }
     {   static long long lo = -2, hi;
