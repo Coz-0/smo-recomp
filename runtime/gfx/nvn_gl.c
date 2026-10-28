@@ -4890,7 +4890,10 @@ static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop
 static HANDLE g_present_ev;
 static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
+static volatile LONG64 g_presents_queued;              /* nvnQueuePresentTexture calls of the game: the frame it builds is this + 1 */
+long long nvn_front_presents_queued(void) { return g_presents_queued; }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
+    InterlockedIncrement64(&g_presents_queued);
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
@@ -5439,7 +5442,7 @@ static void cmd_dispatch_indirect(Ctx *c) { cb_get(A0)->dispatches++; rec(c, OP_
 static void cmd_render_enable(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[1] = 0; m->a[2] = 0; }                      /* (cmdbuf, enable) */
 static void cmd_render_enable_cond(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[2] = m->a[1]; m->a[1] = m->a[0] + 1; }   /* (cmdbuf, mode, counter address) */
 static void cmd_reset_counter(Ctx *c) { rec(c, OP_COUNTER_RESET, 0); }
-static void cmd_report_counter(Ctx *c) { rec(c, OP_COUNTER_REPORT, 0); }
+static void cmd_report_counter(Ctx *c) { rec(c, OP_COUNTER_REPORT, 0)->a[2] = c->x[30]; }      /* (cmdbuf, type, address); a[2]: the game's call site (SMO_VK_OCC_TRACE) */
 static void cmd_report_value(Ctx *c) { rec(c, OP_REPORT_VALUE, 0); }
 static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags) */
 static void cmd_wait_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_WAITSYNC, 0)->a[0] = (uint64_t)(uintptr_t)o; }

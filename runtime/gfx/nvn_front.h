@@ -151,6 +151,7 @@ int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v
  * collects old command lists. Returns the number of the frame just presented. */
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears);
 long long nvn_front_frame_next(void);                                       /* number the frame being presented will get */
+long long nvn_front_presents_queued(void);                                  /* presents the game has queued (it builds frame this + 1) */
 /* SMO_COMPUTE_CMP=<folder>: a dispatch named by the hash of its inputs; its written ranges saved once landed. */
 void nvn_front_ccmp_dispatch(const Range *ubo, const Range *ssbo, uint32_t written, const uint8_t *code, int code_len, unsigned gx, unsigned gy, unsigned gz);
 void nvn_front_ccmp_landed(void);

@@ -1408,6 +1408,20 @@ static void stage_copy(Stage *st, int s) {
     st->code = blk + (st->code - lo);
     g_scopy_n++; g_scopy_bytes += (LONG64)n;
 }
+/* programs handed over per game thread (the exit report): which threads load shaders, how many near a scene, how long
+ * the hand-over held them */
+#define HOTHR_N 32
+static struct { const char *name; LONG64 n, near_scene, held, held_tk; } g_hothr[HOTHR_N];
+static volatile LONG g_hothr_n;
+static __declspec(thread) int t_hothr = -1;
+static int hothr_slot(void) {
+    if (t_hothr >= 0) return t_hothr;
+    LONG i = InterlockedIncrement(&g_hothr_n) - 1;
+    if (i >= HOTHR_N) return t_hothr = HOTHR_N - 1;            /* more threads than slots: the last slot takes the rest */
+    const char *guest_thread_name_of(DWORD tid);                   /* os_threads.c */
+    g_hothr[i].name = guest_thread_name_of(GetCurrentThreadId());
+    return t_hothr = (int)i;
+}
 void nvn_vk_program_set(void *prog) {
     Prog *p = prog;
     SSrc s[3];
@@ -1426,6 +1440,15 @@ void nvn_vk_program_set(void *prog) {
         if (on) { EnterCriticalSection(&g_sh_lock); stage_copy(&p->st[0], 0); stage_copy(&p->st[1], 1); stage_copy(&p->st[5], 5); LeaveCriticalSection(&g_sh_lock); }
     }
     int has[3] = {ssrc_of(&s[0], p, 0), ssrc_of(&s[1], p, 1), ssrc_of(&s[2], p, 5)};
+    {   /* debug aid: SMO_VK_DUMP_SERIAL=<n> also when program n is handed over (its stages may come from the cache) */
+        static int want = -2; if (want == -2) want = getenv("SMO_VK_DUMP_SERIAL") ? atoi(getenv("SMO_VK_DUMP_SERIAL")) : -1;
+        if (want >= 0 && p->serial == want)
+            for (int i = 0; i < 3; i++) if (has[i]) {
+                const char *dir = getenv("SMO_SHADERDUMP"); char path[300];
+                snprintf(path, sizeof path, "%s%svk_prog_%05d_%d.bin", dir ? dir : "", dir ? "/" : "", p->serial, i == 2 ? 5 : i);
+                FILE *f = fopen(path, "wb"); if (f) { fwrite(s[i].code, 1, (size_t)s[i].code_len, f); fclose(f); }
+            }
+    }
     if (!has[0] && !has[2] && has[1]) {
         /* SMO_VK_FRAGONLY. A program
          * with a fragment stage and no vertex stage (the game binds stages of different programs) was never handed over:
@@ -1459,7 +1482,8 @@ void nvn_vk_program_set(void *prog) {
     job_push(j);
     /* away from a scene (no compute dispatch in the last 600 frames: loading) the caller is also held while the background queue
      * still has work: loading ends when everything it holds is ready */
-    int fr = scene_recent();
+    int fr = scene_recent(), ht = hothr_slot();
+    g_hothr[ht].n++; g_hothr[ht].near_scene += fr;
     /* near a scene the caller (a game thread) is not held at all: a draw that needs the program waits for it
      * on the render thread, a program not drawn in this frame costs nothing */
     if (!fr && (g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done)) {
@@ -1467,6 +1491,7 @@ void nvn_vk_program_set(void *prog) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         while ((g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done) && tk() - t0 < 30 * fq.QuadPart) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
         g_set_held++; g_set_held_tk += tk() - t0;
+        g_hothr[ht].held++; g_hothr[ht].held_tk += tk() - t0;
         nvn_setsh_part[7] += tk() - t0;
     }
     LeaveCriticalSection(&g_sh_lock);
@@ -1741,6 +1766,9 @@ static void pipelines_report(void) {
            (long long)n, (double)t * k, (double)g_hold_max * k, (long long)g_hold_n[0], (double)g_hold_tk[0] * k, (long long)g_hold_n[1], (double)g_hold_tk[1] * k, (long long)g_hold_n[2], (double)g_hold_tk[2] * k, (long long)g_hold_n[3], (double)g_hold_tk[3] * k);
     printf("nvn_vk_pipelines: workers: %lld programs handed over, %lld stages made by them, %lld pipelines made by them; look-ahead: %lld pipelines and %lld draws with stages still to make sent ahead, %.0f ms of reading in all; blind prediction: %lld keys, %lld used; pass signatures %d; nvnProgramSetShaders held its caller %lld times, %.0f ms in all; background jobs %lld queued / %lld done; workers raised to normal priority for a waiting render thread %lld times\n",
            (long long)g_w_progs, (long long)g_w_stages, (long long)g_w_pipes, (long long)g_scan_pipes, (long long)g_scan_jobs, (double)g_tm[9] * k, (long long)g_pred_made, (long long)g_pred_used, g_nsig, (long long)g_set_held, (double)g_set_held_tk * k, (long long)g_bq_queued, (long long)g_bq_done, (long long)g_boosts);
+    for (int i = 0; i < g_hothr_n && i < HOTHR_N; i++)
+        printf("nvn_vk_pipelines: programs handed over by thread %s: %lld (%lld of them near a scene), held %lld times, %.0f ms in all\n", g_hothr[i].name ? g_hothr[i].name : "(not a game thread)",
+               (long long)g_hothr[i].n, (long long)g_hothr[i].near_scene, (long long)g_hothr[i].held, (double)g_hothr[i].held_tk * k);
 }
 static void workers_stop(void) {
     if (!g_pw_nthread) return;
