@@ -1123,6 +1123,35 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
 static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
+/* A new texture over the very memory of a target agl has let go of (tex_reclaim's list) - its screen buffers, made again
+ * every frame over the same storage of a pool the CPU never touches - takes that texture's image: the same picture the
+ * memory holds, and one image instead of up to SMO_VK_TEXFREE + 1 of each (in Top-Hat Tower 8 of each 1600x900 buffer,
+ * about 200 MB of 375 MB of targets). The old texture keeps no image; used again it gets a new one, as after tex_reclaim.
+ * Same builder (format, size, levels, layers, samples, target, flags), storage and image size; not bound, not a window
+ * texture, not used in this frame. SMO_VK_RTREUSE=0: a new image as before. */
+static LONG64 g_rtr_n, g_rtr_mb;
+static VTex *rt_reuse(Tex *t) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_VK_RTREUSE"); on = !(e && e[0] && !atoi(e)); }
+    if (!on || !t->mem || !(t->pool_flags & 1) || t->uploaded || wintex_is(t)) return NULL;
+    for (int i = 0; i < g_rc_n; i++) {
+        Tex *o = g_rc[i];
+        VTex *v = o->vk;
+        if (!v || o == t || o->dead || !o->gpu_written || o->mem != t->mem || o->last_use >= g_cur_frame || o->nslots > 0) continue;
+        if (memcmp(&o->b, &t->b, sizeof t->b) || o->data_size != t->data_size || v->decode) continue;
+        int bound = R.depth.tex == o || wintex_is(o);
+        for (int k = 0; k < 8 && !bound; k++) bound = R.col[k].tex == o;
+        if (bound) continue;
+        o->vk = NULL; o->image_freed = 1; o->uploaded = 0; o->checked = 0;
+        InterlockedExchange(&o->reclaim, 0);
+        g_rc[i] = g_rc[--g_rc_n];
+        v->t = t; v->feedback = 0; memset(v->lvl_drawn, 0, sizeof v->lvl_drawn);      /* the old texture's passes say nothing of this one's mip chain */
+        t->vk = v; t->gpu_written = 1; t->uploaded = 1;
+        g_rtr_n++; g_rtr_mb += (LONG64)(v->mem.size >> 20);
+        return v;
+    }
+    return NULL;
+}
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -1135,6 +1164,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         t->image_freed = 0;
         if (t->nslots <= 0 && InterlockedCompareExchange(&t->reclaim, 1, 0) == 0) rc_take(t);      /* still nothing names it: it may go again */
     }
+    if (!vt) vt = rt_reuse(t);
     if (!vt) {
         tu0 = tk();
         TexBuilder *b = &t->b;
@@ -4211,6 +4241,7 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
+    printf("nvn_vk: images of let-go targets taken by new textures over the same memory (SMO_VK_RTREUSE): %lld (%lld MB not allocated again)\n", (long long)g_rtr_n, (long long)g_rtr_mb);
     printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (g_occ_reports || g_occ_folds) {
