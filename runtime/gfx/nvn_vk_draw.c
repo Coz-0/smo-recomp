@@ -1871,6 +1871,7 @@ static CB g_cb[CB_MAX];
 static int g_cb_used;                              /* slots taken into use so far (the walks over g_cb stop there) */
 static CDisp g_cdisp[2048];
 static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
+static uint32_t g_cb_ver;                          /* changed with every change of the live CBs (cbx_may) */
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 static uint64_t g_cb_carry_from;                   /* cb_carry: the oldest submission whose compute results are bound into later batches, not in guest memory yet; 0: none */
 static void cb_masks(void) {                       /* every recorded dispatch has run: which buffers did each one write? */
@@ -1914,7 +1915,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
         c->state = c->dirty = 0;
         c->busy = midbatch ? R.serial + 1 : 0;
     }
-    g_cb_live = g_cb_pending = 0;
+    g_cb_live = g_cb_pending = 0; g_cb_ver++;
     g_cb_carry_from = 0;
     nvn_front_ccmp_landed();                       /* SMO_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
@@ -2146,7 +2147,7 @@ static void cb_batch_end(void) {
     if (!g_cb_live) return;
     g_cb_serial = cmd_submit(NULL, NULL);
     for (int i = 0; i < g_cb_used; i++) if (g_cb[i].state == 1) g_cb[i].state = 2;
-    g_cb_pending = g_cb_live; g_cb_live = 0;
+    g_cb_pending = g_cb_live; g_cb_live = 0; g_cb_ver++;
 }
 /* The CBs of this batch (state 1), in the order they were made: the first g_cb_live entries (every change of a CB out of
  * state 1 sets g_cb_live to 0). Every range a draw reads is looked up here while compute results are live, about 10,000
@@ -2172,7 +2173,7 @@ static void cb_carry(void) {
     if (!g_cb_carry_from) g_cb_carry_from = g_cb_serial;
     int n = 0;
     for (int i = 0; i < g_cb_used; i++) if (g_cb[i].state == 2) { g_cb[i].state = 1; g_cb_live_list[n++] = (int16_t)i; }
-    g_cb_live = n; g_cb_pending = 0; g_cb_carried++;
+    g_cb_live = n; g_cb_pending = 0; g_cb_carried++; g_cb_ver++;
     cmd_begin();
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2180,13 +2181,46 @@ static void cb_carry(void) {
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
-static CB *cb_inside(uint64_t addr, uint64_t size) {
+static CB *cb_inside_walk(uint64_t addr, uint64_t size) {
     for (int k = 0; k < g_cb_live; k++) { CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr >= c->addr && addr + size <= c->addr + c->size) return c; }
     return NULL;
 }
-static int cb_overlap(uint64_t addr, uint64_t size) {
+static int cb_overlap_walk(uint64_t addr, uint64_t size) {
     for (int k = 0; k < g_cb_live; k++) { const CB *c = &g_cb[g_cb_live_list[k]]; if (c->state == 1 && addr < c->addr + c->size && c->addr < addr + size) return 1; }
     return 0;
+}
+/* Most ranges lie in no live CB, and walking them twice for each (cb_inside, then cb_overlap) took 80 % of buf_ref, the
+ * render thread's largest function after #40 kept CBs live longer (New Donk City: 15 % of the thread). So the live CBs'
+ * ranges are also kept sorted by start, with the largest end so far: a range no CB can contain or touch is answered by
+ * a binary search; any other still walks the list (same answer, same CB). Rebuilt when the live set changes (g_cb_ver).
+ * buf_ref with this lookup: 3.3 % of the thread (1.1 % itself, 2.1 % cbx_may). */
+static uint64_t g_cbx_lo[CB_MAX], g_cbx_maxhi[CB_MAX];
+static int g_cbx_n;
+static uint32_t g_cbx_ver = ~0u;
+static int cbx_may(uint64_t a, uint64_t b, int inside) {      /* 0: no live CB contains (inside) or overlaps [a, b) */
+    if (g_cbx_ver != g_cb_ver) {
+        g_cbx_n = 0;
+        for (int k = 0; k < g_cb_live; k++) {
+            const CB *c = &g_cb[g_cb_live_list[k]];
+            if (c->state != 1) continue;
+            int i = g_cbx_n++;
+            while (i > 0 && g_cbx_lo[i - 1] > c->addr) { g_cbx_lo[i] = g_cbx_lo[i - 1]; g_cbx_maxhi[i] = g_cbx_maxhi[i - 1]; i--; }
+            g_cbx_lo[i] = c->addr; g_cbx_maxhi[i] = c->addr + c->size;      /* an end for now: made the running largest below */
+        }
+        for (int i = 1; i < g_cbx_n; i++) if (g_cbx_maxhi[i] < g_cbx_maxhi[i - 1]) g_cbx_maxhi[i] = g_cbx_maxhi[i - 1];
+        g_cbx_ver = g_cb_ver;
+    }
+    int lo = 0, hi = g_cbx_n;                      /* CBs that start before b (overlap) or at a or before (inside) */
+    while (lo < hi) { int m = (lo + hi) / 2; if (inside ? g_cbx_lo[m] <= a : g_cbx_lo[m] < b) lo = m + 1; else hi = m; }
+    return lo && (inside ? g_cbx_maxhi[lo - 1] >= b : g_cbx_maxhi[lo - 1] > a);
+}
+static CB *cb_inside(uint64_t addr, uint64_t size) {
+    if (!cbx_may(addr, addr + size, 1)) return NULL;
+    return cb_inside_walk(addr, size);
+}
+static int cb_overlap(uint64_t addr, uint64_t size) {
+    if (!cbx_may(addr, addr + size, 0)) return 0;
+    return cb_overlap_walk(addr, size);
 }
 static CB *cb_new(uint64_t addr, uint64_t size) {
     CB *c = NULL, *empty = NULL, *victim = NULL;
@@ -2228,7 +2262,7 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         memcpy(c->mem.map, c->snap, (size_t)size);
     } else
     memcpy(c->mem.map, P(addr), (size_t)size);
-    g_cb_live_list[g_cb_live++] = (int16_t)(c - g_cb);
+    g_cb_live_list[g_cb_live++] = (int16_t)(c - g_cb); g_cb_ver++;
     return c;
 }
 typedef struct { uint64_t off, size; int zero; VkBuffer buf; } BufRef;
@@ -4225,7 +4259,7 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < 16; i++) if (g_sem_img[i]) { vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL; }
     if (g_ovl.made) { vkDestroyImage(V.device, g_ovl.img, NULL); g_ovl.made = 0; }      /* the progress bar's image; its memory goes with the blocks */
     for (int i = 0; i < g_cb_used; i++) if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; }
-    g_cb_live = g_cb_pending = g_ncdisp = 0;
+    g_cb_live = g_cb_pending = g_ncdisp = 0; g_cb_ver++;
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i], *n; v; v = n) {
         n = v->next;
         if (v->cp) { vkDestroyPipeline(V.device, v->cp, NULL); vkDestroyPipelineLayout(V.device, v->cl, NULL); vkDestroyDescriptorSetLayout(V.device, v->cdl[0], NULL); vkDestroyDescriptorSetLayout(V.device, v->cdl[1], NULL); }
