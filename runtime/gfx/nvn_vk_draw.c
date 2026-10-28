@@ -3373,12 +3373,26 @@ static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) 
 /* A fence the GPU has passed may still cover compute results not yet copied back to guest memory: R.done also moves on
  * through waits that do not land them (the occlusion wait at the present, slot_wait in cmd_begin). The game reads what the
  * fence covers as soon as the wait returns, so what has finished is landed first (cb_poll never waits). */
-static LONG64 g_sync_pending_cb;
+static LONG64 g_sync_pending_cb, g_fence_late_n;
+static int fence_late_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_FENCE_LATE"); on = !(e && e[0] && !atoi(e)); } return on; }
 static void vk_sync_wait_(SyncJob *j) {
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
     if (want <= R.done) { if (g_cb_pending && g_cb_serial <= want) g_sync_pending_cb++; cb_poll(); j->result = 0; return; }
+    {   /* The game waits for the fence of the frame it has just submitted (every frame, with nothing else queued behind
+         * it), so its CPU and the GPU ran in series: the next frame's game work began only when the GPU had finished.
+         * Instead the wait is for the fence the previous wait deferred, and this one is deferred: the GPU keeps at most two
+         * frames of work and the game's next frame overlaps the GPU's (Link's Awakening Recomp, 13398126d6). What the GPU
+         * writes that the game reads after the fence (compute results, reports, occlusion counts) is then one frame later.
+         * Only waits with a timeout: a wait for ever (a server wait) or a poll is answered as before. SMO_VK_FENCE_LATE=0: as before. */
+        static uint64_t deferred;
+        if (fence_late_on() && j->timeout && want > deferred) {
+            uint64_t prev = deferred;
+            deferred = want;
+            if (prev) { g_fence_late_n++; want = prev; if (want <= R.done) { j->result = 1; cb_poll(); return; } }
+        }
+    }
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
@@ -4004,6 +4018,7 @@ swap: ;
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
+        { static LONG64 fl_last; if (g_fence_late_n != fl_last) printf("nvn_vk_sync: frames %lld..%lld: %lld game fence waits answered with the previous wait's fence (SMO_VK_FENCE_LATE)\n", (long long)frame - 300, (long long)frame, (long long)(g_fence_late_n - fl_last)); fl_last = g_fence_late_n; }
         { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         {   static LONG64 kl[5];
             double mb[5];

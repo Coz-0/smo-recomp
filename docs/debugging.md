@@ -160,13 +160,15 @@ The end of every log has the counts that tell whether a run was healthy:
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
   by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
-- Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
-  GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
-  ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
+- Switches that bring back an older behaviour, for comparisons: `SMO_VK_FENCE_LATE=0` (a game fence wait waits for that
+  very frame, not the one before), `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the GPU),
+  `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream ring
+  waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
   `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
   the render thread), `SMO_VK_VTXGROW=0` (vertex streams are copied only as far as the range the game bound, even when
-  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=0` makes the present wait for the render thread again (by default it does not: one frame in flight);
-  `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
+  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=0` makes the present
+  wait for the render thread again (by default it does not: one frame in flight); `SMO_VK_OCC_LOG=1` logs the
+  conditional renders that had to wait for an occlusion result.
 
 ## Memory
 
