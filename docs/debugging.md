@@ -119,6 +119,10 @@ The end of every log has the counts that tell whether a run was healthy:
   vertex, index, other), `nvn_vk_vstage:` (stage lookups that missed the stage's last variant) and, when there were,
   `nvn_vk_sync:` (fence waits that found compute results not yet in guest memory and landed them first); every 600
   frames `copy-backs forced by` counts each reason a copy-back of compute results was forced, and the GPU waits it cost.
+  A batch does not wait for the compute results of the batch before: while that submission runs, its compute buffers stay
+  bound for the new batch and are copied back later (before a game fence wait for it returns at the latest); a range the
+  game wrote into meanwhile makes the batch wait as before. The line after `copy-backs forced by` counts them;
+  `SMO_VK_CB_CARRY=0`: every batch waits, as before.
   `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why. At exit, `programs
   handed over by thread` says which game threads hand their shaders over (boot: InitSystem; a stage: the scene
   initialisation thread) and how long the hand-over held them.
