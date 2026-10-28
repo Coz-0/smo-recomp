@@ -31,6 +31,27 @@ RUNTIME = os.path.join(T.RUNTIME, 'core')        # runtime.h, neon.h, fpexact.h:
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 OPT = os.environ.get('RECOMP_OPT', '-O2')       # -O2: New Donk City 20 -> 30-36 fps against -O1 (Ryzen 5 3600XT)
 EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_ARCH', '').split()   # e.g. RECOMP_ARCH=-march=znver2: this PC's CPU only
+
+
+def no_loop_load_elim():
+    """The clang flags that turn LoopLoadElimination off, as this clang spells them (none if it takes neither). On the
+    lifted code the pass takes much of the time of the files with the largest loops and changes nothing in the others
+    (at -O2, 218 of 219 objects byte-identical without it, clang 23 on Linux): guest registers live in memory (c->x[n])
+    and loops are gotos, so its loop dependence analysis grows with the square of the accesses. The one object that
+    differs, c_00ce.c, now compiles within the time limit (71 s) instead of falling back to unoptimised code."""
+    import tempfile
+    src = os.path.join(tempfile.gettempdir(), 'smo_flag_probe.c')
+    with open(src, 'w') as f:
+        f.write('int f(int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }\n')
+    for flags in (['-mllvm', '-opt-disable=loop-load-elim', '-mllvm', '-opt-bisect-verbose=false'],    # LLVM 20 and later
+                  ['-mllvm', '-enable-loop-load-elim=false']):                                         # older (clang 9)
+        r = subprocess.run([CLANG, '-c', '-O1', '-w'] + flags + [src, '-o', os.devnull], capture_output=True, text=True)
+        if r.returncode == 0 and not r.stderr.strip():
+            return flags
+    return []
+
+
+EXTRA += no_loop_load_elim()
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 BASE_FLAGS = ['-w', '-fno-strict-aliasing', '-I', RUNTIME, '-I', GEN]
