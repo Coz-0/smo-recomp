@@ -547,25 +547,36 @@ static uint64_t c2_ring(int s) {
  * memory when it runs, which the game allows (it waits for a fence before it changes what submitted commands read, and
  * the fences wait for the GPU: vk_sync_wait_).
  * One import takes tens of milliseconds in the driver whatever its size, and stalls the render thread's submissions
- * even when made on another thread (one per memory pool, 211 while entering New Donk City: 19 fps there). So the heap
- * is imported once, at the first batch, by a thread of its own, in pieces of 256 MB that overlap by 32 MB (a range of
- * up to 32 MB is always inside one piece); until a piece is ready its ranges are streamed by the ring. The heap is
- * locked in memory (3 GB; the game uses all of it).
+ * even when made on another thread (one per memory pool, 211 while entering New Donk City: 19 fps there). So imports
+ * are made by a thread of its own; until a piece is ready its ranges are streamed by the ring. What is imported also
+ * costs at EVERY submission on Linux: RADV puts all memory in each submission and amdgpu checks the pages of every
+ * imported range each time (an empty submission: 0.04 ms, 0.17 ms with 256 MB imported, 5.4 ms with 3 GB). So only
+ * what draws read is imported: the first time a vertex or index range is read from a part of the heap, its granules
+ * are imported as one piece, up to SMO_VK_HOSTMEM_MB in all. Linux: 2 MB granules, 512 MB (New Donk City reads from 90
+ * granules, 180 MB). Elsewhere (not measured there) all of the heap is queued at the first batch, as before, in pieces
+ * of 256 MB.
+ * Pieces do not overlap: a range across the edge of a piece made before is streamed.
  * What the game does not expect is the render thread's own writes into guest memory, made at replay, before the GPU
  * has run the draws recorded ahead of them (copy-backs of compute results, buffer copies and clears,
  * UpdateUniformBuffer, reports, occlusion results, textures read into buffers): hm_guard, called before each, waits for
  * the command buffers that read the range in place (kept by 64 KB page: the serial of the last command buffer that
  * reads it), submitting the one being recorded if it does. */
 #define HM_PG 16
-#define HM_PIECE (256ull << 20)
-#define HM_STEP (224ull << 20)
-#define HM_MAX 64
+#ifdef __linux__
+#define HM_GRAN 21                                 /* pieces are made of granules of the heap: 2 MB */
+#define HM_CAP_MB 512
+#else
+#define HM_GRAN 28                                 /* 256 MB: few imports where each costs tens of ms (not measured: per submission) */
+#define HM_CAP_MB 16384
+#endif
+#define HM_MAX 1024
 typedef struct { uint64_t lo, hi, used; VkDeviceMemory mem; VkBuffer buf; uint64_t *pg; } HSpan;      /* pg: per 64 KB page, the serial of the last command buffer that reads it */
 static HSpan *g_hs[HM_MAX];                        /* imported pieces, by address */
 static int g_hs_n;
 static HSpan *g_hs_last;
 static int g_hm_on = -1;
-static uint64_t g_hm_end;                          /* the heap is queued for import up to here */
+static uint8_t *g_hm_claim;                        /* per granule of the heap: 1 once it belongs to a queued piece */
+static uint64_t g_hm_base, g_hm_size, g_hm_cap, g_hm_queued;      /* the heap; most and so far queued for import (bytes) */
 static SRWLOCK g_hj_lock = SRWLOCK_INIT;
 static struct { uint64_t lo, hi; HSpan *s; int state; } g_hj[HM_MAX];      /* imports for the import thread; state: 0 queued, 1 being made, 2 made (s; NULL: failed) */
 static int g_hj_n;
@@ -634,24 +645,23 @@ static void hm_init(void) {
     if (!g_hm_on) return;
     vkGetMemoryHostPointerPropertiesEXT_ = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(V.device, "vkGetMemoryHostPointerPropertiesEXT");
     if (!vkGetMemoryHostPointerPropertiesEXT_) { g_hm_on = 0; printf("nvn_vk: no vkGetMemoryHostPointerPropertiesEXT: guest memory is streamed\n"); return; }
+    const char *mb = getenv("SMO_VK_HOSTMEM_MB");
+    g_hm_cap = (uint64_t)(mb ? atoi(mb) : HM_CAP_MB) << 20;
     g_hj_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, hm_thread, NULL, 0, NULL));
 }
+static void hm_want(uint64_t addr, uint64_t size);
 static void hm_batch_begin(void) {      /* the heap's pieces to import, and those made since */
-    uint64_t base, size;
     if (g_hm_on < 0) hm_init();
     if (g_hm_on <= 0) return;
-    int queued = 0, added = 0;
+    int added = 0;
+    if (!g_hm_claim && smo_heap_range(&g_hm_base, &g_hm_size)) g_hm_claim = calloc((size_t)(16ull << 30 >> HM_GRAN), 1);      /* the heap's reserve (smo_nn.c) */
+    if (g_hm_claim) smo_heap_range(&g_hm_base, &g_hm_size);      /* it may have grown */
+#ifndef __linux__
+    for (uint64_t lo = g_hm_base; g_hm_claim && lo < g_hm_base + g_hm_size; lo += 1ull << HM_GRAN)      /* all of it, at the start */
+        hm_want(lo, (g_hm_base + g_hm_size - lo) < (1ull << HM_GRAN) ? g_hm_base + g_hm_size - lo : 1ull << HM_GRAN);
+#endif
     AcquireSRWLockExclusive(&g_hj_lock);
-    if (smo_heap_range(&base, &size) && base + size > g_hm_end) {      /* the heap was set or grew */
-        if (!g_hm_end) g_hm_end = base;
-        for (uint64_t lo = g_hm_end > base ? g_hm_end - (HM_PIECE - HM_STEP) : base; lo < base + size && g_hj_n < HM_MAX; lo += HM_STEP) {
-            uint64_t hi = lo + HM_PIECE < base + size ? lo + HM_PIECE : base + size;
-            g_hj[g_hj_n].lo = lo; g_hj[g_hj_n].hi = hi; g_hj[g_hj_n].s = NULL; g_hj[g_hj_n].state = 0; g_hj_n++; queued++;
-            if (hi == base + size) break;
-        }
-        g_hm_end = base + size;
-    }
     int busy = 0;
     for (int i = 0; i < g_hj_n; i++) {
         if (g_hj[i].state != 2) { busy = 1; continue; }
@@ -665,7 +675,6 @@ static void hm_batch_begin(void) {      /* the heap's pieces to import, and thos
     }
     if (!busy) g_hj_n = 0;
     ReleaseSRWLockExclusive(&g_hj_lock);
-    if (queued) { SetEvent(g_hj_ev); printf("nvn_vk: vertex and index ranges will be read in place from guest memory: the heap (%llu MB) is imported in %d pieces\n", (unsigned long long)(size >> 20), queued); }
     if (added) g_hs_last = NULL;
 }
 static int hm_first_after(uint64_t addr) {        /* index of the first piece that starts after addr */
@@ -680,11 +689,31 @@ static HSpan *hm_find(uint64_t addr, uint64_t size) {
     if (i < 0 || addr + size > g_hs[i]->hi) return NULL;
     return g_hs_last = g_hs[i];
 }
+/* render thread: a range not in any piece. Its granules are queued for import as one piece if none of them is queued yet
+ * and the total stays within SMO_VK_HOSTMEM_MB. */
+static void hm_want(uint64_t addr, uint64_t size) {
+    if (!g_hm_claim || addr < g_hm_base || addr + size > g_hm_base + g_hm_size || addr + size < addr) return;
+    uint64_t g0 = (addr - g_hm_base) >> HM_GRAN, g1 = (addr + size - 1 - g_hm_base) >> HM_GRAN;
+    for (uint64_t g = g0; g <= g1; g++) if (g_hm_claim[g]) return;      /* being made, or across the edge of a piece */
+    uint64_t lo = g_hm_base + (g0 << HM_GRAN), hi = g_hm_base + ((g1 + 1) << HM_GRAN);
+    if (hi > g_hm_base + g_hm_size) hi = g_hm_base + g_hm_size;
+    if (g_hm_queued + (hi - lo) > g_hm_cap) return;
+    AcquireSRWLockExclusive(&g_hj_lock);
+    int ok = g_hj_n < HM_MAX && g_hs_n + g_hj_n < HM_MAX;
+    if (ok) { g_hj[g_hj_n].lo = lo; g_hj[g_hj_n].hi = hi; g_hj[g_hj_n].s = NULL; g_hj[g_hj_n].state = 0; g_hj_n++; }
+    ReleaseSRWLockExclusive(&g_hj_lock);
+    if (!ok) return;
+    memset(g_hm_claim + g0, 1, (size_t)(g1 - g0 + 1));
+    if (!g_hm_queued) printf("nvn_vk: vertex and index ranges will be read in place from guest memory: the parts of the heap they are in are imported (at most %llu MB)\n", (unsigned long long)(g_hm_cap >> 20));
+    g_hm_queued += hi - lo;
+    SetEvent(g_hj_ev);
+}
 /* A vertex or index range read in place: 1 with *buf, *off set; 0 when the ring streams it. */
 static int hm_ref(uint64_t addr, uint64_t size, uint64_t align, VkBuffer *buf, uint64_t *off) {
     if (g_hm_on <= 0) return 0;
     HSpan *s = hm_find(addr, size);
     uint64_t o = s ? addr - s->lo : 0, ser = R.serial + 1;
+    if (!s) hm_want(addr, size);
     if (!s || o % align) { g_hm_ring_b += (LONG64)size; return 0; }
     for (uint64_t p = o >> HM_PG, last = (o + size - 1) >> HM_PG; p <= last; p++) s->pg[p] = ser;
     s->used = ser;
@@ -696,7 +725,8 @@ static int hm_ref(uint64_t addr, uint64_t size, uint64_t align, VkBuffer *buf, u
 static void hm_guard(uint64_t addr, uint64_t size) {
     if (g_hm_on <= 0 || !g_hs_n || !size) return;
     uint64_t need = 0;
-    for (int i = 0; i < g_hs_n && g_hs[i]->lo < addr + size; i++) {
+    int i0 = hm_first_after(addr) - 1;      /* pieces do not overlap: the first that can hold addr, then those after it */
+    for (int i = i0 > 0 ? i0 : 0; i < g_hs_n && g_hs[i]->lo < addr + size; i++) {
         HSpan *s = g_hs[i];
         if (s->hi <= addr || s->used <= R.done) continue;
         uint64_t a = addr > s->lo ? addr - s->lo : 0, b = (addr + size < s->hi ? addr + size : s->hi) - s->lo;
@@ -4111,8 +4141,8 @@ swap: ;
             if (g_hm_on > 0) {
                 static LONG64 lb, lr, lw, lwt, lsu;
                 LARGE_INTEGER hq; QueryPerformanceFrequency(&hq);
-                printf("nvn_vk_hostmem: frames %lld..%lld MB a frame: vertex and index read in place %.2f, streamed %.2f | heap pieces imported %d (%lld failed, %.1f ms each) | waits before a host write %.2f a frame (%.3f ms), %lld submissions\n",
-                       (long long)frame - 300, (long long)frame, (double)(g_hm_b - lb) / 300.0 / 1048576.0, (double)(g_hm_ring_b - lr) / 300.0 / 1048576.0, g_hs_n, (long long)g_hm_fail,
+                printf("nvn_vk_hostmem: frames %lld..%lld MB a frame: vertex and index read in place %.2f, streamed %.2f | heap pieces imported %d, %llu MB (%lld failed, %.1f ms each) | waits before a host write %.2f a frame (%.3f ms), %lld submissions\n",
+                       (long long)frame - 300, (long long)frame, (double)(g_hm_b - lb) / 300.0 / 1048576.0, (double)(g_hm_ring_b - lr) / 300.0 / 1048576.0, g_hs_n, (unsigned long long)(g_hm_queued >> 20), (long long)g_hm_fail,
                        g_hm_made ? (double)g_hm_make_tk * 1000.0 / (double)hq.QuadPart / (double)g_hm_made : 0.0,
                        (double)(g_hm_waits - lw) / 300.0, (double)(g_hm_wait_tk - lwt) * 1000.0 / (double)hq.QuadPart / 300.0, (long long)(g_hm_submits - lsu));
                 lb = g_hm_b; lr = g_hm_ring_b; lw = g_hm_waits; lwt = g_hm_wait_tk; lsu = g_hm_submits;

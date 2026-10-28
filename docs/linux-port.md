@@ -18,7 +18,7 @@ measured is said, the rest is the plan. Developed on Arch Linux (CachyOS), Ryzen
 | `mach_vm_read_overwrite` (`host_try_read`) | `process_vm_readv` on the process itself |
 | Mach thread ports, `thread_suspend` / `thread_get_state` | kernel thread ids; a signal (`SIGRTMIN+3`) stops a thread in its handler, which keeps its registers until `ResumeThread` |
 | `task_threads`, `thread_info` | `/proc/self/task/*/stat` |
-| `mach_vm_remap` (virtual memory pools) | the heap is a shared mapping of a memfd; a view is the same file range mapped again |
+| `mach_vm_remap` (virtual memory pools) | none by default: the heap is private memory, which RADV can import (the game's one virtual pool is a direct alias and needs no view); with `SMO_HEAP_MEMFD=1` the heap is a shared mapping of a memfd and a view is the same file range mapped again |
 | CoreText (glyph outlines) | FreeType |
 | fonts in /System/Library/Fonts | what fontconfig picks: Noto Sans, Noto Sans CJK |
 | AVFoundation (movies) | FFmpeg (`runtime/services/nnmovie_ff.c`) |

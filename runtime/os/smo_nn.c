@@ -79,13 +79,27 @@ static void os_SetMemoryHeapSize(Ctx *c) {
                                                 (DWORD)(HEAP_RESERVE >> 32), (DWORD)HEAP_RESERVE, NULL);
             if (g_heap_section) g_heap = MapViewOfFile(g_heap_section, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)HEAP_RESERVE);
 #elif defined(__linux__)
-            /* Linux: a shared mapping of a memfd as large as the reserve (sparse: no memory until a page is touched), so a
-             * second view of its pages (graphics memory pools) is an mmap of the same file range, as a second view of a
-             * section is on Windows; the "section" is the heap's base, as on macOS. Committing is mprotect. */
-            g_heap_fd = memfd_create("smo-heap", MFD_CLOEXEC);
-            if (g_heap_fd >= 0 && !ftruncate(g_heap_fd, (off_t)HEAP_RESERVE)) {
-                void *p = mmap(NULL, (size_t)HEAP_RESERVE, PROT_NONE, MAP_SHARED | MAP_NORESERVE, g_heap_fd, 0);
-                g_heap = p == MAP_FAILED ? NULL : p;
+            /* Linux: plain private memory by default. The renderer imports the heap into Vulkan (nvn_vk_draw.c, guest
+             * memory read in place), and the amdgpu driver imports anonymous private memory only: a shared mapping fails
+             * with VK_ERROR_INVALID_EXTERNAL_HANDLE (RADV, Mesa 26.2), and every vertex and index range is then copied
+             * (42 MB a frame in New Donk City). The game's one virtual memory pool is a direct alias of its physical
+             * pool (nvn_stub.c) and needs no second view. SMO_HEAP_MEMFD=1: a shared mapping of a memfd as large as the
+             * reserve (sparse), so a second view of its pages is an mmap of the same file range, as a second view of a
+             * section is on Windows. The "section" is the heap's base, as on macOS. Committing is mprotect. */
+            const char *memfd = getenv("SMO_HEAP_MEMFD");
+            if (memfd && atoi(memfd)) {
+                g_heap_fd = memfd_create("smo-heap", MFD_CLOEXEC);
+                if (g_heap_fd >= 0 && !ftruncate(g_heap_fd, (off_t)HEAP_RESERVE)) {
+                    void *p = mmap(NULL, (size_t)HEAP_RESERVE, PROT_NONE, MAP_SHARED | MAP_NORESERVE, g_heap_fd, 0);
+                    g_heap = p == MAP_FAILED ? NULL : p;
+                }
+            } else {
+                g_heap = VirtualAlloc(NULL, (SIZE_T)HEAP_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+                /* no transparent huge pages, as the memfd had none (shmem: "advise" by default): with them the game
+                 * thread took 2.5 ms more a frame in New Donk City, and runs had bursts of 45 ms frames. SMO_HEAP_THP=1
+                 * leaves them to the kernel's setting. */
+                const char *thp = getenv("SMO_HEAP_THP");
+                if (g_heap && !(thp && atoi(thp))) madvise(g_heap, (size_t)HEAP_RESERVE, MADV_NOHUGEPAGE);
             }
             g_heap_section = g_heap;
 #else

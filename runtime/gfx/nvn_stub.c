@@ -233,12 +233,16 @@ static uint64_t vp_reserve(uint64_t size) {
 }
 #ifdef __linux__
 int smo_heap_memfd(void);                                          /* smo_nn.c */
-/* Linux: the heap is a shared mapping of a memfd (smo_nn.c): a view is the same file range mapped at the second address.
+/* Linux, with SMO_HEAP_MEMFD=1: the heap is a shared mapping of a memfd (smo_nn.c), and a view is the same file range
+ * mapped at the second address. Otherwise the heap is private memory and has no second view.
  * The caller has checked that the range lies in the committed heap (smo_heap_section_offset). */
 static int vp_view(HANDLE sec, uint64_t at, uint64_t sec_off, uint64_t size) {
     (void)sec;
     int fd = smo_heap_memfd();
-    if (fd < 0) { SetLastError(0); return 0; }
+    if (fd < 0) {
+        printf("nvn: the heap is private memory (so that Vulkan can import it): run with SMO_HEAP_MEMFD=1 for a heap whose pages can be viewed twice\n");
+        SetLastError(0); return 0;
+    }
     void *p = mmap((void *)(uintptr_t)at, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)sec_off);
     if (p != (void *)(uintptr_t)at) { SetLastError((DWORD)errno); return 0; }
     return 1;
