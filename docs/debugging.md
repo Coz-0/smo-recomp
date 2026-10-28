@@ -92,6 +92,11 @@ The end of every log has the counts that tell whether a run was healthy:
   goes after `SMO_VK_TEXFREE=<frames>` unused frames (default 8; `0` keeps every image, as before). `made again` counts
   textures used after their image went (what the GPU had drawn into one is lost then; it should stay 0, and
   `nvn_vk_tex:` lines name them). With `SMO_TEXLOG=1` every release of a slot and every freed image is logged too.
+  Sampled textures of memory pools the CPU never writes whose texels are the same bytes as another's, with the same
+  image description, share that texture's image (the same file loaded for several objects; `runtime/gfx/nvn_vk_draw.c`,
+  above `sh_join`); one written to (a copy or a draw into it) first gets an image of its own. The exit line `textures
+  sharing the image of another` counts them and the memory not allocated; `SMO_VK_TEXSHARE=0` gives every texture its
+  own image, as before.
 - Flicker that shows in single frames: save every frame of a stretch (`SMO_SHOT_EVERY=1 SMO_SHOT_FROM=<a> SMO_SHOT_TO=<b>
   SMO_SHOT_DIR=<folder>`), then `tools\dev\flicker.py <folder>` lists the frames where a region of the picture is brighter
   or darker than in both neighbours, and saves them side by side. To see what such a frame drew differently, run the same
