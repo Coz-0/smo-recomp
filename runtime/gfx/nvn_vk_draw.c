@@ -1085,6 +1085,14 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
 static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
+/* A scene for the window's shape (hud_fix, the present's 16:9 box): a frame with compute dispatches, one of more than
+ * 200 draws while a scene goes on, and it ends only after 3 frames that are neither. Parts of play draw the world without
+ * a dispatch (Top-Hat Tower, Cap Kingdom: the first capture's scene, 307 frames of 224-364 draws; 120 frames of up to
+ * 1,492 a little later; one frame of 132 draws in play), and with g_in_scene alone the HUD went into the box and the bars
+ * came and went: 10 times, 467 frames in the tower. A 2D screen never follows a scene that way: the title and its menus
+ * draw 18-182 without a dispatch, the loading screens at most 60. */
+static volatile LONG g_shape_scene;
+static int g_shape_off = 3;                        /* frames since the last that kept the scene going */
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -2360,8 +2368,8 @@ static int hud_fix(uint64_t addr, uint64_t size, BufRef *b) {
     /* A frame that draws no scene (the controller and loading screens, the title's menus) is a 2D screen laid out for
      * 16:9: all of it goes into the 16:9 box, with bars, as on a 16:9 screen (with the rules below its rows came apart:
      * text as wide as the screen anchored to an edge, its pictures in the box). In play the scene fills the window and
-     * the rules below fit the HUD over it. (g_in_scene: the last frame had compute dispatches.) */
-    if (size >= 136 * 4 && g_in_scene) {                         /* the pane's corners in normalized device coordinates */
+     * the rules below fit the HUD over it. (g_shape_scene: the last frame drew a scene.) */
+    if (size >= 136 * 4 && g_shape_scene) {                         /* the pane's corners in normalized device coordinates */
         const float *mv = g + 16, *rc = g + 132;
         float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
         for (int k = 0; k < 4 && rc[0] > 0 && rc[1] > 0; k++) {
@@ -3904,7 +3912,7 @@ swap: ;
                  * around it (the title's 3D Mario below the menu, the loading screen's icon) does not spill into the bars. */
                 float smo_aspect_shape(void);
                 float shp = smo_aspect_shape();
-                if (shp != 1.0f && !g_in_scene && !progress) {
+                if (shp != 1.0f && !g_shape_scene && !progress) {
                     VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f;
                     vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr);
                     VkImageMemoryBarrier wb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -3985,7 +3993,7 @@ swap: ;
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     passshot_update();                             /* the next frame */
-    { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
+    { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene || (g_shape_scene && R.frame_draws > 200)) g_shape_off = 0; else if (g_shape_off < 3) g_shape_off++; g_shape_scene = g_shape_off < 3; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
     {   /* per-frame record for the "nvn_vk_gpu_play:" line */
         static LONG64 t_prev;
         LONG64 t_now = tk();
