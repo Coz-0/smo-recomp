@@ -3354,7 +3354,7 @@ static void vk_submit(void *arg) {
     hm_batch_begin();
     g_batch_no++;
     if (g_scan_on) {                               /* what this batch will need goes to the workers before it is replayed */
-        if (mt_on()) scan_async_start(j->handles, j->count);      /* SMO_VK_MT=1: beside the replay, on its own thread */
+        if (mt_on()) scan_async_start(j->handles, j->count);      /* beside the replay, on its own thread (SMO_VK_MT=0: before it) */
         else { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }
     }
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);

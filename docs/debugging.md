@@ -131,8 +131,8 @@ The end of every log has the counts that tell whether a run was healthy:
   sent at every draw), `SMO_FAST_SKIP=0` (registerSampler's free-slot walk one lifted call per slot), `SMO_HOST_PIN=0`
   (the render thread, the pipeline workers and the renderer's helper threads anywhere instead of away from the console
   cores; `SMO_HOST_CPUS=<hex mask>` chooses their processors, `SMO_HOST_LAYOUT=1` gives the render thread a core of its
-  own). `SMO_VK_MT=1` (off by default) runs the look-ahead over a batch on a thread of its own beside the replay. The
-  build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default; `RECOMP_ARCH` adds target
+  own). `SMO_VK_MT=0` runs the look-ahead over a batch on the render thread before the replay instead of on a thread of its own
+  beside it. The build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default; `RECOMP_ARCH` adds target
   flags (e.g. `-march=znver2`: the objects then run on that CPU family and later ones only). A change of them recompiles
   nothing by itself: `tools\lifter\build_main.py --force`, or delete `build\obj\host`.
 - `nvn_vk_frames:` at exit counts the frames that drew a scene, i.e. had compute dispatches (in the Cap Kingdom run 40,164
