@@ -92,6 +92,10 @@ The end of every log has the counts that tell whether a run was healthy:
   goes after `SMO_VK_TEXFREE=<frames>` unused frames (default 8; `0` keeps every image, as before). `made again` counts
   textures used after their image went (what the GPU had drawn into one is lost then; it should stay 0, and
   `nvn_vk_tex:` lines name them). With `SMO_TEXLOG=1` every release of a slot and every freed image is logged too.
+  A new texture made over the very memory of such a texture that the GPU drew into (agl's screen buffers, made again
+  every frame over the same storage), with the same builder and not bound or used in this frame, takes its image instead
+  of a new one (`rt_reuse`); the exit line `images of let-go targets taken by new textures` counts them and
+  `SMO_VK_RTREUSE=0` makes a new image, as before.
 - Flicker that shows in single frames: save every frame of a stretch (`SMO_SHOT_EVERY=1 SMO_SHOT_FROM=<a> SMO_SHOT_TO=<b>
   SMO_SHOT_DIR=<folder>`), then `tools\dev\flicker.py <folder>` lists the frames where a region of the picture is brighter
   or darker than in both neighbours, and saves them side by side. To see what such a frame drew differently, run the same
