@@ -231,6 +231,36 @@ static void *vk_sym(const char *name) {
     return p;
 }
 
+/* The NVIDIA driver keeps the pipeline libraries it compiles in its own shader disk cache, one cache per executable in one
+ * folder for the whole PC (%LOCALAPPDATA%\NVIDIA\GLCache) with one size limit: once that is full it stores nothing new,
+ * and every start compiles again what its cache lacks (measured with a full one: 123 s of worker time and 19 s of held
+ * loading screens at each start of a played copy; with a folder that had room, the second start took 5 s and 27 ms).
+ * The pipeline cache file does not hold them (it did not grow while thousands were compiled). So the driver gets a
+ * folder of the game's own, nv beside the stages' cache (__GL_SHADER_DISK_CACHE_PATH, read when the driver is loaded),
+ * for the copies a person plays and for runs that name their stage cache (SMO_VK_CACHE): a test copy on the played
+ * copies' cache would fill their folder with a cache of its own. A path already set in the environment is kept;
+ * SMO_VK_NVCACHE=0 leaves the driver's folder. */
+static const char *vkc_dir(void);                  /* nvn_vk_pipelines.c */
+static void nv_cache_dir(void) {
+    const char *off = getenv("SMO_VK_NVCACHE"), *set = getenv("__GL_SHADER_DISK_CACHE_PATH"), *own = getenv("SMO_VK_CACHE");
+    char rel[260], dir[260], exe[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
+    if (off && !atoi(off)) { printf("nvn_vk: SMO_VK_NVCACHE=0: the driver's shader disk cache stays in its own folder\n"); return; }
+    if (set && set[0]) { printf("nvn_vk: the driver's shader disk cache: %s (__GL_SHADER_DISK_CACHE_PATH)\n", set); return; }
+    if (!(own && own[0]) && _stricmp(base, "smo_native.exe") && _stricmp(base, "smo_user.exe")) {
+        printf("nvn_vk: the driver's shader disk cache stays in its own folder (a test copy without SMO_VK_CACHE)\n");
+        return;
+    }
+    snprintf(rel, sizeof rel, "%s/nv", vkc_dir());
+    if (!_fullpath(dir, rel, sizeof dir)) return;
+    CreateDirectoryA(vkc_dir(), NULL);
+    CreateDirectoryA(dir, NULL);
+    SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", dir);
+    if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_SIZE", "8589934592");      /* 8 GB, in bytes */
+    printf("nvn_vk: the driver's shader disk cache: %s (the game's own; SMO_VK_NVCACHE=0: the driver's folder)\n", dir);
+}
+
 /* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
 int nvn_vk_init(void *hwnd) {
     static const char *const k_wanted[] = {"VK_KHR_swapchain", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
@@ -238,6 +268,7 @@ int nvn_vk_init(void *hwnd) {
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+    nv_cache_dir();                                /* before the driver is loaded */
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
 #define X(ret, name, args) name = vk_sym(#name);
