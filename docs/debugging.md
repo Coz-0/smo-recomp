@@ -132,8 +132,8 @@ The end of every log has the counts that tell whether a run was healthy:
   (the render thread, the pipeline workers and the renderer's helper threads anywhere instead of away from the console
   cores; `SMO_HOST_CPUS=<hex mask>` chooses their processors, `SMO_HOST_LAYOUT=1` gives the render thread a core of its
   own). `SMO_VK_MT=1` (off by default) runs the look-ahead over a batch on a thread of its own beside the replay.
-  `SMO_VK_RECORDER=1` (off by default) has a thread of its own make the Vulkan calls the render thread recorded (vkCmd*,
-  descriptor writes, submissions); `nvn_vk_rec:` every 300 frames says how busy it was and how long the render thread
+  A thread of its own makes the Vulkan calls the render thread recorded (vkCmd*, descriptor writes, submissions;
+  `SMO_VK_RECORDER=0`: the render thread makes them itself, as before); `nvn_vk_rec:` every 300 frames says how busy it was and how long the render thread
   waited for it. The build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default;
   `RECOMP_ARCH` adds target flags (e.g. `-march=znver2`: the objects then run on that CPU family and later ones only). A
   change of them recompiles nothing by itself: `tools\lifter\build_main.py --force`, or delete `build\obj\host`.

@@ -4103,7 +4103,7 @@ static VkImageView dummy_view(VTex *vt, VkImageViewType type, uint32_t layers) {
  * SPIR-V files, pipelines through the driver's pipeline cache kept in ..\cache\vk\pipelines_<gpu>.bin). The render thread
  * waits for them before it replays its first batch, so the tables are never shared with a running worker. */
 #include "nvn_vk_watchdog.c"                       /* the freeze watchdog (wd_start / wd_stop) */
-#include "nvn_vk_rec.c"                            /* the recorder thread (SMO_VK_RECORDER=1) */
+#include "nvn_vk_rec.c"                            /* the recorder thread (SMO_VK_RECORDER=0: off) */
 static void vkd_init(void) {
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)

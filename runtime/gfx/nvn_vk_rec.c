@@ -1,4 +1,4 @@
-/* The recorder thread (SMO_VK_RECORDER=1): the render thread's command recording and submissions made by a thread of
+/* The recorder thread (on by default; SMO_VK_RECORDER=0: off): the render thread's command recording and submissions made by a thread of
  * their own. Included by nvn_vk_draw.c.
  *
  * The render thread translates the game's command lists and made every vkCmd* call, the descriptor writes and the
@@ -426,7 +426,7 @@ static void VKAPI_PTR rs_vkCmdPipelineBarrier(VkCommandBuffer c, VkFlags src, Vk
 /* after vkd_init has loaded every function: from here on the calls above are packets */
 static void rec_start(void) {
     const char *e = getenv("SMO_VK_RECORDER");
-    if (!e || !atoi(e)) return;
+    if (e && e[0] && !atoi(e)) return;           /* SMO_VK_RECORDER=0: the render thread makes the calls itself, as before */
     if (getenv("SMO_VK_REC_SPIN_US")) g_rec_spin_us = atoll(getenv("SMO_VK_REC_SPIN_US"));
     if (getenv("SMO_VK_REC_BATCH")) g_rec_batch = (uint64_t)atoll(getenv("SMO_VK_REC_BATCH"));
     g_rec_ring = VirtualAlloc(NULL, REC_RING, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -441,7 +441,7 @@ static void rec_start(void) {
     if (!h) vkd_fail("the recorder thread could not be started");
     CloseHandle(h);
     g_rec_on = 1;
-    printf("nvn_vk: SMO_VK_RECORDER=1: Vulkan commands are recorded and submitted by a thread of their own\n");
+    printf("nvn_vk: recorder thread (SMO_VK_RECORDER=0: off): Vulkan commands are recorded and submitted by a thread of their own\n");
 }
 /* for the nvn_vk_perf line, per frame over `frames` frames */
 static void rec_report(LONG64 frame, int frames, double k) {
