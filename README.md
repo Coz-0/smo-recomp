@@ -72,6 +72,10 @@ py -3.13 -m venv .venv
 .venv\Scripts\python scripts\run.py play --exe smo_native.exe --seconds 0
 ```
 
+Or, without the command line after the first two lines: `.venv\Scripts\python scripts\launcher.py` opens a window
+that sets up the build from your dump folder (with its progress), starts the game and edits the graphics settings and
+the save data folder.
+
 The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
 [`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
 
@@ -79,7 +83,8 @@ The first build takes a while (lifting and compiling the game); later runs of `s
 
 ```
 runtime/          the host runtime, by subsystem: core, libc, os, fs, gfx, audio, input, services, game
-scripts/          setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
+scripts/          setup.py (from your dump to a build), run.py (start the game, play an input sequence) and
+                  launcher.py (a window for both, and the graphics settings)
 tools/target.py   where the build's files go
 tools/extract/    the import of your dump (NSO to ELF, version checks) and the function lists
 tools/lifter/     the AArch64 to C lifter, the SDK lifter, the differential test and the build steps

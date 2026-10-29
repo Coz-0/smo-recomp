@@ -7,6 +7,13 @@ by git). One script does all of it, in steps that resume where they stopped:
 .venv\Scripts\python scripts\setup.py --dump "<folder of your dump>"
 ```
 
+`scripts\launcher.py` does the same from a window: choose the folder of your dump, press Set up (the steps and a
+progress bar; Show details has their output; Cancel stops it, and the next Set up resumes there), then PLAY. Its
+Settings page edits `build\config\graphics.ini`: the keys, their choices and explanations are read from the runtime's
+own defaults in `runtime/gfx/gfx_options.c`, saving changes only the `key = value` lines, and the rarely changed keys
+are under Advanced, with the save data folder (`scripts\run.py --userdata`; empty: `build\userdata`). Standard library
+only (tkinter, which the python.org installer includes); `tests\check_launcher.py` checks its `graphics.ini` handling.
+
 No console keys and no firmware are needed: the dump's files are already decrypted by your console, and the build only
 converts and reads them.
 
