@@ -1,56 +1,37 @@
 /* perf_overlay.c - the performance overlay: F10 cycles off, frame rate, full (graphics.ini perf_overlay sets the start).
  *
- * Numbers in a corner of the window, drawn over the window image after the game's picture (nvn_vk_draw.c overlay_draw),
- * so pictures of the Capture button and SMO_SHOT* never have them. Frame rate: frames per second and milliseconds over
- * the last second. Full, as Savage Wind's overlay ([doc] Revivedx/SavageWindRecomp, MIT, runtime/perfmon.c and its F10
- * overlay) plus what only the renderer knows:
- *   - the game's frames: rate, average and longest of the last second, a graph of the last 120, frames over 33.4 ms
- *     (two refreshes missed) in the last minute;
- *   - the renderer: GPU milliseconds of a frame (timestamp queries, written while the full overlay is on, the frame
- *     read back NSLOT frames later), the size the game draws its 3D scene at (its dynamic resolution), CPU milliseconds
- *     per frame of the game's main thread and of the render thread;
- *   - the machine, twice a second on a thread of its own and only while the full overlay is shown: CPU use of all
- *     processors and of this process, memory of the process and of the machine; on Linux also the CPU temperature
- *     (hwmon: k10temp, zenpower, coretemp) and the GPU's use, temperature, power, clock and memory (amdgpu sysfs).
- *     A number the platform does not give is "-".
- * The letters: font8x8_basic, 8x8 pixels, public domain ([doc] dhepper/font8x8, from the IBM VGA font), printable ASCII,
- * drawn 2x on a window 1000 pixels high or more. */
+ * A panel in the window's top-left corner, blended over the window image after the game's picture (nvn_vk_draw.c
+ * perf_draw), so pictures of the Capture button and SMO_SHOT* never have it. Frame rate: frames per second and
+ * milliseconds over the last second. Full: the panel of TotK recomp's F10 overlay ([doc] valentderah/totk-pc-recomp,
+ * MIT, runtime/ui/menu.cpp perf_full_draw, itself after Savage Wind's runtime/perfmon.c), its rows and colours:
+ *   - the machine (perf_machine.c): GPU use, temperature, power, memory and clock; CPU use of all processors and of
+ *     this process, its temperature; memory of the machine and of the process;
+ *   - the game's frames: rate, average and longest of the last second, a graph of the last 120;
+ *   - per frame, averaged over half a second: the batch replay (the render thread turning the game's NVN commands
+ *     into Vulkan), GPU milliseconds (timestamp queries, written while the full overlay is on), the render thread's
+ *     waits for pipelines and for shader stages, texture uploads; and, only the renderer knows them, CPU milliseconds
+ *     of the game's main thread and of the render thread, frames over 33.4 ms (two refreshes missed) in the last minute;
+ *   - the picture: the window, the game's image (its size and the internal resolution scale), the 3D scene the game
+ *     draws in it (its dynamic resolution), the scaling to the window, the frame limit and the present mode.
+ * The letters are the game's MessageFont38 (smo_ui.c, read from the RomFS at run time), each drawn once per size at
+ * twice that size and halved (smooth at any size). The panel is composed about ten times a second on the overlay's own
+ * thread; the render thread only copies the latest picture when there is a new one. */
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
-#include <psapi.h>                         /* PROCESS_MEMORY_COUNTERS; K32GetProcessMemoryInfo is in kernel32 */
 #else
 #include "win32_posix.h"
-#include <dirent.h>
-#endif
-#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
-#include <cpuid.h>
 #endif
 #include "perf_overlay.h"
-
-static const uint64_t g_glyph[95] = {      /* U+0020..U+007E: row r = byte r, bit x = column x */
-    0x0000000000000000ull, 0x00180018183c3c18ull, 0x0000000000003636ull, 0x0036367f367f3636ull, 0x000c1f301e033e0cull, 0x0063660c18336300ull,
-    0x006e333b6e1c361cull, 0x0000000000030606ull, 0x00180c0606060c18ull, 0x00060c1818180c06ull, 0x0000663cff3c6600ull, 0x00000c0c3f0c0c00ull,
-    0x060c0c0000000000ull, 0x000000003f000000ull, 0x000c0c0000000000ull, 0x000103060c183060ull, 0x003e676f7b73633eull, 0x003f0c0c0c0c0e0cull,
-    0x003f33061c30331eull, 0x001e33301c30331eull, 0x0078307f33363c38ull, 0x001e3330301f033full, 0x001e33331f03061cull, 0x000c0c0c1830333full,
-    0x001e33331e33331eull, 0x000e18303e33331eull, 0x000c0c00000c0c00ull, 0x060c0c00000c0c00ull, 0x00180c0603060c18ull, 0x00003f00003f0000ull,
-    0x00060c1830180c06ull, 0x000c000c1830331eull, 0x001e037b7b7b633eull, 0x0033333f33331e0cull, 0x003f66663e66663full, 0x003c66030303663cull,
-    0x001f36666666361full, 0x007f46161e16467full, 0x000f06161e16467full, 0x007c66730303663cull, 0x003333333f333333ull, 0x001e0c0c0c0c0c1eull,
-    0x001e333330303078ull, 0x006766361e366667ull, 0x007f66460606060full, 0x0063636b7f7f7763ull, 0x006363737b6f6763ull, 0x001c36636363361cull,
-    0x000f06063e66663full, 0x00381e3b3333331eull, 0x006766363e66663full, 0x001e33380e07331eull, 0x001e0c0c0c0c2d3full, 0x003f333333333333ull,
-    0x000c1e3333333333ull, 0x0063777f6b636363ull, 0x0063361c1c366363ull, 0x001e0c0c1e333333ull, 0x007f664c1831637full, 0x001e06060606061eull,
-    0x00406030180c0603ull, 0x001e18181818181eull, 0x0000000063361c08ull, 0xff00000000000000ull, 0x0000000000180c0cull, 0x006e333e301e0000ull,
-    0x003b66663e060607ull, 0x001e3303331e0000ull, 0x006e33333e303038ull, 0x001e033f331e0000ull, 0x000f06060f06361cull, 0x1f303e33336e0000ull,
-    0x006766666e360607ull, 0x001e0c0c0c0e000cull, 0x1e33333030300030ull, 0x0067361e36660607ull, 0x001e0c0c0c0c0c0eull, 0x00636b7f7f330000ull,
-    0x00333333331f0000ull, 0x001e3333331e0000ull, 0x0f063e66663b0000ull, 0x78303e33336e0000ull, 0x000f06666e3b0000ull, 0x001f301e033e0000ull,
-    0x00182c0c0c3e0c08ull, 0x006e333333330000ull, 0x000c1e3333330000ull, 0x00367f7f6b630000ull, 0x0063361c36630000ull, 0x1f303e3333330000ull,
-    0x003f260c193f0000ull, 0x00380c0c070c0c38ull, 0x0018181800181818ull, 0x00070c0c380c0c07ull, 0x0000000000003b6eull,
-};
+#include "perf_machine.h"
+#include "../game/smo_ui.h"
 
 static volatile LONG g_mode = -1;          /* PERF_OFF / PERF_FPS / PERF_FULL */
+static void thread_start(void);
 int perf_overlay_mode(void) {
     if (g_mode < 0) {
         const char *e = getenv("SMO_PERF_OVERLAY");
@@ -65,17 +46,22 @@ void perf_overlay_toggle(void) {
     printf("perf overlay: %s (F10)\n", m == PERF_FULL ? "full" : m == PERF_FPS ? "frame rate" : "off");
 }
 int perf_overlay_wants_gpu(void) { return perf_overlay_mode() == PERF_FULL; }
+static char g_gpu_name[64];
+void perf_overlay_set_gpu(const char *name) { snprintf(g_gpu_name, sizeof g_gpu_name, "%s", name ? name : ""); }
 
-/* ---- frames (render thread) */
+/* ---- frames (render thread; read by the overlay's thread under g_flock) */
 #define HIST 120
 #define SLOWS 4096
-static float g_ms[HIST];
-static double g_at[HIST];                  /* seconds, when each frame was presented */
-static int g_n, g_pos;
-static double g_slow_at[SLOWS];            /* when frames over 33.4 ms were presented */
-static int g_nslow;
-static float g_gpu_ms = -1, g_main_ms = -1, g_render_ms = -1;
-static int g_vpw, g_vph;
+typedef struct {
+    float ms[HIST]; double at[HIST]; int n, pos;           /* frame times and when each frame was presented (seconds) */
+    double slow_at[SLOWS]; int nslow;                      /* when frames over 33.4 ms were presented */
+    float replay, gpu, pipe, shader, uploads, main_ms, render_ms;      /* per frame, the last half second; -1: none */
+    PerfFrame pic;                                         /* the last frame's picture rows */
+    char scale_from[24], present[24];
+} Frames;
+static Frames g_fr = {.replay = -1, .gpu = -1, .pipe = -1, .shader = -1, .uploads = -1, .main_ms = -1, .render_ms = -1};
+static CRITICAL_SECTION g_flock;
+static volatile LONG g_win_h = 720;        /* the window's height (the size of the panel follows it) */
 static DWORD g_render_tid;
 static DWORD g_main_tid;                   /* the thread nnMain runs on (perf_overlay_main_here) */
 void perf_overlay_main_here(void) { g_main_tid = GetCurrentThreadId(); }      /* boot.c, just before nnMain */
@@ -108,230 +94,334 @@ static double thread_cpu_ms(DWORD tid) {   /* CPU time a thread used, ms; -1 whe
 #endif
 }
 
-void perf_overlay_frame(double wall_ms, float gpu_ms, int vpw, int vph) {
-    if (perf_overlay_mode() == PERF_OFF) { g_n = 0; return; }
+void perf_overlay_frame(const PerfFrame *f) {
+    if (perf_overlay_mode() == PERF_OFF) { g_fr.n = 0; return; }
+    thread_start();
     double t = now_s();
     if (!g_render_tid) g_render_tid = GetCurrentThreadId();
-    if (wall_ms > 0) {
-        g_ms[g_pos] = (float)wall_ms; g_at[g_pos] = t; g_pos = (g_pos + 1) % HIST; if (g_n < HIST) g_n++;
-        if (wall_ms > 33.4) g_slow_at[g_nslow++ % SLOWS] = t;
+    /* sums over half a second, then the averages (and the threads' CPU per frame) are published */
+    static double last, main0 = -1, render0 = -1, s_replay, s_gpu, s_pipe, s_shader, s_up;
+    static int frames, gpu_n;
+    frames++; s_replay += f->replay_ms; s_pipe += f->pipe_wait_ms; s_shader += f->shader_wait_ms; s_up += f->uploads;
+    if (f->gpu_ms > 0) { s_gpu += f->gpu_ms; gpu_n++; }
+    EnterCriticalSection(&g_flock);
+    if (f->wall_ms > 0) {
+        g_fr.ms[g_fr.pos] = (float)f->wall_ms; g_fr.at[g_fr.pos] = t; g_fr.pos = (g_fr.pos + 1) % HIST; if (g_fr.n < HIST) g_fr.n++;
+        if (f->wall_ms > 33.4) g_fr.slow_at[g_fr.nslow++ % SLOWS] = t;
     }
-    if (gpu_ms > 0) g_gpu_ms = gpu_ms;
-    if (vpw > 0) { g_vpw = vpw; g_vph = vph; }
-    static double last; static double main0, render0; static int frames;
-    frames++;
-    if (t - last >= 0.5) {                   /* threads' CPU per frame, twice a second */
+    g_fr.pic = *f;
+    InterlockedExchange(&g_win_h, f->win_h);
+    snprintf(g_fr.scale_from, sizeof g_fr.scale_from, "%s", f->scale_from ? f->scale_from : "");
+    snprintf(g_fr.present, sizeof g_fr.present, "%s", f->present ? f->present : "");
+    g_fr.pic.scale_from = g_fr.pic.present = NULL;
+    if (t - last >= 0.5) {
         double m = thread_cpu_ms(g_main_tid), r = thread_cpu_ms(g_render_tid);
-        if (last > 0 && frames > 0) {
-            g_main_ms = m >= 0 && main0 >= 0 ? (float)((m - main0) / frames) : -1;
-            g_render_ms = r >= 0 && render0 >= 0 ? (float)((r - render0) / frames) : -1;
+        if (last > 0) {
+            g_fr.replay = (float)(s_replay / frames); g_fr.pipe = (float)(s_pipe / frames); g_fr.shader = (float)(s_shader / frames);
+            g_fr.uploads = (float)(s_up / frames); g_fr.gpu = gpu_n ? (float)(s_gpu / gpu_n) : -1;
+            g_fr.main_ms = m >= 0 && main0 >= 0 ? (float)((m - main0) / frames) : -1;
+            g_fr.render_ms = r >= 0 && render0 >= 0 ? (float)((r - render0) / frames) : -1;
         }
-        main0 = m; render0 = r; last = t; frames = 0;
+        main0 = m; render0 = r; last = t; frames = gpu_n = 0;
+        s_replay = s_gpu = s_pipe = s_shader = s_up = 0;
     }
+    LeaveCriticalSection(&g_flock);
 }
 
-/* ---- the machine (its own thread, twice a second while the full overlay is shown) */
-typedef struct { float cpu, cpu_game, cpu_temp, ram_game, ram_used, ram_total, gpu, gpu_temp, gpu_w, gpu_mhz, vram_used, vram_total, gtt_used, gtt_total; } Machine;
-static Machine g_mach = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-static CRITICAL_SECTION g_mlock;
-static char g_cpu_name[64], g_gpu_name[64];
-void perf_overlay_set_gpu(const char *name) { snprintf(g_gpu_name, sizeof g_gpu_name, "%s", name ? name : ""); }
+/* ---- drawing on the canvas (RGBA, premultiplied; rows from the top) */
+static UiImage g_cv;                       /* the picture being composed */
+static UiFont *g_font;
+static float g_ts, g_em;                   /* font pixels -> picture pixels; the letters' height in picture pixels */
+/* The letters at the panel's size, made once per size: each drawn by smo_ui at twice that size and halved (smooth at
+ * any size), then copied as coverage. Drawing every letter of every frame through smo_ui cost 19.9 ms a picture at a
+ * 720-line window (the mean of 20); the copies are what is left. */
+typedef struct { uint8_t *cov; int w, h, ox, oy; float adv; } Glyph;      /* ox, oy: the bitmap's corner from the pen on the baseline */
+static Glyph g_gl[96];                     /* ' ' .. '~', and the degree sign (95: a ring, the game's font has none) */
+static float g_gl_em;
+static void line(float ax, float ay, float bx, float by, float wdt, uint32_t rgba);
+static void glyphs_make(void) {
+    if (g_gl_em == g_em) return;
+    UiFontInfo fi;
+    ui_font_info(g_font, &fi);
+    float s2 = 2.0f * g_ts;
+    int pad = 4, cw = (int)ceilf((float)fi.cell_w * s2) + 2 * pad, ch = (int)ceilf((float)fi.cell_h * s2) + 2 * pad;
+    float base2 = (float)pad + (float)fi.baseline * s2;            /* the baseline in the 2x cell, from its top */
+    UiImage c2 = {cw, ch, 4, malloc((size_t)cw * ch * 4)};
+    UiXf down = {1, 0, 0, 0, -1, (float)ch};
+    for (int i = 0; i < 96 && c2.px; i++) {
+        Glyph *g = &g_gl[i];
+        free(g->cov);
+        memset(c2.px, 0, (size_t)cw * ch * 4);
+        if (i < 95) {
+            uint16_t one[2] = {(uint16_t)(32 + i), 0};
+            g->adv = ui_text(&c2, down, g_font, NULL, one, 1, (float)pad, (float)ch - base2, s2, 0xffffffffu) / 2.0f;
+        } else {                                   /* the ring, drawn on the 2x cell with line() */
+            UiImage keep = g_cv; float r = 0.2f * g_em, cx = (float)pad + 0.16f * g_em + r, cy = base2 - 1.3f * g_em + r;
+            g_cv = c2;
+            for (int k = 0; k < 12; k++) { float a0 = (float)k * 0.5236f, a1 = a0 + 0.5236f; line(cx + r * cosf(a0), cy + r * sinf(a0), cx + r * cosf(a1), cy + r * sinf(a1), 0.14f * g_em, 0xffffffffu); }
+            g_cv = keep;
+            g->adv = 0.42f * g_em;
+        }
+        g->w = cw / 2; g->h = ch / 2; g->ox = -pad / 2; g->oy = -(int)(base2 / 2.0f + 0.5f);
+        g->cov = malloc((size_t)g->w * g->h);
+        for (int y = 0; g->cov && y < g->h; y++)
+            for (int x = 0; x < g->w; x++) {
+                const uint8_t *q = c2.px + ((size_t)(2 * y) * cw + 2 * x) * 4 + 3, *r = q + (size_t)cw * 4;
+                g->cov[(size_t)y * g->w + x] = (uint8_t)((q[0] + q[4] + r[0] + r[4] + 2) / 4);
+            }
+    }
+    free(c2.px);
+    g_gl_em = g_em;
+}
+static const Glyph *glyph_of_char(unsigned char c) { return c == 0xb0 ? &g_gl[95] : &g_gl[c >= 32 && c < 127 ? c - 32 : '?' - 32]; }
+static float text_w(const char *s) { float w = 0; for (; *s; s++) w += glyph_of_char((unsigned char)*s)->adv; return w; }
+static void blend(uint8_t *q, float cov, uint32_t rgba);
+static void text(float x, float y, float row, uint32_t rgba, const char *s) {     /* in a row of height `row` from y, capitals centred */
+    int base = (int)(y + row * 0.5f + g_em * 0.36f + 0.5f);
+    float pen = x;
+    unsigned a = rgba & 255, cr = rgba >> 24, cg = rgba >> 16 & 255, cb = rgba >> 8 & 255;
+    for (; *s; s++) {
+        const Glyph *g = glyph_of_char((unsigned char)*s);
+        int gx = (int)(pen + 0.5f) + g->ox, gy = base + g->oy;
+        for (int j = 0; g->cov && j < g->h; j++) {
+            int Y = gy + j;
+            if (Y < 0 || Y >= g_cv.h) continue;
+            for (int i = 0; i < g->w; i++) {
+                int X = gx + i;
+                unsigned c = g->cov[(size_t)j * g->w + i];
+                if (!c || X < 0 || X >= g_cv.w) continue;
+                unsigned k = c * a / 255, keep = 255 - k;          /* premultiplied over premultiplied, in integers */
+                uint8_t *q = g_cv.px + ((size_t)Y * g_cv.w + X) * 4;
+                q[0] = (uint8_t)((cr * k + q[0] * keep + 127) / 255); q[1] = (uint8_t)((cg * k + q[1] * keep + 127) / 255);
+                q[2] = (uint8_t)((cb * k + q[2] * keep + 127) / 255); q[3] = (uint8_t)((255 * k + q[3] * keep + 127) / 255);
+            }
+        }
+        pen += g->adv;
+    }
+}
+static void text_right(float x1, float y, float row, uint32_t rgba, const char *s) { text(x1 - text_w(s), y, row, rgba, s); }
+static void blend(uint8_t *q, float cov, uint32_t rgba) {          /* rgba not premultiplied, over a premultiplied pixel */
+    float a = (float)(rgba & 255) / 255.0f * cov, keep = 1.0f - a;
+    if (a <= 0) return;
+    for (int c = 0; c < 3; c++) q[c] = (uint8_t)((float)(rgba >> (24 - 8 * c) & 255) * a + (float)q[c] * keep + 0.5f);
+    q[3] = (uint8_t)(255.0f * a + (float)q[3] * keep + 0.5f);
+}
+static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+static void rrect(float x0, float y0, float x1, float y1, float r, uint32_t rgba) {     /* a rounded rectangle, smooth edges */
+    for (int Y = (int)y0 < 0 ? 0 : (int)y0; Y < (int)ceilf(y1) && Y < g_cv.h; Y++)
+        for (int X = (int)x0 < 0 ? 0 : (int)x0; X < (int)ceilf(x1) && X < g_cv.w; X++) {
+            float px = (float)X + 0.5f, py = (float)Y + 0.5f;
+            if (px > x0 + r + 1 && px < x1 - r - 1 && py > y0 + 1 && py < y1 - 1) {      /* inside, away from the edges: the whole pixel */
+                blend(g_cv.px + ((size_t)Y * g_cv.w + X) * 4, 1.0f, rgba);
+                continue;
+            }
+            float dx = fmaxf(fmaxf(x0 + r - px, px - (x1 - r)), 0), dy = fmaxf(fmaxf(y0 + r - py, py - (y1 - r)), 0);
+            float d = sqrtf(dx * dx + dy * dy) - r;                /* < 0 inside the corner circles */
+            float cov = clamp01(0.5f - d) * clamp01(px - x0 + 0.5f) * clamp01(x1 - px + 0.5f) * clamp01(py - y0 + 0.5f) * clamp01(y1 - py + 0.5f);
+            if (cov > 0) blend(g_cv.px + ((size_t)Y * g_cv.w + X) * 4, cov, rgba);
+        }
+}
+static void line(float ax, float ay, float bx, float by, float wdt, uint32_t rgba) {     /* a segment, smooth */
+    float x0 = fminf(ax, bx) - wdt, x1 = fmaxf(ax, bx) + wdt, y0 = fminf(ay, by) - wdt, y1 = fmaxf(ay, by) + wdt;
+    float vx = bx - ax, vy = by - ay, ll = vx * vx + vy * vy;
+    for (int Y = (int)y0 < 0 ? 0 : (int)y0; Y <= (int)y1 && Y < g_cv.h; Y++)
+        for (int X = (int)x0 < 0 ? 0 : (int)x0; X <= (int)x1 && X < g_cv.w; X++) {
+            float px = (float)X + 0.5f - ax, py = (float)Y + 0.5f - ay, k = ll > 0 ? clamp01((px * vx + py * vy) / ll) : 0;
+            float dx = px - k * vx, dy = py - k * vy, cov = clamp01(wdt * 0.5f + 0.5f - sqrtf(dx * dx + dy * dy));
+            if (cov > 0) blend(g_cv.px + ((size_t)Y * g_cv.w + X) * 4, cov, rgba);
+        }
+}
 
-static ULONG64 ft64(FILETIME f) { return ((ULONG64)f.dwHighDateTime << 32) | f.dwLowDateTime; }
-#ifdef __linux__
-static double read_num(const char *path) {  /* the first number in a sysfs file, -1 if none */
-    FILE *f = fopen(path, "r");
-    double v = -1;
-    if (f) { if (fscanf(f, "%lf", &v) != 1) v = -1; fclose(f); }
-    return v;
+/* TotK's colours (menu.cpp perf_full_draw), 0xRRGGBBAA */
+#define C_GPU 0x8cd44fffu
+#define C_CPU 0x2e96ccffu
+#define C_RAM 0xcc73b3ffu
+#define C_FPS 0xf2f2f2ffu
+#define C_WAIT 0xedc254ffu
+#define C_PIC 0x9eb3f2ffu
+#define C_TEXT 0xffffffffu
+#define C_DIM 0x808080ffu
+#define C_BG 0x0f0f0f99u                   /* ImGui's window background at TotK's 60 % */
+#define C_PLOT_BG 0x294a7a8au              /* ImGui's frame background */
+#define C_PLOT 0x9c9c9cffu                 /* ImGui's plot line */
+
+static void fmt(char *b, size_t n, const char *f, float v) { if (v < 0) snprintf(b, n, "-"); else snprintf(b, n, f, v); }
+static float gb(float mb) { return mb < 0 ? -1 : mb / 1024; }
+
+typedef struct { const char *label; uint32_t colour; char value[48]; } Row;
+/* a table of label + right-aligned value rows, the labels' column stretching to `w` */
+static float rows_w(const Row *r, int n, float gap) { float w = 0; for (int i = 0; i < n; i++) w = fmaxf(w, text_w(r[i].label) + gap + text_w(r[i].value)); return w; }
+static float rows_draw(const Row *r, int n, float x, float y, float w, float row) {
+    for (int i = 0; i < n; i++, y += row) { text(x, y, row, r[i].colour, r[i].label); text_right(x + w, y, row, strcmp(r[i].value, "-") ? C_TEXT : C_DIM, r[i].value); }
+    return y;
 }
-static char g_hw_cpu[300], g_hw_gpu[300], g_drm[300];       /* the CPU's hwmon folder, the GPU's hwmon folder, its drm device */
-static void find_sensors(void) {
-    DIR *d = opendir("/sys/class/hwmon");
-    struct dirent *e;
-    while (d && (e = readdir(d))) {
-        char p[300], n[64] = "";
-        if (e->d_name[0] == '.') continue;
-        snprintf(p, sizeof p, "/sys/class/hwmon/%s/name", e->d_name);
-        FILE *f = fopen(p, "r");
-        if (!f) continue;
-        if (!fgets(n, sizeof n, f)) n[0] = 0;
-        fclose(f);
-        n[strcspn(n, "\n")] = 0;
-        if (!g_hw_cpu[0] && (!strcmp(n, "k10temp") || !strcmp(n, "zenpower") || !strcmp(n, "coretemp"))) snprintf(g_hw_cpu, sizeof g_hw_cpu, "/sys/class/hwmon/%s", e->d_name);
-        if (!g_hw_gpu[0] && !strcmp(n, "amdgpu")) snprintf(g_hw_gpu, sizeof g_hw_gpu, "/sys/class/hwmon/%s", e->d_name);
+
+/* The frames of the last second: rate, average, longest. */
+static void last_second(const Frames *f, double t, float *fps, float *avg, float *mx) {
+    double sum = 0, m = 0;
+    int n = 0;
+    for (int i = 0; i < f->n; i++) {
+        int k = (f->pos - 1 - i + HIST) % HIST;
+        if (t - f->at[k] > 1.0) break;
+        sum += f->ms[k]; if (f->ms[k] > m) m = f->ms[k]; n++;
     }
-    if (d) closedir(d);
-    for (int i = 0; i < 8 && !g_drm[0]; i++) {
-        char p[300];
-        snprintf(p, sizeof p, "/sys/class/drm/card%d/device/gpu_busy_percent", i);
-        if (read_num(p) >= 0) snprintf(g_drm, sizeof g_drm, "/sys/class/drm/card%d/device", i);
-    }
+    *fps = n && sum > 0 ? (float)(n * 1000.0 / sum) : 0; *avg = n ? (float)(sum / n) : 0; *mx = (float)m;
 }
-#endif
-static void sample_machine(Machine *m) {
-    static ULONG64 idle0, kern0, user0, pk0, pu0;
-    FILETIME i, k, u, c, e, pk, pu;
-    m->cpu = m->cpu_game = -1;
-    if (GetSystemTimes(&i, &k, &u) && GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu)) {
-        ULONG64 total = (ft64(k) - kern0) + (ft64(u) - user0), idle = ft64(i) - idle0, game = (ft64(pk) - pk0) + (ft64(pu) - pu0);
-        if (kern0 && total) { m->cpu = (float)(100.0 * (double)(total - idle) / (double)total); m->cpu_game = (float)(100.0 * (double)game / (double)total); }
-        idle0 = ft64(i); kern0 = ft64(k); user0 = ft64(u); pk0 = ft64(pk); pu0 = ft64(pu);
+
+/* The full panel or the frame-rate line on the canvas; returns 0 when there is nothing to draw. U: the
+ * height of a row in canvas pixels. */
+static int compose(int mode, float U, const PerfMachine *m, const char *cpu_name) {
+    Frames f;
+    EnterCriticalSection(&g_flock); f = g_fr; LeaveCriticalSection(&g_flock);
+    double t = now_s();
+    float fps, avg, mx;
+    last_second(&f, t, &fps, &avg, &mx);
+    UiFontInfo fi;
+    ui_font_info(g_font, &fi);
+    g_em = 0.72f * U; g_ts = g_em / (float)fi.height;
+    glyphs_make();
+    float pad = 0.55f * U, gap = 0.9f * U;
+    char b[64];
+    if (mode == PERF_FPS) {                                        /* TotK's frame-rate line: a dark box, the rate in white */
+        snprintf(b, sizeof b, "%.0f FPS  %.1f ms", fps, avg);
+        int w = (int)(text_w(b) + 2 * pad + 1) & ~1, h = (int)(U + pad + 1) & ~1;
+        if (g_cv.w != w || g_cv.h != h) { free(g_cv.px); g_cv.px = malloc((size_t)w * h * 4); g_cv.w = w; g_cv.h = h; g_cv.ch = 4; }
+        if (!g_cv.px) return 0;
+        memset(g_cv.px, 0, (size_t)w * h * 4);
+        rrect(0, 0, (float)w, (float)h, 0.3f * U, 0x00000096u);
+        text(pad, pad * 0.5f, U, 0xffffffebu, b);
+        return 1;
     }
-    PROCESS_MEMORY_COUNTERS pmc;
-    m->ram_game = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (float)((double)pmc.WorkingSetSize / 1048576.0) : -1;
-#ifdef _WIN32
-    MEMORYSTATUSEX ms;
-    ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) { m->ram_total = (float)((double)ms.ullTotalPhys / 1048576.0); m->ram_used = (float)((double)(ms.ullTotalPhys - ms.ullAvailPhys) / 1048576.0); }
-#elif defined(__linux__)
-    {   FILE *f = fopen("/proc/meminfo", "r");
-        char l[128];
-        double tot = -1, avail = -1;
-        while (f && fgets(l, sizeof l, f)) { if (!strncmp(l, "MemTotal:", 9)) tot = atof(l + 9); else if (!strncmp(l, "MemAvailable:", 13)) avail = atof(l + 13); }
-        if (f) fclose(f);
-        if (tot > 0 && avail >= 0) { m->ram_total = (float)(tot / 1024.0); m->ram_used = (float)((tot - avail) / 1024.0); }
+    /* the machine and the frames: label, three right-aligned numbers per row (TotK's widths: samples of 8s) */
+    static const char *const lab[4] = {"GPU", "VRAM", "CPU", "RAM"};
+    static const uint32_t lab_c[4] = {C_GPU, C_GPU, C_CPU, C_RAM};
+    char v[5][3][32];
+    fmt(v[0][0], 32, "%.0f%%", m->gpu); fmt(v[0][1], 32, "%.0f \xb0" "C", m->gpu_temp); fmt(v[0][2], 32, "%.0f W", m->gpu_w);
+    fmt(v[1][0], 32, "%.1f GB", gb(m->vram_used)); fmt(v[1][1], 32, "/ %.1f GB", gb(m->vram_total)); fmt(v[1][2], 32, "%.0f MHz", m->gpu_mhz);
+    fmt(v[2][0], 32, "%.0f%%", m->cpu); fmt(v[2][1], 32, "%.0f \xb0" "C", m->cpu_temp); fmt(v[2][2], 32, "game %.0f%%", m->cpu_game);
+    fmt(v[3][0], 32, "%.1f GB", gb(m->ram_used)); fmt(v[3][1], 32, "/ %.1f GB", gb(m->ram_total)); fmt(v[3][2], 32, "game %.1f GB", gb(m->ram_game));
+    snprintf(v[4][0], 32, "%.1f ms", avg); snprintf(v[4][1], 32, "max %.1f ms", mx); v[4][2][0] = 0;
+    float c0 = fmaxf(text_w("VRAM"), text_w("888 FPS")), c1 = fmaxf(text_w("100%"), text_w("888.8 GB")), c2 = fmaxf(text_w("188 \xb0" "C"), fmaxf(text_w("/ 888.8 GB"), text_w("max 888.8 ms"))),
+          c3 = fmaxf(fmaxf(text_w("8888 MHz"), text_w("game 100%")), text_w("game 888.8 GB"));
+    float w1 = c0 + c1 + c2 + c3 + 3 * gap;
+    /* per frame */
+    Row wr[8] = {{"GPU frame prep", C_WAIT}, {"GPU busy per frame", C_WAIT}, {"Pipeline waits", C_WAIT}, {"Shader waits", C_WAIT},
+                 {"Texture uploads", C_WAIT}, {"Game thread CPU", C_WAIT}, {"Render thread CPU", C_WAIT}, {"Frames over 33 ms (1 min)", C_WAIT}};
+    int slow = 0;
+    for (int i = 0; i < f.nslow && i < SLOWS; i++) slow += t - f.slow_at[(f.nslow - 1 - i) % SLOWS] <= 60.0;
+    fmt(wr[0].value, 48, "%.2f ms", f.replay); fmt(wr[1].value, 48, "%.2f ms", f.gpu); fmt(wr[2].value, 48, "%.2f ms", f.pipe);
+    fmt(wr[3].value, 48, "%.2f ms", f.shader); fmt(wr[4].value, 48, "%.1f per frame", f.uploads); fmt(wr[5].value, 48, "%.2f ms", f.main_ms);
+    fmt(wr[6].value, 48, "%.2f ms", f.render_ms); snprintf(wr[7].value, 48, "%d", slow);
+    /* the picture */
+    const PerfFrame *p = &f.pic;
+    Row pr[7] = {{"Window", C_PIC}, {"Game image", C_PIC}, {"Rendered at", C_PIC}, {"3D scene", C_PIC}, {"Scaling", C_PIC}, {"Frame limit", C_PIC}, {"Presentation", C_PIC}};
+    snprintf(pr[0].value, 48, "%dx%d", p->win_w, p->win_h);
+    if (p->game_w > 0) snprintf(pr[1].value, 48, "%dx%d", p->game_w, p->game_h); else snprintf(pr[1].value, 48, "-");
+    if (p->image_w > 0) snprintf(pr[2].value, 48, "%dx%d, %.0f%% (%s)", p->image_w, p->image_h, p->scale * 100.0f, f.scale_from); else snprintf(pr[2].value, 48, "-");
+    if (p->scene_w > 0 && p->game_w > 0) snprintf(pr[3].value, 48, "%dx%d, %.0f%%", p->scene_w, p->scene_h, p->scene_w * 100.0 / p->game_w); else snprintf(pr[3].value, 48, "-");
+    snprintf(pr[4].value, 48, "%s", p->image_w <= 0 ? "-" : p->image_w == p->win_w && p->image_h == p->win_h ? "none (1:1)" : "bilinear");
+    fmt(pr[5].value, 48, "%.0f FPS", p->rate_hz > 0 ? p->rate_hz : -1);
+    snprintf(pr[6].value, 48, "%s", f.present[0] ? f.present : "-");
+    float w = fmaxf(w1, fmaxf(rows_w(wr, 8, gap), rows_w(pr, 7, gap)));
+    w = fmaxf(w, fmaxf(text_w(g_gpu_name), text_w(cpu_name)));
+    float plot_h = 2.2f * U, sp = 0.35f * U;
+    int foot = (g_gpu_name[0] != 0) + (cpu_name[0] != 0);
+    int W = ((int)(w + 2 * pad) + 1) & ~1, H = ((int)(pad * 2 + 5 * U + sp + plot_h + sp + 8 * U + sp + 7 * U + (foot ? sp : 0) + foot * U) + 1) & ~1;
+    if (g_cv.w != W || g_cv.h != H) { free(g_cv.px); g_cv.px = malloc((size_t)W * H * 4); g_cv.w = W; g_cv.h = H; g_cv.ch = 4; }
+    if (!g_cv.px) return 0;
+    memset(g_cv.px, 0, (size_t)W * H * 4);
+    rrect(0, 0, (float)W, (float)H, 0.45f * U, C_BG);
+    float x = pad, y = pad, xr = (float)W - pad;
+    for (int r = 0; r < 5; r++, y += U) {
+        if (r < 4) text(x, y, U, lab_c[r], lab[r]);
+        else { snprintf(b, sizeof b, "%.0f FPS", fps); text(x, y, U, C_FPS, b); }
+        float ends[3] = {x + c0 + gap + c1, x + c0 + c1 + c2 + 2 * gap, xr};
+        for (int c = 0; c < 3; c++) if (v[r][c][0]) text_right(ends[c], y, U, strcmp(v[r][c], "-") ? C_TEXT : C_DIM, v[r][c]);
     }
-    static int found;
-    if (!found) { found = 1; find_sensors(); }
-    char p[400];
-    if (g_hw_cpu[0]) { snprintf(p, sizeof p, "%s/temp1_input", g_hw_cpu); double v = read_num(p); m->cpu_temp = v >= 0 ? (float)(v / 1000.0) : -1; }
-    if (g_drm[0]) {
-        snprintf(p, sizeof p, "%s/gpu_busy_percent", g_drm); m->gpu = (float)read_num(p);
-        double v;
-        snprintf(p, sizeof p, "%s/mem_info_vram_used", g_drm); v = read_num(p); m->vram_used = v >= 0 ? (float)(v / 1048576.0) : -1;
-        snprintf(p, sizeof p, "%s/mem_info_vram_total", g_drm); v = read_num(p); m->vram_total = v >= 0 ? (float)(v / 1048576.0) : -1;
-        snprintf(p, sizeof p, "%s/mem_info_gtt_used", g_drm); v = read_num(p); m->gtt_used = v >= 0 ? (float)(v / 1048576.0) : -1;
-        snprintf(p, sizeof p, "%s/mem_info_gtt_total", g_drm); v = read_num(p); m->gtt_total = v >= 0 ? (float)(v / 1048576.0) : -1;
+    y += sp;
+    rrect(x, y, xr, y + plot_h, 0, C_PLOT_BG);                    /* the last 120 frames, 0 .. max(50 ms, the longest) */
+    {   float top = fmaxf(50.0f, mx), px0 = x + 1, pw = xr - x - 2, ph = plot_h - 2;
+        for (int i = 1; i < f.n; i++) {
+            int k0 = (f.pos - f.n + i - 1 + HIST) % HIST, k1 = (k0 + 1) % HIST;
+            float a = fminf(f.ms[k0], top) / top, c = fminf(f.ms[k1], top) / top, s = pw / (float)(HIST - 1);
+            float xa = px0 + (float)(HIST - f.n + i - 1) * s;
+            line(xa, y + 1 + ph * (1 - a), xa + s, y + 1 + ph * (1 - c), fmaxf(1.0f, U / 11.0f), C_PLOT);
+        }
     }
-    if (g_hw_gpu[0]) {
-        double v;
-        snprintf(p, sizeof p, "%s/temp1_input", g_hw_gpu); v = read_num(p); m->gpu_temp = v >= 0 ? (float)(v / 1000.0) : -1;
-        snprintf(p, sizeof p, "%s/power1_average", g_hw_gpu); v = read_num(p);
-        if (v < 0) { snprintf(p, sizeof p, "%s/power1_input", g_hw_gpu); v = read_num(p); }
-        m->gpu_w = v >= 0 ? (float)(v / 1e6) : -1;
-        snprintf(p, sizeof p, "%s/freq1_input", g_hw_gpu); v = read_num(p); m->gpu_mhz = v >= 0 ? (float)(v / 1e6) : -1;
-    }
-#endif
+    y += plot_h + sp;
+    y = rows_draw(wr, 8, x, y, xr - x, U) + sp;
+    y = rows_draw(pr, 7, x, y, xr - x, U);
+    if (foot) y += sp;
+    if (g_gpu_name[0]) { text(x, y, U, C_DIM, g_gpu_name); y += U; }
+    if (cpu_name[0]) text(x, y, U, C_DIM, cpu_name);
+    return 1;
 }
-static DWORD WINAPI machine_thread(LPVOID arg) {
+
+/* ---- the overlay's thread: the machine twice a second (full overlay only), the picture ten times a second */
+static CRITICAL_SECTION g_plock;
+static uint8_t *g_pic;                     /* the latest picture, RGBA premultiplied */
+static int g_pic_w, g_pic_h, g_pic_margin;
+static unsigned g_pic_ver;
+static int load_font(void) {
+    static int tried;
+    if (tried) return g_font != NULL;
+    tried = 1;
+    size_t n = 0, fn = 0;
+    uint8_t *arc = ui_arc("LocalizedData/USen/LayoutData/FontData.szs", &n);
+    const uint8_t *b = arc ? ui_sarc(arc, n, "MessageFont38.bffnt", &fn) : NULL;
+    g_font = b ? ui_font(b, fn) : NULL;
+    free(arc);
+    if (!g_font) printf("perf overlay: the game's MessageFont38 could not be read: no overlay\n");
+    return g_font != NULL;
+}
+static void publish(int ok) {
+    uint8_t *out = ok ? malloc((size_t)g_cv.w * g_cv.h * 4) : NULL;
+    if (out) memcpy(out, g_cv.px, (size_t)g_cv.w * g_cv.h * 4);
+    EnterCriticalSection(&g_plock);
+    free(g_pic); g_pic = out; g_pic_w = out ? g_cv.w : 0; g_pic_h = out ? g_cv.h : 0; g_pic_margin = (int)fmaxf(8.0f, (float)g_win_h / 90.0f); g_pic_ver++;
+    LeaveCriticalSection(&g_plock);
+}
+static DWORD WINAPI overlay_thread(LPVOID arg) {
     (void)arg;
-    for (;;) {
-        if (perf_overlay_mode() == PERF_FULL) {
-            Machine m = g_mach;
-            sample_machine(&m);
-            EnterCriticalSection(&g_mlock); g_mach = m; LeaveCriticalSection(&g_mlock);
+    PerfMachine m = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    char cpu_name[64];
+    perf_machine_cpu_name(cpu_name, sizeof cpu_name);
+    double sampled = 0;
+    for (int was = PERF_OFF;; Sleep(100)) {
+        int mode = perf_overlay_mode();
+        float u = fmaxf(17.0f, (float)g_win_h / 48.0f);              /* a row: 22.5 pixels on a window 1080 high, at least 17 */
+        if (mode == PERF_FULL && now_s() - sampled >= 0.5) { perf_machine_sample(&m); sampled = now_s(); }
+        if (mode != PERF_OFF || was != PERF_OFF) {
+            int ok = mode != PERF_OFF && load_font();
+            double t0 = now_s();
+            ok = ok && compose(mode, u, &m, cpu_name);
+            static int n; static double sum;
+            if (ok && mode == PERF_FULL && n < 21 && ++n > 1 && (sum += now_s() - t0, n == 21))      /* the mean of 20, the font's loading left out */
+                printf("perf overlay: the full panel (%dx%d) composed in %.1f ms on its own thread (mean of 20), ten times a second\n", g_cv.w, g_cv.h, sum * 1000.0 / 20);
+            publish(ok);
         }
-        Sleep(500);
+        was = mode;
     }
     return 0;
 }
-static void machine_start(void) {
+static void thread_start(void) {          /* render thread, the first frame with the overlay on */
     static int started;
     if (started) return;
     started = 1;
-    InitializeCriticalSection(&g_mlock);
-#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
-    {   unsigned r[12];
-        if (__get_cpuid(0x80000000, &r[0], &r[1], &r[2], &r[3]) && r[0] >= 0x80000004) {
-            for (unsigned i = 0; i < 3; i++) __get_cpuid(0x80000002 + i, &r[i * 4], &r[i * 4 + 1], &r[i * 4 + 2], &r[i * 4 + 3]);
-            char b[49];
-            memcpy(b, r, 48); b[48] = 0;
-            char *s = b; while (*s == ' ') s++;
-            snprintf(g_cpu_name, sizeof g_cpu_name, "%s", s);
-        }
-    }
-#endif
-    HANDLE h = CreateThread(NULL, 0, machine_thread, NULL, 0, NULL);
+    InitializeCriticalSection(&g_flock); InitializeCriticalSection(&g_plock);
+    HANDLE h = CreateThread(NULL, 0, overlay_thread, NULL, 0, NULL);
     if (h) CloseHandle(h);
 }
 
-/* ---- the picture */
-static uint8_t *g_px;                      /* BGRA */
-static int g_pw, g_ph, g_sc;
-static void fill(int x, int y, int w, int h, uint32_t bgra) {
-    for (int j = y < 0 ? 0 : y; j < y + h && j < g_ph; j++)
-        for (int i = x < 0 ? 0 : x; i < x + w && i < g_pw; i++) memcpy(g_px + ((size_t)j * g_pw + i) * 4, &bgra, 4);
-}
-static void text(int x, int y, uint32_t bgra, const char *s) {
-    for (; *s; s++, x += 8 * g_sc) {
-        unsigned ch = (unsigned char)*s;
-        if (ch < 32 || ch > 126) ch = '?';
-        uint64_t g = g_glyph[ch - 32];
-        for (int r = 0; r < 8; r++)
-            for (int c = 0; c < 8; c++)
-                if (g >> (r * 8 + c) & 1) fill(x + c * g_sc, y + r * g_sc, g_sc, g_sc, bgra);
-    }
-}
-#define BG 0xff141414u                     /* 0xAARRGGBB: B, G, R, A in memory */
-#define WHITE 0xffe6e6e6u
-#define GREY 0xff8c8c8cu
-#define GREEN 0xff5ad25au
-#define YELLOW 0xffe6c828u
-#define RED 0xffeb4646u
-static uint32_t rate_colour(float fps) { return fps >= 55 ? GREEN : fps >= 30 ? YELLOW : RED; }
-static void num(char *b, size_t n, const char *fmt, float v) { if (v < 0) snprintf(b, n, "-"); else snprintf(b, n, fmt, v); }
-
-int perf_overlay_compose(uint8_t **bgra, int *w, int *h, int win_w, int win_h) {
-    int mode = perf_overlay_mode();
-    if (mode == PERF_OFF || win_w < 200 || win_h < 100) return 0;
-    if (mode == PERF_FULL) machine_start();
-    g_sc = win_h >= 1000 ? 2 : 1;
-    double t = now_s(), sum = 0, mx = 0;
-    int n = 0, slow = 0;
-    for (int i = 0; i < g_n; i++) {
-        int k = (g_pos - 1 - i + HIST) % HIST;
-        if (t - g_at[k] > 1.0) break;
-        sum += g_ms[k]; if (g_ms[k] > mx) mx = g_ms[k]; n++;
-    }
-    for (int i = 0; i < g_nslow && i < SLOWS; i++) slow += t - g_slow_at[(g_nslow - 1 - i) % SLOWS] <= 60.0;
-    float fps = n && sum > 0 ? (float)(n * 1000.0 / sum) : 0, avg = n ? (float)(sum / n) : 0;
-    char l[16][64];
-    int lines = 0, gh = 0;
-    snprintf(l[lines++], 64, mode == PERF_FPS ? "%.0f FPS  %.1f ms" : "FPS %.1f  %.1f ms  max %.1f", fps, avg, mx);
-    if (mode == PERF_FULL) {
-        Machine m;
-        EnterCriticalSection(&g_mlock); m = g_mach; LeaveCriticalSection(&g_mlock);
-        char a[16], b[16], c[16], d[16];
-        gh = 40 * g_sc;
-        num(a, sizeof a, "%.1f ms", g_gpu_ms); snprintf(l[lines++], 64, "GPU frame %s  3D %dx%d", a, g_vpw, g_vph);
-        num(a, sizeof a, "%.1f", g_main_ms); num(b, sizeof b, "%.1f", g_render_ms); snprintf(l[lines++], 64, "CPU ms/frame main %s render %s", a, b);
-        snprintf(l[lines++], 64, "frames over 33 ms, last minute: %d", slow);
-        num(a, sizeof a, "%.0f%%", m.cpu); num(b, sizeof b, "%.0f%%", m.cpu_game); num(c, sizeof c, "%.0f C", m.cpu_temp);
-        snprintf(l[lines++], 64, "CPU %s  game %s  %s", a, b, c);
-        num(a, sizeof a, "%.1f", m.ram_game < 0 ? -1 : m.ram_game / 1024); num(b, sizeof b, "%.1f", m.ram_used < 0 ? -1 : m.ram_used / 1024); num(c, sizeof c, "%.1f", m.ram_total < 0 ? -1 : m.ram_total / 1024);
-        snprintf(l[lines++], 64, "RAM game %s GB  %s / %s GB", a, b, c);
-        num(a, sizeof a, "%.0f%%", m.gpu); num(b, sizeof b, "%.0f C", m.gpu_temp); num(c, sizeof c, "%.0f W", m.gpu_w); num(d, sizeof d, "%.0f MHz", m.gpu_mhz);
-        snprintf(l[lines++], 64, "GPU %s  %s  %s  %s", a, b, c, d);
-        num(a, sizeof a, "%.0f", m.vram_used); num(b, sizeof b, "%.0f", m.vram_total); num(c, sizeof c, "%.0f", m.gtt_used); num(d, sizeof d, "%.0f", m.gtt_total);
-        snprintf(l[lines++], 64, m.gtt_total > 0 ? "VRAM %s/%s MB  GTT %s/%s MB" : "VRAM %s/%s MB", a, b, c, d);
-        snprintf(l[lines++], 64, "%.36s", g_gpu_name);
-        snprintf(l[lines++], 64, "%.36s", g_cpu_name);
-    }
-    int cols = 0;
-    for (int i = 0; i < lines; i++) { int k = (int)strlen(l[i]); if (k > cols) cols = k; }
-    int pad = 4 * g_sc, lh = 10 * g_sc;
-    int pw = cols * 8 * g_sc + 2 * pad, ph = lines * lh + 2 * pad + (gh ? gh + pad : 0);
-    if (mode == PERF_FULL && pw < HIST * 2 * g_sc + 2 * pad) pw = HIST * 2 * g_sc + 2 * pad;
-    if (pw > win_w) pw = win_w;
-    if (ph > win_h) ph = win_h;
-    if (pw != g_pw || ph != g_ph) { free(g_px); g_px = malloc((size_t)pw * ph * 4); g_pw = pw; g_ph = ph; if (!g_px) { g_pw = g_ph = 0; return 0; } }
-    fill(0, 0, pw, ph, BG);
-    int y = pad;
-    text(pad, y, rate_colour(fps), l[0]); y += lh;
-    if (gh) {                                  /* the last 120 frames, 0..50 ms, lines at 16.7 and 33.3 ms */
-        int x0 = pad, bw = 2 * g_sc;
-        for (int i = 0; i < g_n; i++) {
-            int k = (g_pos - g_n + i + HIST) % HIST;
-            float v = g_ms[k] > 50 ? 50 : g_ms[k];
-            int bh = (int)(v / 50 * gh); if (bh < 1) bh = 1;
-            fill(x0 + (HIST - g_n + i) * bw, y + gh - bh, bw, bh, g_ms[k] > 33.4f ? RED : g_ms[k] > 17.5f ? YELLOW : GREEN);
-        }
-        fill(x0, y + gh - (int)(16.7 / 50 * gh), HIST * bw, g_sc, WHITE);      /* over the bars: 60 and 30 frames a second */
-        fill(x0, y + gh - (int)(33.3 / 50 * gh), HIST * bw, g_sc, WHITE);
-        y += gh + pad;
-    }
-    for (int i = 1; i < lines; i++, y += lh) text(pad, y, i >= lines - 2 ? GREY : WHITE, l[i]);
-    *bgra = g_px; *w = pw; *h = ph;
-    return 1;
+int perf_overlay_picture(uint8_t *dst, size_t cap, int *w, int *h, unsigned *version, int *margin) {
+    if (perf_overlay_mode() == PERF_OFF || !g_pic_ver) return 0;
+    int r;
+    EnterCriticalSection(&g_plock);
+    *w = g_pic_w; *h = g_pic_h; *margin = g_pic_margin;
+    if (!g_pic) r = 0;
+    else if (*version == g_pic_ver) r = 1;
+    else if (cap < (size_t)g_pic_w * g_pic_h * 4) r = -1;
+    else { memcpy(dst, g_pic, (size_t)g_pic_w * g_pic_h * 4); *version = g_pic_ver; r = 2; }
+    LeaveCriticalSection(&g_plock);
+    return r;
 }

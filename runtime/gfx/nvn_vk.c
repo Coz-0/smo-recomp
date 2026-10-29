@@ -180,10 +180,12 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
+static void perf_views_drop(void);                       /* nvn_vk_draw.c: the performance overlay's views of the window images */
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
+    perf_views_drop();
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
 }

@@ -67,6 +67,7 @@ static int vsync_signal_ok(void) { return !g_menu_hold; }
  * same. Not set or 1 = nothing changes. (A lockstep clock, a refresh only once the game has queued a frame, never starts
  * this game: it waits for a refresh before its first frame.) */
 static double g_rate = 60.0;                          /* refreshes a second */
+double display_rate_hz(void) { return g_rate; }      /* the performance overlay's frame limit */
 static void speed_init(void) {
     const char *e = getenv("SMO_SPEED");
     if (!e || !e[0]) return;

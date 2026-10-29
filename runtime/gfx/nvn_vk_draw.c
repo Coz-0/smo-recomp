@@ -793,6 +793,7 @@ static float rs_scale(void) {
     }
     return g_rs;
 }
+static const char *rs_from(void) { return getenv("SMO_VK_SCALE") && atof(getenv("SMO_VK_SCALE")) > 0 ? "SMO_VK_SCALE" : "graphics.ini"; }
 #define RS_ON (rs_scale() != 1.0f)
 /* The game's screen-sized targets (measured with SMO_VK_RTLOG): its window textures (1600 x 900), the title's and every stage's
  * scene buffers (1600 x 900, 1440 x 810 in Cascade Kingdom, ...) and their halvings down to 11 x 6 are all about 16:9; every
@@ -3588,36 +3589,188 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
-/* the performance overlay (perf_overlay.c): its picture copied straight into the window image's top-left corner, from
- * an upload buffer of the command buffer being recorded (one per slot: a slot is waited for before it records again) */
+/* the performance overlay (perf_overlay.c): its picture (RGBA, alpha premultiplied) blended over the window image's
+ * top-left corner by one textured rectangle, so the game shows through the panel as through TotK recomp's. The picture
+ * goes into an image of its own only when perf_overlay.c composed a new one (about ten times a second), from an upload
+ * buffer of the command buffer being recorded (one per slot: a slot is waited for before it records again). The image
+ * grows when the panel does; the one it replaces is destroyed once the submissions that read it have finished. The
+ * window images get views of their own, dropped with the swapchain (perf_views_drop). */
+static struct {
+    VkImage img; VMem mem; VkImageView view; VkDescriptorSet set; int iw, ih;      /* the picture's image (iw x ih, >= w x h) */
+    struct { VkImage img; VMem mem; VkImageView view; VkDescriptorSet set; uint64_t serial; } old;
+    int w, h, margin, have; unsigned ver;
+    VkFormat fmt;                                  /* the window's format: the pipeline's, and the picture's in its encoding */
+    VkSampler smp; VkDescriptorSetLayout dsl; VkDescriptorPool dp; VkPipelineLayout pl; VkPipeline pipe; int failed;
+    VkImage wimg[16]; VkImageView wview[16];
+} g_po;
 static struct { VkBuffer buf; VMem mem; uint64_t size; } g_perf[NSLOT];
-static void perf_draw(uint32_t index) {
-    uint8_t *px; int w, h;
-    if (!perf_overlay_compose(&px, &w, &h, (int)V.extent.width, (int)V.extent.height)) return;
-    int x = h >= 300 ? 16 : 8;                     /* a margin, two letters' worth on a large window */
-    if (w + x > (int)V.extent.width || h + x > (int)V.extent.height) return;
-    uint64_t need = (uint64_t)w * h * 4;
-    if (g_perf[R.cur].size < need) {
-        if (g_perf[R.cur].buf) { vkDestroyBuffer(V.device, g_perf[R.cur].buf, NULL); vmem_free(g_perf[R.cur].mem); }
-        g_perf[R.cur].buf = vbuf_new(need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_perf[R.cur].mem);
-        g_perf[R.cur].size = need;
+static void perf_views_drop(void) {                /* swapchain_destroy (nvn_vk.c), after the device is idle */
+    for (int i = 0; i < 16; i++) if (g_po.wview[i]) { vkDestroyImageView(V.device, g_po.wview[i], NULL); g_po.wview[i] = NULL; g_po.wimg[i] = NULL; }
+}
+static VkFormat perf_unorm(VkFormat f) {           /* the picture's format: RGBA8 in the window's encoding */
+    return f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+}
+static int perf_pipeline(void) {
+    if (g_po.pipe && g_po.fmt == V.format.format) return 1;
+    if (g_po.failed) return 0;
+    if (g_po.pipe) { vkDestroyPipeline(V.device, g_po.pipe, NULL); g_po.pipe = NULL; }      /* a new swapchain format: swapchain_destroy left the device idle */
+    uint64_t h;
+    static VkShaderModule vs, fs;
+    if (!vs) vs = module_from_glsl(0, "#version 460\nlayout(push_constant) uniform P { vec4 rect; vec2 uv; } p;\nlayout(location = 0) out vec2 uv;\n"
+                                      "void main() { vec2 c = vec2(gl_VertexIndex & 1, gl_VertexIndex >> 1); uv = c * p.uv; gl_Position = vec4(mix(p.rect.xy, p.rect.zw, c), 0.0, 1.0); }\n",
+                                   "performance overlay", &h, NULL);
+    if (!fs) fs = module_from_glsl(1, "#version 460\nlayout(set = 0, binding = 0) uniform sampler2D t;\nlayout(location = 0) in vec2 uv;\nlayout(location = 0) out vec4 o;\n"
+                                      "void main() { o = texture(t, uv); }\n", "performance overlay", &h, NULL);
+    if (!vs || !fs) { g_po.failed = 1; printf("perf overlay: its shaders do not compile: no overlay\n"); return 0; }
+    if (!g_po.smp) {
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_NEAREST; si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VKC(vkCreateSampler(V.device, &si, NULL, &g_po.smp));
+        VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &g_po.smp};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 1; li.pBindings = &lb;
+        VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &g_po.dsl));
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+        VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; pi.maxSets = 2; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &g_po.dp));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 24};
+        VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1; pli.pSetLayouts = &g_po.dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+        VKC(vkCreatePipelineLayout(V.device, &pli, NULL, &g_po.pl));
     }
-    uint8_t *dst = g_perf[R.cur].mem.map;
-    if (V.format.format == VK_FORMAT_R8G8B8A8_UNORM || V.format.format == VK_FORMAT_R8G8B8A8_SRGB) {
-        for (uint64_t i = 0; i < need; i += 4) { dst[i] = px[i + 2]; dst[i + 1] = px[i + 1]; dst[i + 2] = px[i]; dst[i + 3] = px[i + 3]; }
-    } else memcpy(dst, px, need);
-    VkBufferImageCopy c;
-    memset(&c, 0, sizeof c);
-    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
-    c.imageOffset.x = x; c.imageOffset.y = x; c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
-    {   /* after the blit of the frame into the same image: two transfer writes need a barrier between them */
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {VK_TRUE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD,
+                                              VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, 0xf};      /* premultiplied; the window's alpha kept */
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2; ds.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rci.colorAttachmentCount = 1; rci.pColorAttachmentFormats = &V.format.format;
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &rci; gi.stageCount = 2; gi.pStages = st; gi.pVertexInputState = &vi; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp;
+    gi.pRasterizationState = &rs; gi.pMultisampleState = &ms; gi.pColorBlendState = &cb; gi.pDynamicState = &ds; gi.layout = g_po.pl;
+    if (vkCreateGraphicsPipelines(V.device, NULL, 1, &gi, NULL, &g_po.pipe) != VK_SUCCESS) { g_po.pipe = NULL; g_po.failed = 1; printf("perf overlay: its pipeline could not be made: no overlay\n"); return 0; }
+    g_po.fmt = V.format.format;
+    return 1;
+}
+static int perf_image(int w, int h) {              /* an image for a w x h picture, the old one kept until it is not read any more; 0: not yet */
+    if (g_po.old.img && R.done >= g_po.old.serial) {
+        vkFreeDescriptorSets(V.device, g_po.dp, 1, &g_po.old.set); vkDestroyImageView(V.device, g_po.old.view, NULL);
+        vkDestroyImage(V.device, g_po.old.img, NULL); vmem_free(g_po.old.mem); memset(&g_po.old, 0, sizeof g_po.old);
+    }
+    if (g_po.img && w <= g_po.iw && h <= g_po.ih) return 1;
+    if (g_po.old.img) return 0;                    /* a second growth while the first old image may still be read: a later frame */
+    if (g_po.img) { g_po.old.img = g_po.img; g_po.old.mem = g_po.mem; g_po.old.view = g_po.view; g_po.old.set = g_po.set; g_po.old.serial = R.serial + 1; }
+    g_po.iw = (w + 63) & ~63; g_po.ih = (h + 63) & ~63;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkMemoryRequirements rq;
+    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = perf_unorm(V.format.format); ci.extent.width = (uint32_t)g_po.iw; ci.extent.height = (uint32_t)g_po.ih; ci.extent.depth = 1;
+    ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VKC(vkCreateImage(V.device, &ci, NULL, &g_po.img));
+    vkGetImageMemoryRequirements(V.device, g_po.img, &rq);
+    g_po.mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VKC(vkBindImageMemory(V.device, g_po.img, g_po.mem.mem, g_po.mem.off));
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_po.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format; vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+    VKC(vkCreateImageView(V.device, &vi, NULL, &g_po.view));
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_po.dp; ai.descriptorSetCount = 1; ai.pSetLayouts = &g_po.dsl;
+    VKC(vkAllocateDescriptorSets(V.device, &ai, &g_po.set));
+    VkDescriptorImageInfo ii = {NULL, g_po.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wr.dstSet = g_po.set; wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii;
+    vkUpdateDescriptorSets(V.device, 1, &wr, 0, NULL);
+    image_barrier(g_po.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_po.have = 0;
+    return 1;
+}
+static void perf_draw(uint32_t index) {
+    if (index >= 16) return;
+    if (!g_po.pipe) {                              /* nothing made until there is something to draw */
+        int w, h, m; unsigned v0 = 0;
+        if (!perf_overlay_picture(NULL, 0, &w, &h, &v0, &m)) return;
+    }
+    if (!perf_pipeline()) return;
+    int w = 0, h = 0, margin = 0;
+    unsigned ver = g_po.ver;
+    uint64_t cap = g_perf[R.cur].size;
+    int r = perf_overlay_picture(g_perf[R.cur].buf ? g_perf[R.cur].mem.map : NULL, (size_t)cap, &w, &h, &ver, &margin);
+    if (r == -1) {                                 /* this slot's upload buffer is too small: a larger one, then again */
+        if (g_perf[R.cur].buf) { vkDestroyBuffer(V.device, g_perf[R.cur].buf, NULL); vmem_free(g_perf[R.cur].mem); }
+        g_perf[R.cur].size = (uint64_t)w * h * 4 * 2;
+        g_perf[R.cur].buf = vbuf_new(g_perf[R.cur].size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_perf[R.cur].mem);
+        r = perf_overlay_picture(g_perf[R.cur].mem.map, (size_t)g_perf[R.cur].size, &w, &h, &ver, &margin);
+    }
+    if (r <= 0 || w <= 0 || h <= 0) return;
+    if (w + margin > (int)V.extent.width || h + margin > (int)V.extent.height) return;
+    if (r == 2 && perf_image(w, h)) {              /* a new picture: into the image */
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = g_po.img;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+        b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        VkBufferImageCopy c;
+        memset(&c, 0, sizeof c);
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
+        c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(R.cmd, g_perf[R.cur].buf, g_po.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        g_po.ver = ver; g_po.w = w; g_po.h = h; g_po.margin = margin; g_po.have = 1;
+    }
+    if (!g_po.have) return;
+    if (g_po.wimg[index] != V.images[index]) {     /* this window image's view */
+        if (g_po.wview[index]) vkDestroyImageView(V.device, g_po.wview[index], NULL);
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = V.images[index]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = V.format.format; vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+        VKC(vkCreateImageView(V.device, &vi, NULL, &g_po.wview[index]));
+        g_po.wimg[index] = V.images[index];
+    }
+    {   /* the window image: from the blits into it (transfer) to a colour target, and back for what follows */
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = V.images[index];
         b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
-        b.srcAccessMask = b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        ca.imageView = g_po.wview[index]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea.offset.x = g_po.margin; ri.renderArea.offset.y = g_po.margin; ri.renderArea.extent.width = (uint32_t)g_po.w; ri.renderArea.extent.height = (uint32_t)g_po.h;
+        ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+        vkCmdBeginRendering(R.cmd, &ri);
+        VkViewport vp = {0, 0, (float)V.extent.width, (float)V.extent.height, 0, 1};
+        vkCmdSetViewport(R.cmd, 0, 1, &vp); vkCmdSetScissor(R.cmd, 0, 1, &ri.renderArea);
+        vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pipe);
+        vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pl, 0, 1, &g_po.set, 0, NULL);
+        float pc[6] = {(float)g_po.margin / (float)V.extent.width * 2 - 1, (float)g_po.margin / (float)V.extent.height * 2 - 1,
+                       (float)(g_po.margin + g_po.w) / (float)V.extent.width * 2 - 1, (float)(g_po.margin + g_po.h) / (float)V.extent.height * 2 - 1,
+                       (float)g_po.w / (float)g_po.iw, (float)g_po.h / (float)g_po.ih};
+        vkCmdPushConstants(R.cmd, g_po.pl, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+        vkCmdDraw(R.cmd, 4, 1, 0, 0);
+        vkCmdEndRendering(R.cmd);
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     }
-    vkCmdCopyBufferToImage(R.cmd, g_perf[R.cur].buf, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    R.pipe_bound = NULL; R.dyn_dirty = 1; R.vi_dirty = 1; R.dyn3_dirty = 1; g_dyn_inval = 1;      /* the game's draws set their own pipeline and states again */
 }
 static void overlay_draw(uint32_t index) {
     if (!g_menu.on) perf_draw(index);
@@ -4035,7 +4188,22 @@ swap: ;
              * waited for since: a slot is waited for before it records again), the last frame's main 3D pass */
             LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
             int kb = (int)((frame - NSLOT) & 15), kl = (int)((frame - 1) & 15), kn = (int)((frame + 1) & 15);
-            perf_overlay_frame(t_prev ? (double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart : 0, frame >= NSLOT ? g_po_gpu[kb] : -1.0f, g_po_vpw[kl], g_po_vph[kl]);
+            static LONG64 tm0[3], up0;
+            static const char *const k_present[4] = {"Immediate", "Mailbox", "VSync", "VSync, relaxed"};
+            double display_rate_hz(void);
+            double k = 1000.0 / (double)fq.QuadPart;
+            PerfFrame pf;
+            memset(&pf, 0, sizeof pf);
+            pf.wall_ms = t_prev ? (double)(t_now - t_prev) * k : 0; pf.gpu_ms = frame >= NSLOT ? g_po_gpu[kb] : -1.0f;
+            pf.replay_ms = (float)((double)(g_tm[3] - tm0[0]) * k); pf.pipe_wait_ms = (float)((double)(g_tm[5] - tm0[1]) * k); pf.shader_wait_ms = (float)((double)(g_tm[6] - tm0[2]) * k);
+            pf.uploads = (int)(R.uploads - up0);
+            tm0[0] = g_tm[3]; tm0[1] = g_tm[5]; tm0[2] = g_tm[6]; up0 = R.uploads;
+            pf.scene_w = g_po_vpw[kl]; pf.scene_h = g_po_vph[kl];
+            pf.win_w = (int)V.extent.width; pf.win_h = (int)V.extent.height;
+            if (vt) { pf.image_w = vt->w; pf.image_h = vt->h; pf.game_w = vt->rs ? (int)((float)vt->w / vt->sx + 0.5f) : vt->w; pf.game_h = vt->rs ? (int)((float)vt->h / vt->sy + 0.5f) : vt->h; }
+            pf.scale = rs_scale(); pf.scale_from = rs_from();
+            pf.rate_hz = (float)display_rate_hz(); pf.present = V.mode >= 0 && V.mode < 4 ? k_present[V.mode] : NULL;
+            if (perf_overlay_mode() != PERF_OFF) perf_overlay_frame(&pf);
             g_po_gpu[kb] = 0;
             g_po_vpdraws[kn] = 0; g_po_vpw[kn] = g_po_vph[kn] = 0;
         }
@@ -4258,6 +4426,12 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
     tc_shutdown();
     for (int i = 0; i < NSLOT; i++) if (g_perf[i].buf) { vkDestroyBuffer(V.device, g_perf[i].buf, NULL); vmem_free(g_perf[i].mem); g_perf[i].buf = NULL; g_perf[i].size = 0; }
+    perf_image(0, 0);                              /* the device is idle: the replaced picture image goes */
+    if (g_po.img) { vkDestroyImageView(V.device, g_po.view, NULL); vkDestroyImage(V.device, g_po.img, NULL); vmem_free(g_po.mem); }
+    if (g_po.pipe) vkDestroyPipeline(V.device, g_po.pipe, NULL);
+    if (g_po.pl) { vkDestroyPipelineLayout(V.device, g_po.pl, NULL); vkDestroyDescriptorPool(V.device, g_po.dp, NULL); vkDestroyDescriptorSetLayout(V.device, g_po.dsl, NULL); vkDestroySampler(V.device, g_po.smp, NULL); }
+    perf_views_drop();
+    memset(&g_po, 0, sizeof g_po);
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;

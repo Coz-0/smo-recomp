@@ -86,8 +86,8 @@ static const char *const k_default_ini =
 "\r\n"
 "; perf_overlay = off | fps | full\r\n"
 ";   The performance overlay in the window's corner at start; F10 cycles it while the game runs. fps: frames per second\r\n"
-";   and milliseconds. full: also a graph of the last frames, the GPU time of a frame, the size the game draws its 3D\r\n"
-";   scene at, CPU time of the main and render threads, slow frames, and the machine's CPU, memory and GPU.\r\n"
+";   and milliseconds. full: the machine's GPU, CPU and memory, a graph of the last frames, the render thread's work\r\n"
+";   and waits per frame, the GPU time of a frame, and the picture's sizes (the 3D scene's too), scaling and pacing.\r\n"
 "perf_overlay = off\r\n";
 
 #define GFX_LOW_SCALE 0.5f
