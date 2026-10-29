@@ -214,7 +214,8 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending, hm; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted; hm: it reads guest memory in place */
+static int g_hm_open;                              /* the command buffer being recorded reads guest memory in place (hm_ref) */
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -419,7 +420,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
     nvn_tl(15, (int)R.frame_draws);               /* SMO_FRAMETL: a submission, with the draws of the frame so far */
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
-    s->pending = 1; s->serial = ++R.serial;
+    s->pending = 1; s->serial = ++R.serial; s->hm = g_hm_open; g_hm_open = 0;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
@@ -670,6 +671,7 @@ static int hm_ref(uint64_t addr, uint64_t size, uint64_t align, VkBuffer *buf, u
     for (uint64_t p = o >> HM_PG, last = (o + size - 1) >> HM_PG; p <= last; p++) s->pg[p] = ser;
     s->used = ser;
     *buf = s->buf; *off = o; g_hm_b += (LONG64)size;
+    g_hm_open = 1;
     return 1;
 }
 /* The render thread is about to write [addr, addr + size) of guest memory: the command buffers that read it in place
@@ -3373,12 +3375,33 @@ static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) 
 /* A fence the GPU has passed may still cover compute results not yet copied back to guest memory: R.done also moves on
  * through waits that do not land them (the occlusion wait at the present, slot_wait in cmd_begin). The game reads what the
  * fence covers as soon as the wait returns, so what has finished is landed first (cb_poll never waits). */
-static LONG64 g_sync_pending_cb;
+static LONG64 g_sync_pending_cb, g_fence_late_n, g_fence_late_hm;
+static int fence_late_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_FENCE_LATE"); on = !(e && e[0] && !atoi(e)); } return on; }
 static void vk_sync_wait_(SyncJob *j) {
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
     if (want <= R.done) { if (g_cb_pending && g_cb_serial <= want) g_sync_pending_cb++; cb_poll(); j->result = 0; return; }
+    {   /* The game waits for the fence of the frame it has just submitted (every frame, with nothing else queued behind
+         * it), so its CPU and the GPU ran in series: the next frame's game work began only when the GPU had finished.
+         * Instead the wait is for the fence the previous wait deferred, and this one is deferred: the GPU keeps at most two
+         * frames of work and the game's next frame overlaps the GPU's (Link's Awakening Recomp, 13398126d6). What the GPU
+         * writes that the game reads after the fence (compute results, reports, occlusion counts) is then one frame later.
+         * Only waits with a timeout: a wait for ever (a server wait) or a poll is answered as before. SMO_VK_FENCE_LATE=0: as before.
+         * Not when a submission the game would be told has finished reads vertices or indices in place (SMO_VK_HOSTMEM): the
+         * game writes that memory as soon as the wait returns, while the GPU may still read it (measured in New Donk City:
+         * 37 517 such ranges written in a pass of 724 frames, 0 with the wait in full). */
+        static uint64_t deferred;
+        if (fence_late_on() && j->timeout && want > deferred) {
+            uint64_t prev = deferred;
+            deferred = want;
+            for (int i = 0; i < NSLOT && prev; i++) {
+                Slot *s = &R.slot[i];
+                if (s->pending && s->hm && s->serial > prev && s->serial <= want && vkGetFenceStatus(V.device, s->fence) != VK_SUCCESS) { prev = 0; g_fence_late_hm++; }
+            }
+            if (prev) { g_fence_late_n++; want = prev; if (want <= R.done) { j->result = 1; cb_poll(); return; } }
+        }
+    }
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
@@ -4004,6 +4027,7 @@ swap: ;
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
+        { static LONG64 fl_last, hm_last; if (g_fence_late_n != fl_last || g_fence_late_hm != hm_last) printf("nvn_vk_sync: frames %lld..%lld: %lld game fence waits answered with the previous wait's fence (SMO_VK_FENCE_LATE), %lld waited for in full (vertices read in place)\n", (long long)frame - 300, (long long)frame, (long long)(g_fence_late_n - fl_last), (long long)(g_fence_late_hm - hm_last)); fl_last = g_fence_late_n; hm_last = g_fence_late_hm; }
         { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         {   static LONG64 kl[5];
             double mb[5];
