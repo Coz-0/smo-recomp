@@ -662,16 +662,27 @@ static HSpan *hm_find(uint64_t addr, uint64_t size) {
     if (i < 0 || addr + size > g_hs[i]->hi) return NULL;
     return g_hs_last = g_hs[i];
 }
+/* What the game rewrites while the GPU may still read it is in GPU_UNCACHED pools: with the fence answered late
+ * (SMO_VK_FENCE_LATE) and every range read in place hashed at the answer and again when its submission had finished,
+ * every one of the 1 737 ranges the game rewrote in a New Donk City run (189 addresses, again and again) was in the one
+ * 8 MB pool of flags 0x12; none of the 3.5 million in the 212 GPU_CACHED pools. Those ranges are streamed (~86 KB a
+ * frame there), and a command buffer counts as reading memory the game may rewrite (Slot.hm: the fence is waited for in
+ * full) only when it reads such a range in place. SMO_VK_HM_DYNRING=0: read in place as the rest, as before. */
+static LONG64 g_hm_dyn_b;
+int nvn_pool_gpu_uncached(uint64_t addr, uint64_t size);      /* nvn_stub.c */
+static int hm_dynring(void) { static int on = -1; if (on < 0) on = !(getenv("SMO_VK_HM_DYNRING") && !atoi(getenv("SMO_VK_HM_DYNRING"))); return on; }
 /* A vertex or index range read in place: 1 with *buf, *off set; 0 when the ring streams it. */
 static int hm_ref(uint64_t addr, uint64_t size, uint64_t align, VkBuffer *buf, uint64_t *off) {
     if (g_hm_on <= 0) return 0;
     HSpan *s = hm_find(addr, size);
     uint64_t o = s ? addr - s->lo : 0, ser = R.serial + 1;
     if (!s || o % align) { g_hm_ring_b += (LONG64)size; return 0; }
+    int dyn = nvn_pool_gpu_uncached(addr, size);
+    if (dyn && hm_dynring()) { g_hm_ring_b += (LONG64)size; g_hm_dyn_b += (LONG64)size; return 0; }
     for (uint64_t p = o >> HM_PG, last = (o + size - 1) >> HM_PG; p <= last; p++) s->pg[p] = ser;
     s->used = ser;
     *buf = s->buf; *off = o; g_hm_b += (LONG64)size;
-    g_hm_open = 1;
+    if (dyn) g_hm_open = 1;
     return 1;
 }
 /* The render thread is about to write [addr, addr + size) of guest memory: the command buffers that read it in place
@@ -4040,6 +4051,7 @@ swap: ;
                        (long long)frame - 300, (long long)frame, (double)(g_hm_b - lb) / 300.0 / 1048576.0, (double)(g_hm_ring_b - lr) / 300.0 / 1048576.0, g_hs_n, (long long)g_hm_fail,
                        g_hm_made ? (double)g_hm_make_tk * 1000.0 / (double)hq.QuadPart / (double)g_hm_made : 0.0,
                        (double)(g_hm_waits - lw) / 300.0, (double)(g_hm_wait_tk - lwt) * 1000.0 / (double)hq.QuadPart / 300.0, (long long)(g_hm_submits - lsu));
+                { static LONG64 ld; if (g_hm_dyn_b != ld) printf("nvn_vk_hostmem: frames %lld..%lld: %.2f MB a frame of GPU_UNCACHED pools streamed instead of read in place (SMO_VK_HM_DYNRING)\n", (long long)frame - 300, (long long)frame, (double)(g_hm_dyn_b - ld) / 300.0 / 1048576.0); ld = g_hm_dyn_b; }
                 lb = g_hm_b; lr = g_hm_ring_b; lw = g_hm_waits; lwt = g_hm_wait_tk; lsu = g_hm_submits;
             }
         }

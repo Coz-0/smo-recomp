@@ -106,7 +106,31 @@ static void builder_get_device(Ctx *c) { RET(g_device); }
 static void pool_builder_get_memory(Ctx *c) { RET(nobj(A0)->memory); }
 static void pool_builder_get_size(Ctx *c) { RET(nobj(A0)->size); }
 static void pool_builder_get_flags(Ctx *c) { RET(nobj(A0)->flags); }
-static void pool_finalize(Ctx *c) { nvn_label_drop(A0); nobj_drop(A0); }
+/* the GPU_UNCACHED pools (NVN_MEMORY_POOL_FLAGS_GPU_UNCACHED, 0x10): what the game writes while the GPU may read it. The
+ * renderer streams vertex and index ranges in them instead of reading them in place (nvn_pool_gpu_uncached); few, so a scan */
+#define PDYN_MAX 64
+static struct { uint64_t key, mem, size; } g_pdyn[PDYN_MAX];
+static int g_pdyn_n;
+static SRWLOCK g_pdyn_lock = SRWLOCK_INIT;
+static void pdyn_add(uint64_t key, uint64_t mem, uint64_t size) {
+    AcquireSRWLockExclusive(&g_pdyn_lock);
+    if (g_pdyn_n < PDYN_MAX) { g_pdyn[g_pdyn_n].key = key; g_pdyn[g_pdyn_n].mem = mem; g_pdyn[g_pdyn_n++].size = size; }
+    else printf("nvn: more than %d GPU_UNCACHED pools: pool %llx is read in place by the renderer\n", PDYN_MAX, (unsigned long long)key);
+    ReleaseSRWLockExclusive(&g_pdyn_lock);
+}
+static void pdyn_drop(uint64_t key) {
+    AcquireSRWLockExclusive(&g_pdyn_lock);
+    for (int i = 0; i < g_pdyn_n; i++) if (g_pdyn[i].key == key) { g_pdyn[i] = g_pdyn[--g_pdyn_n]; break; }
+    ReleaseSRWLockExclusive(&g_pdyn_lock);
+}
+int nvn_pool_gpu_uncached(uint64_t addr, uint64_t size) {      /* does [addr, addr + size) overlap a GPU_UNCACHED pool */
+    int r = 0;
+    AcquireSRWLockShared(&g_pdyn_lock);
+    for (int i = 0; i < g_pdyn_n && !r; i++) r = addr < g_pdyn[i].mem + g_pdyn[i].size && g_pdyn[i].mem < addr + size;
+    ReleaseSRWLockShared(&g_pdyn_lock);
+    return r;
+}
+static void pool_finalize(Ctx *c) { pdyn_drop(A0); nvn_label_drop(A0); nobj_drop(A0); }
 static void obj_set_label(Ctx *c) { nvn_label_set(A0, A1 ? (const char *)(uintptr_t)A1 : ""); }
 /* FlushMappedRange(object, offset, size): the CPU wrote this range and the GPU must see it. Pool memory is ordinary host memory here,
  * so what has to be told is the backend, which keeps copies of textures. */
@@ -126,6 +150,7 @@ static void pool_initialize(Ctx *c) {
     NvnObj *p = nobj(A0), *b = nobj(A1);
     p->memory = b->memory; p->size = b->size; p->flags = b->flags;
     if (p->flags & 0x200) { pool_virtual_init(c, p); RET(1); return; }   /* NVN_MEMORY_POOL_FLAGS_VIRTUAL */
+    if (p->memory && p->size && (p->flags & 0x10)) pdyn_add(A0, p->memory, p->size);
     RET(1);
 }
 static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }
