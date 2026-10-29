@@ -33,6 +33,7 @@ VKD(X)
 static PFN_vkCmdSetVertexInputEXT vkCmdSetVertexInputEXT;
 static PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR;
 static PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
+static PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
 static PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
@@ -51,6 +52,7 @@ static struct {
     int has_dcc;                                   /* VK_EXT_depth_clip_control (NVN depth mode NEAR_IS_MINUS_W) */
     int has_emh; uint64_t emh_align;              /* VK_EXT_external_memory_host (SMO_VK_HOSTMEM) */
     VkPhysicalDeviceMemoryProperties mp;
+    int driver_id;                                  /* VkDriverId (0 = not told) */
 } D;
 /* NVN's depth mode is honoured, read when a pipeline is made (the game sets it on the device after nvnDeviceInitialize, which
  * may be after this backend starts). 0 = NEAR_IS_MINUS_W (OpenGL clip z -w..w, NVN's default) needs VK_EXT_depth_clip_control
@@ -82,6 +84,7 @@ static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = g
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
     void **tail;
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2");
+    vkGetPhysicalDeviceProperties2 = vk_sym("vkGetPhysicalDeviceProperties2");
     vkGetPhysicalDeviceFormatProperties = vk_sym("vkGetPhysicalDeviceFormatProperties");
     vkGetPhysicalDeviceMemoryProperties = vk_sym("vkGetPhysicalDeviceMemoryProperties");
     vkGetDeviceProcAddr = vk_sym("vkGetDeviceProcAddr");
@@ -107,6 +110,12 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     if (has_name(dext, ndext, "VK_EXT_external_memory_host")) { D.has_emh = 1; D.exts[D.next++] = "VK_EXT_external_memory_host"; }
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SMO_VK_PUSH") && !atoi(getenv("SMO_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
+    if (vkGetPhysicalDeviceProperties2) {                          /* which driver (Vulkan 1.2): the pipeline cache choice */
+        VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+        vkGetPhysicalDeviceProperties2(V.gpu, &p2);
+        D.driver_id = (int)dp.driverID;
+    }
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
     D.has_pv = D.has_pv && D.pv.provokingVertexLast; D.has_iu8 = D.has_iu8 && D.iu8.indexTypeUint8; D.has_plr = D.has_plr && D.plr.primitiveTopologyListRestart;
     D.has_dcc = D.has_dcc && D.dcc.depthClipControl;

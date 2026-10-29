@@ -1496,7 +1496,15 @@ static void prewarm_start(void) {
      * would serve the same pipelines, but it keeps one cache per executable, so an exe started under a new name (every
      * test copy's first run) would compile everything again (several minutes of every processor). SMO_VK_PCACHE=0 makes
      * pipelines without the object (nothing read or saved): 640 MB less for an exe whose name the driver has seen. */
-    if (getenv("SMO_VK_PCACHE") && !atoi(getenv("SMO_VK_PCACHE"))) printf("nvn_vk: SMO_VK_PCACHE=0: no pipeline cache object: pipelines are made without one (the driver's own disk cache, kept per executable, serves them); nothing is read or saved\n");
+    /* Mesa's drivers (RADV, ANV, NVK, Turnip...) keep their own disk cache for every program, not per executable: there
+     * the object only doubles it in memory. Measured with RADV (Radeon 660M, Cap Kingdom): without it the peak of the
+     * process is 235 MB lower (anonymous memory 669 -> 435 MB), the start 3.7-3.9 s shorter (the driver taking the
+     * 132 MB file in), the frame rate the same. SMO_VK_PCACHE=1 / 0 forces it either way. */
+    static const int k_mesa[] = {3, 6, 13, 18, 19, 20, 22, 23, 24, 26};   /* VkDriverId: RADV, ANV, llvmpipe, Turnip, V3DV, PanVK,
+                                                                         * Venus, Dozen, NVK, Honeykrisp (numbers: older SDK headers lack the names) */
+    int mesa = 0;
+    for (int i = 0; i < (int)(sizeof k_mesa / sizeof k_mesa[0]); i++) mesa |= D.driver_id == k_mesa[i];
+    if (getenv("SMO_VK_PCACHE") ? !atoi(getenv("SMO_VK_PCACHE")) : mesa) printf("nvn_vk: no pipeline cache object (%s): pipelines are made without one (the driver's own disk cache serves them); nothing is read or saved\n", getenv("SMO_VK_PCACHE") ? "SMO_VK_PCACHE=0" : "a Mesa driver: its disk cache is not per executable");
     else {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
