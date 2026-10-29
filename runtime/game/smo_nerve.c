@@ -55,6 +55,7 @@ static long long g_transitions, g_logged;
 static float g_player_pos[3];
 static int g_player_nrv = -1;
 static uint64_t g_player_actor;
+void ic_invalidate(void);                               /* hostrt.c: icache.h */
 int g_nerve_mode = -1;                                    /* hostrt.c call_indirect: -1 = not decided yet, 0 = off, 1 = on */
 
 static unsigned hash_addr(uint64_t a, unsigned n) { return (unsigned)(((a >> 2) * 0x9E3779B97F4A7C15ULL) >> 40) % n; }
@@ -116,6 +117,7 @@ static int nrv_index(uint64_t addr);
 
 static void nerve_add(uint64_t a, const char *nm) {
     if (g_nrv_count >= NRV_MAX) return;
+    ic_invalidate();                                      /* a new nerve: sites cached to it go back to call_indirect */
     g_nrv[g_nrv_count].addr = a;
     g_nrv[g_nrv_count].name = _strdup(nm);
     g_nrv[g_nrv_count].last_frame = -10;
@@ -245,7 +247,7 @@ static void nerve_init(void) {                           /* first indirect call 
     if (want) nerve_load();
     stage_list_init();
     MemoryBarrier();
-    g_nerve_mode = want && g_nrv_count > 0;
+    g_nerve_mode = want && g_nrv_count > 0; ic_invalidate();
 }
 
 static int nrv_index(uint64_t addr) {
@@ -405,7 +407,7 @@ int nerve_watch_set(const char *a, const char *b) {
     if (!found[0]) found[0] = found[1];                   /* call_indirect tests the first one first */
     if (!found[1]) found[1] = found[0];
     g_nerve_watch[1] = found[1];
-    g_nerve_watch[0] = found[0];
+    g_nerve_watch[0] = found[0]; ic_invalidate();
     return found[0] != 0;
 }
 
@@ -459,7 +461,7 @@ static void start_stage_init(void) {                      /* nerve_init: before 
         if (!GAME_VSYM_StageScene_init) printf("start stage: SMO_START_STAGE is set, but this build does not know StageScene::init (gen_tables.py): ignored\n");
         else {
             printf("start stage: the first stage scene will start %s (SMO_START_STAGE=%s, TEST ONLY)\n", g_start_stage, e);
-            g_stage_init = GAME_VSYM_StageScene_init;
+            g_stage_init = GAME_VSYM_StageScene_init; ic_invalidate();
         }
     }
     if (!l || !l[0]) return;
@@ -484,7 +486,7 @@ static void start_stage_init(void) {                      /* nerve_init: before 
     }
     printf("stage list: %d stages in one run (SMO_STAGE_LIST, TEST ONLY):", g_list_n);
     for (int i = 0; i < g_list_n; i++) printf(" %s%s", g_list[i].stage, i + 1 < g_list_n ? "," : "\n");
-    g_stage_init = GAME_VSYM_StageScene_init;             /* every StageScene::init, while the list lasts */
+    g_stage_init = GAME_VSYM_StageScene_init; ic_invalidate();             /* every StageScene::init, while the list lasts */
 }
 static void stage_list_init(void) {                       /* nerve_init, after the nerve list may have been loaded */
     if (!g_list_n) return;
@@ -536,7 +538,7 @@ void stage_list_seq_done(long long poll) {
     unsigned nvn_gl_held_ms(void);                        /* nvn_gl.c: held presents are not run time (boot.c) */
     g_list_tick = GetTickCount64() - nvn_gl_held_ms();
     InterlockedExchange(&g_list_state, LIST_ASKED);
-    g_stage_play = g_play_exec;
+    g_stage_play = g_play_exec; ic_invalidate();
     printf("stage list: stage %d of %d, %s, scenario %d%s%s: the game is asked to change stage at its next StageSceneNrvPlay (frame %lld)\n", k + 2, g_list_n,
            g_list[k + 1].stage, g_list[k + 1].scenario, g_list[k + 1].start[0] ? ", start " : "", g_list[k + 1].start, frame);
     fflush(stdout);
@@ -579,7 +581,7 @@ static uint64_t holder_of(uint64_t info) {
 /* hostrt.c call_indirect, on the thread that runs the stage scene: StageSceneNrvPlay's execute while a change is asked
  * for. The game's own calls are made with this thread's registers, which are put back before its call goes on. */
 void stage_play_hit(Ctx *c) {
-    g_stage_play = 0;
+    g_stage_play = 0; ic_invalidate();
     if (g_list_state != LIST_ASKED) return;
     int k = g_list_cur + 1;
     static __declspec(align(16)) unsigned char info[0x1000];     /* ChangeStageInfo: 0x278 bytes */
@@ -646,7 +648,7 @@ const char *stage_list_begun(void) {
     g_player_nrv = -1;
     g_nerve_lock = 0;
     if (g_nerve_mode == 0 && g_released >= 0 && g_nrv_count > 0) {
-        g_nerve_mode = 1;
+        g_nerve_mode = 1; ic_invalidate();
         printf("nerve: tracking resumes at frame %lld (a new stage of SMO_STAGE_LIST)\n", nvn_front_frame_next());
     }
     char key[32];
@@ -782,3 +784,6 @@ void nerve_report(FILE *out) {
     if (g_player_nrv >= 0)
         fprintf(out, "nerve: player last seen at %.1f %.1f %.1f in %s\n", g_player_pos[0], g_player_pos[1], g_player_pos[2], g_nrv[g_player_nrv].name);
 }
+
+/* icache.h (hostrt.c ic_fill): a site calling this address must keep going through call_indirect */
+int nerve_watches(uint64_t addr) { return nrv_index(addr) >= 0; }

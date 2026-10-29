@@ -34,16 +34,19 @@ void trace_printf(const char *fmt, ...) {
 /* guest address -> lifted function through a hash table built in runtime_init (open addressing, load below 1/2);
  * before that, and as the reference, the binary search over fn_table (sorted by address). Same answer either way. */
 static struct { uint64_t addr; void (*fn)(Ctx *); } *g_fn_hash;
+static int *g_fn_hidx;                            /* g_fn_hash slot -> fn_table index (ic_fill) */
 static unsigned g_fn_mask;
 static inline unsigned fn_hash(uint64_t addr) { return (unsigned)(((addr >> 2) * 0x9E3779B97F4A7C15ULL) >> 40); }
+static void ic_start(void);
 static void fn_hash_build(void) {
     unsigned size = 1024;
     while (size < (unsigned)fn_table_count * 2u) size <<= 1;
     g_fn_hash = calloc(size, sizeof *g_fn_hash);
+    g_fn_hidx = calloc(size, sizeof *g_fn_hidx);
     for (int i = 0; i < fn_table_count; i++) {
         unsigned h = fn_hash(fn_table[i].addr) & (size - 1);
         while (g_fn_hash[h].addr) h = (h + 1) & (size - 1);
-        g_fn_hash[h].addr = fn_table[i].addr; g_fn_hash[h].fn = fn_table[i].fn;
+        g_fn_hash[h].addr = fn_table[i].addr; g_fn_hash[h].fn = fn_table[i].fn; g_fn_hidx[h] = i;
     }
     g_fn_mask = size - 1;
 }
@@ -195,6 +198,32 @@ void nerve_call(Ctx *c, uint64_t addr);
 void nerve_watch_hit(void);
 void stage_init_hit(Ctx *c);
 void stage_play_hit(Ctx *c);
+
+/* icache.h: the slow way of a cached indirect call. The site's word is filled only for a function of main that no hook
+ * of call_indirect watches and while no mode of it is on; then the call goes on as any other. */
+extern volatile uint32_t *game_ic_epoch_p;            /* gamedll.c */
+void ic_invalidate(void) {                            /* a hook changed: every cached site is out of date */
+    if (game_ic_epoch_p && *game_ic_epoch_p) { uint32_t e = (*game_ic_epoch_p + 1) & 0xffff; *game_ic_epoch_p = e ? e : 1; }
+}
+static void ic_start(void) {                          /* SMO_ICACHE=0: off; macOS: off (call_indirect's safe point) */
+#ifndef __APPLE__
+    const char *e = getenv("SMO_ICACHE");
+    if (game_ic_epoch_p && !(e && e[0] && !atoi(e))) *game_ic_epoch_p = 1;
+#endif
+}
+void ic_fill(Ctx *c, uint64_t addr, uint64_t *site) {
+    uint32_t ep = game_ic_epoch_p ? *game_ic_epoch_p : 0;
+    int nerve_watches(uint64_t addr);                  /* smo_nerve.c: a nerve nerve_call tracks */
+    if (ep && g_fn_mask && !g_icall_mode && g_nerve_mode >= 0 && !(g_nerve_mode && nerve_watches(addr)) && addr - GUEST_BASE < IMAGE_SIZE &&
+        addr != g_nerve_watch[0] && addr != g_nerve_watch[1] && addr != g_stage_init && addr != g_stage_play) {
+        for (unsigned h = fn_hash(addr) & g_fn_mask; g_fn_hash[h].addr; h = (h + 1) & g_fn_mask)
+            if (g_fn_hash[h].addr == addr) {
+                if (g_fn_hidx[h] < 65536) __atomic_store_n(site, (addr - GUEST_BASE) << 32 | (uint64_t)g_fn_hidx[h] << 16 | (ep & 0xffff), __ATOMIC_RELAXED);
+                break;
+            }
+    }
+    call_indirect(c, addr);
+}
 
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
@@ -643,6 +672,7 @@ void runtime_init(const char *elf, const char *trace_path) {
     memcpy(g_by_host, fn_table, (size_t)fn_table_count * sizeof *g_by_host);
     qsort(g_by_host, (size_t)fn_table_count, sizeof *g_by_host, cmp_host);
     fn_hash_build();
+    ic_start();                                       /* icache.h: the per-site caches on (SMO_ICACHE=0: off) */
     {   const char *e = getenv("SMO_IMPORT_COUNTS"), *a = getenv("SMO_AUDIT_COUNTS");
         g_import_count_all = (e && e[0] && e[0] != '0') || (a && a[0]); }
     {   /* sanity: host code addresses must be strictly increasing after the sort */
