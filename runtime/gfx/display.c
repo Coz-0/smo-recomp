@@ -6,6 +6,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "perf_overlay.h"
 #include "gfx_options.h"
 
 #define A0 (c->x[0])
@@ -66,6 +67,7 @@ static int vsync_signal_ok(void) { return !g_menu_hold; }
  * same. Not set or 1 = nothing changes. (A lockstep clock, a refresh only once the game has queued a frame, never starts
  * this game: it waits for a refresh before its first frame.) */
 static double g_rate = 60.0;                          /* refreshes a second */
+double display_rate_hz(void) { return g_rate; }      /* the performance overlay's frame limit */
 static void speed_init(void) {
     const char *e = getenv("SMO_SPEED");
     if (!e || !e[0]) return;
@@ -138,6 +140,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_KEYDOWN && w == VK_F10 && !(l & (1 << 30))) { perf_overlay_toggle(); return 0; }     /* F10 = the performance overlay (perf_overlay.c) */
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) {      /* F12 = the console's Capture button (once per press) */
         void smo_capture_request(void);
         smo_capture_request();

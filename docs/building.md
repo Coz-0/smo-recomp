@@ -116,6 +116,14 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
   and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]`.
 - The Capture button: F12, or a pad's share button, saves the frame as a BMP in the save folder's `album`.
+- F10: the performance overlay in the window's top-left corner, cycling off, frame rate (frames per second and
+  milliseconds) and full: the panel of TotK recomp's overlay - the GPU's use, temperature, power, memory and clock (on
+  Linux with an AMD GPU), the CPU's and memory's use (the machine's and the game's), the frame rate with a graph of the
+  last 120 frames; per frame the render thread's replay of the game's commands, the GPU time, the waits for pipelines
+  and shaders, the texture uploads, the CPU time of the game's main thread and of the render thread, frames over 33 ms
+  in the last minute; and the picture: the window, the game's image and the size it is rendered at, the 3D scene the
+  game draws in it (it lowers it when the GPU falls behind), the scaling to the window, the frame limit and the present
+  mode. `perf_overlay = off | fps | full` in `graphics.ini` sets how it starts; screenshots never have it.
 - Translated shaders are cached in `build\cache\vk`. The first run compiles them as the game meets them and is slower;
   later runs reuse them.
 

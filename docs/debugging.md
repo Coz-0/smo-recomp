@@ -112,6 +112,8 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Speed
 
+- `SMO_PERF_OVERLAY=0|1|2` starts the performance overlay off, at frame rate or full, whatever `graphics.ini` says
+  (`runtime/gfx/perf_overlay.c`; F10 cycles it). The full overlay writes the renderer's timestamp queries while it is shown.
 - Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
   ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
   the GPU, present), `nvn_vk_hostmem:` (vertex and index data read in place from the game's heap or streamed, waits

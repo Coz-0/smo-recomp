@@ -180,10 +180,12 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
+static void perf_views_drop(void);                       /* nvn_vk_draw.c: the performance overlay's views of the window images */
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
+    perf_views_drop();
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
 }
@@ -374,6 +376,7 @@ int nvn_vk_init(void *hwnd) {
     uint32_t ndext = 512;
     r = vkEnumerateDeviceExtensionProperties(V.gpu, NULL, &ndext, dext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateDeviceExtensionProperties", r);
+    { void perf_overlay_set_gpu(const char *name); perf_overlay_set_gpu(V.props.deviceName); }      /* perf_overlay.c */
     printf("nvn_vk: using device %d: %s (loader Vulkan %u.%u.%u); extensions of the design:", best, V.props.deviceName, VK_API_VERSION_MAJOR(loader_version), VK_API_VERSION_MINOR(loader_version),
            VK_API_VERSION_PATCH(loader_version));
     for (unsigned i = 1; i < sizeof k_wanted / sizeof *k_wanted; i++) printf(" %s=%s", k_wanted[i] + 3, has_name(dext, ndext, k_wanted[i]) ? "yes" : "NO");
