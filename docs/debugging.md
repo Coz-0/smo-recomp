@@ -161,7 +161,7 @@ The end of every log has the counts that tell whether a run was healthy:
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
   by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_FENCE_LATE=0` (a game fence wait waits for that
-  very frame, not the one before), `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the GPU),
+  very frame, not the one before; with it on, a frame whose draws read vertices in place is waited for in full anyway), `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the GPU),
   `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream ring
   waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
   `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
