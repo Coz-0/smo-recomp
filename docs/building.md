@@ -73,6 +73,7 @@ compile    the lifted C -> objects (clang -O2, incremental)                     
 tables     generated headers and tables                                       tools/lifter/gen_tables.py, gen_sdktest.py
 sdk        the system-library functions that are lifted too                                  tools/lifter/sdklift.py
 link       host runtime + game library -> build/bin/smo_native.exe                           tools/lifter/build_exe.py
+shaders    every shader stage of the game to SPIR-V, into build/cache/vk      tools/lifter/precompile_shaders.py
 check      differential test against Unicorn, link check (on demand)        tools/lifter/difftest.py, linkcheck.py
 ```
 
@@ -116,8 +117,9 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
   and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]`.
 - The Capture button: F12, or a pad's share button, saves the frame as a BMP in the save folder's `album`.
-- Translated shaders are cached in `build\cache\vk`. The first run compiles them as the game meets them and is slower;
-  later runs reuse them.
+- Translated shaders are cached in `build\cache\vk`. The `shaders` step compiles every stage of the game to SPIR-V
+  there before the first run (compiling is nearly all of a stage's cost); what the game still meets for the first time
+  (other variants, pipelines, the driver's own compilation) is done in play and reused by later runs.
 
 The scripted Cap Kingdom run checks the game from a new save up to Mario's first capture:
 
