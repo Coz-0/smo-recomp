@@ -39,7 +39,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
+#else
+#include "win32_posix.h"
+/* every path of the __try / __except probe below returns; the one-pass loop of the macOS __try hides that */
+#pragma clang diagnostic ignored "-Wreturn-type"
+#endif
 #include <GL/gl.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -249,7 +256,9 @@ static Job *g_job_head, *g_job_tail;
 static HANDLE g_job_event, g_ready_event;
 static DWORD g_render_tid;
 static HWND g_hwnd;
+#ifdef _WIN32
 static HDC g_dc;
+#endif
 static __declspec(thread) HANDLE t_done;
 static void gl_housekeeping(void);
 static void (*pf_job_submit)(void *), (*pf_job_present)(void *);
@@ -1691,6 +1700,7 @@ static void pw_gate(void) {
     g_pw_gate_t0 = 0;
     printf("nvn_gl: shader preparation held the present of frame %lld for %.2f s (%lld jobs)%c", (long long)g_st.frames + 1, (double)(pf_now() - t0) / (double)freq, (long long)(g_shw_done - start_done), 10);
 }
+#ifdef _WIN32       /* the OpenGL renderer's shader workers: OpenGL contexts of their own (WGL) */
 static DWORD WINAPI shd_worker(LPVOID arg) {
     PIXELFORMATDESCRIPTOR pfd;
     (void)arg;
@@ -1755,6 +1765,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         free(j);
     }
 }
+#endif
 static void shd_workers_start(void) {
     const char *e = getenv("SMO_SHADER_WORKERS");
     g_shw_n = e ? atoi(e) : 3;
@@ -1764,7 +1775,9 @@ static void shd_workers_start(void) {
     for (int i = 0; i < 64; i++) InitializeCriticalSection(&g_pw_stripe[i]);
     if (!getenv("SMO_NO_SHADER_VARIANTS")) shv_load();
     g_shw_sem = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL);
+#ifdef _WIN32
     for (int i = 0; i < g_shw_n; i++) CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, NULL));
+#endif
 }
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
@@ -3668,13 +3681,78 @@ static void save_bmp(const char *path, Tex *t) {
 }
 
 /* Frame times (present to present) of the last 300 frames and CPU time per thread, printed with the frame-rate line. */
-#include <tlhelp32.h>
 static double g_pf_ft[300];
 static struct { DWORD tid; ULONGLONG cpu; } g_pf_thr[512];
 static int g_pf_nthr;
 static DWORD g_pf_main_tid;
 const char *guest_thread_name_of(DWORD tid);                             /* os_threads.c */
 static int pf_cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+#ifdef __linux__
+/* Linux: the threads of the process and their CPU time (/proc/self/task), as the Windows version below reads them */
+static void pf_threads(double frames) {
+    static DWORD tids[512];
+    static ULONG64 cpus[512];
+    struct { DWORD tid; double ms; } top[512];
+    int n = 0, nth = host_task_threads(tids, cpus, 512);
+    double total = 0;
+    for (int t = 0; t < nth; t++) {
+        DWORD tid = tids[t];
+        ULONGLONG cpu = cpus[t], prev = 0;
+        int i;
+        for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != tid; i++) {}
+        if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = tid; i = g_pf_nthr++; }
+        if (i < 512) g_pf_thr[i].cpu = cpu;
+        top[n].tid = tid; top[n].ms = (double)(cpu - prev) / 10000.0 / frames; total += top[n].ms; n++;
+    }
+    printf("nvn_perf: cpu ms/frame by thread (all %.1f):", total);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) if (top[i].ms > 0.05 && (best < 0 || top[i].ms > top[best].ms)) best = i;
+        if (best < 0) break;
+        const char *name = top[best].tid == g_render_tid ? "render(host)" : top[best].tid == g_pf_main_tid ? "main" : guest_thread_name_of(top[best].tid);
+        printf(" %s[%lu] %.1f", name ? name : "host", (unsigned long)top[best].tid, top[best].ms);
+        top[best].ms = 0;
+    }
+    printf("\n");
+}
+#elif !defined(_WIN32)
+/* macOS: the threads of the task and their CPU time (Mach), as the Windows version below reads them with a snapshot */
+#include <mach/mach.h>
+static void pf_threads(double frames) {
+    thread_act_array_t th;
+    mach_msg_type_number_t nth = 0;
+    struct { DWORD tid; double ms; } top[512];
+    int n = 0;
+    double total = 0;
+    if (task_threads(mach_task_self(), &th, &nth) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t t = 0; t < nth; t++) {
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        DWORD tid = (DWORD)th[t];
+        if (thread_info(th[t], THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS) {
+            ULONGLONG cpu = ((ULONGLONG)bi.user_time.seconds + (ULONGLONG)bi.system_time.seconds) * 10000000ull
+                          + ((ULONGLONG)bi.user_time.microseconds + (ULONGLONG)bi.system_time.microseconds) * 10ull, prev = 0;     /* 100 ns, as FILETIME */
+            int i;
+            for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != tid; i++) {}
+            if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = tid; i = g_pf_nthr++; }
+            if (i < 512) g_pf_thr[i].cpu = cpu;
+            if (n < 512) { top[n].tid = tid; top[n].ms = (double)(cpu - prev) / 10000.0 / frames; total += top[n].ms; n++; }
+        }
+        mach_port_deallocate(mach_task_self(), th[t]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)th, nth * sizeof *th);
+    printf("nvn_perf: cpu ms/frame by thread (all %.1f):", total);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) if (top[i].ms > 0.05 && (best < 0 || top[i].ms > top[best].ms)) best = i;
+        if (best < 0) break;
+        const char *name = top[best].tid == g_render_tid ? "render(host)" : top[best].tid == g_pf_main_tid ? "main" : guest_thread_name_of(top[best].tid);
+        printf(" %s[%lu] %.1f", name ? name : "host", (unsigned long)top[best].tid, top[best].ms);
+        top[best].ms = 0;
+    }
+    printf("\n");
+}
+#else
 static void pf_threads(double frames) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te;
@@ -3711,6 +3789,7 @@ static void pf_threads(double frames) {
     }
     printf("\n");
 }
+#endif
 static DWORD WINAPI pf_threads_thread(LPVOID arg) { for (;;) { WaitForSingleObject((HANDLE)arg, INFINITE); pf_threads(300.0); } }
 static void pf_frame_mark(LONG64 frame) {
     static LONG64 last, freq, snap[PF_N], snapn[PF_N], b0[3];
@@ -3830,7 +3909,9 @@ static void job_present(void *arg) {
         glClearColor(0, 0, 0, 1);                 /* nothing has been drawn into the presented texture yet */
         glClear(GL_COLOR_BUFFER_BIT);
     }
+#ifdef _WIN32
     { LONG64 pf1 = pf_now(); HS_IN("SwapBuffers", 0); SwapBuffers(g_dc); HS_OUT(); pf_add(PF_SWAP, pf1); }
+#endif
     pf_add(PF_PRESENT, pf0);
     pf_frame_mark(frame);
     g_joblog_cur = frame;
@@ -3912,7 +3993,6 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SMO_JOBLOG") ? atoi(getenv("SMO_JOBLOG")) : 0;
-    PIXELFORMATDESCRIPTOR pfd;
     g_render_tid = GetCurrentThreadId();
     if (g_vk) {                                 /* no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
         os_pin_render_thread();                 /* away from the console cores; with SMO_HOST_LAYOUT=1 on a core of its own (os_threads.c) */
@@ -3922,6 +4002,10 @@ static DWORD WINAPI render_thread(LPVOID arg) {
         render_loop();
         return 0;
     }
+#ifndef _WIN32
+    return 0;                                   /* macOS: never (nvn_gl_start chose Vulkan) */
+#else
+    PIXELFORMATDESCRIPTOR pfd;
     g_dc = GetDC(g_hwnd);
     memset(&pfd, 0, sizeof pfd);
     pfd.nSize = sizeof pfd; pfd.nVersion = 1;
@@ -3994,6 +4078,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     SetEvent(g_ready_event);
     render_loop();
     return 0;
+#endif
 }
 
 /* Called by display.c once the window exists. */
@@ -4004,6 +4089,10 @@ void nvn_gl_start(void *hwnd) {
         if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: SMO_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); ExitProcess(5); }
         /* VULKAN IS THE DEFAULT. SMO_RENDERER=gl|vk wins; else renderer = vulkan | opengl of config\graphics.ini. */
         g_vk = e && e[0] ? !strcmp(e, "vk") : !gfx_options()->renderer;
+#ifndef _WIN32
+        if (!g_vk) printf("nvn: the OpenGL renderer needs OpenGL 4.6 and NVIDIA's extensions, which macOS does not have: Vulkan instead\n");
+        g_vk = 1;
+#endif
         g_rb = g_vk ? &rb_vk : &rb_gl;
         printf("nvn: renderer: %s (%s)\n", g_vk ? "Vulkan (nvn_vk.c)" : "OpenGL (nvn_gl.c)", e && e[0] ? "SMO_RENDERER" : "graphics.ini; the default is Vulkan");
     }

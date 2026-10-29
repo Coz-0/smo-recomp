@@ -17,7 +17,17 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#ifdef _WIN32
 #include <windows.h>
+#define GLSL_LIB "smo_glslang.dll"
+#else
+#include "win32_posix.h"
+#ifdef __APPLE__
+#define GLSL_LIB "./libsmo_glslang.dylib"
+#else
+#define GLSL_LIB "./libsmo_glslang.so"
+#endif
+#endif
 #include <vulkan/vulkan.h>
 #include "mx_translate.h"
 
@@ -287,7 +297,7 @@ static int translate(const uint8_t *code, int len, int structured, MxOut *o) {
 int main(int argc, char **argv) {
     if (argc < 2) { printf("usage: mx_equiv <folder of vk_prog_*_1.bin> [max]\n"); return 2; }
     int max = argc > 2 ? atoi(argv[2]) : 1 << 30;
-    HMODULE m = LoadLibraryA("smo_glslang.dll");
+    HMODULE m = LoadLibraryA(GLSL_LIB);
     g_glsl = m ? (GlslFn)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_free = m ? (FreeFn)GetProcAddress(m, "smo_spirv_free") : NULL;
     if (!g_glsl) { printf("smo_glslang.dll not found (run from build\\bin)\n"); return 2; }
     vk_init();
@@ -308,6 +318,7 @@ int main(int argc, char **argv) {
         if (!ta || !tb) { untranslated++; goto next; }
         if (!strcmp(a.glsl, b.glsl)) { same_text++; goto next; }
         if (a.images || a.ssbos) { skipped++; goto next; }
+        if (getenv("MX_EQUIV_PROGRESS")) { fprintf(stderr, "testing %s\n", fd.cFileName); fflush(stderr); }     /* the stage a GPU hang names */
         {
             int ms = 0; for (int k = 0; k < a.nsmp; k++) if (strstr(a.smp[k].type, "2DMS")) ms = 1;
             if (ms) { skipped++; goto next; }

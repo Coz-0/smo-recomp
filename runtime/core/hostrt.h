@@ -6,15 +6,27 @@
 #include <stdarg.h>
 #include "runtime.h"
 
-#define GUEST_BASE 0x7100000000ULL
+/* Where the guest's modules are mapped: the console's own addresses on Windows. macOS keeps 0x70_0000_0000 ..
+ * 0x80_0000_0000 for malloc's heap range, so there everything is 0x10_0000_0000 higher (docs/macos-port.md). The lifted
+ * code is made for these bases: tools/target.py has the same numbers and image.h says which ones it was made for. */
+#ifdef __APPLE__
+#define GUEST_LAYOUT_SHIFT 0x1000000000ULL
+#else
+#define GUEST_LAYOUT_SHIFT 0ULL
+#endif
+#define GUEST_BASE (0x7100000000ULL + GUEST_LAYOUT_SHIFT)
+#define SDK_BASE (0x7500000000ULL + GUEST_LAYOUT_SHIFT)     /* the SDK module (sdklift_rt.c) */
 #include "image.h"               /* generated per build: tools/lifter/gen_tables.py */
-#define IMPORT_BASE 0x7300000000ULL      /* placeholder addresses for symbols of other modules */
+#if defined(GEN_GUEST_BASE) && (GEN_GUEST_BASE != GUEST_BASE || GEN_SDK_BASE != SDK_BASE)
+#error "build/gen/image.h was generated for other guest bases: run scripts/setup.py again on this system"
+#endif
+#define IMPORT_BASE (0x7300000000ULL + GUEST_LAYOUT_SHIFT)      /* placeholder addresses for symbols of other modules */
 #define IMPORT_SLOT 256ULL
 
 typedef void (*ImportFn)(Ctx *c);
 typedef struct { const char *name; ImportFn fn; } ImportDef;
 
-#define HOSTFN_BASE 0x7400000000ULL      /* placeholder addresses for host functions handed out at run time */
+#define HOSTFN_BASE (0x7400000000ULL + GUEST_LAYOUT_SHIFT)      /* placeholder addresses for host functions handed out at run time */
 
 uint64_t hostfn_address(const char *name, ImportFn fn);
 const char *hostfn_current_name(void);

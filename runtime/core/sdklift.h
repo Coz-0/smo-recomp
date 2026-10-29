@@ -7,7 +7,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 
-#define SDK_BASE 0x7500000000ULL          /* where the SDK image is mapped (text, rodata, data, bss) */
+/* SDK_BASE (hostrt.h): where the SDK image is mapped (text, rodata, data, bss) */
 #define SDK_IMAGE_SIZE SDK_IMAGE_SIZE_GEN     /* build/gen/image.h */
 
 typedef struct { uint64_t addr; void (*fn)(Ctx *); const char *name; } SdkFn;

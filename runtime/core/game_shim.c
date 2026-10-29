@@ -5,6 +5,9 @@
  * import from the exe, so the six host functions the lifted code calls are forwarded through
  * pointers the exe hands over once at start-up (gamedll.c). */
 #include "runtime.h"
+#ifndef _WIN32
+#include "win32_posix.h"       /* __declspec(dllexport / dllimport) */
+#endif
 
 typedef struct {
     void (*call_indirect)(Ctx *, uint64_t);

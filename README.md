@@ -1,6 +1,6 @@
 # smo-recomp
 
-A native Windows x64 version of *Super Mario Odyssey* (1.4.1), made by **static recompilation** of the Nintendo
+A native Windows x64 version of *Super Mario Odyssey* (1.3.0), made by **static recompilation** of the Nintendo
 Switch game, with its own runtime and a Vulkan renderer.
 
 It is **not an emulator**: there is no CPU interpreter and no JIT, and no console firmware runs. The game's AArch64
@@ -22,7 +22,7 @@ something was not checked, it says so.
 | Start | boot, title screen, file select, Resume: play begins (a scripted start reaches the game's play state at frame 3,564 with the warm shader cache) |
 | Cap Kingdom | `tests/run_cap_kingdom.py` plays from an empty save to Mario's first capture in Top-Hat Tower and checks 13 checkpoints against the game's own state: 13 of 13 (42,558 frames), 0 host exceptions, 0 Vulkan call failures, 0 operations not implemented |
 | Every stage and scenario | `tests/stress_stages.py` started every stage the game plays as a stage scene (176) and every scenario of every kingdom (100), each from a save made to start there, played for a few seconds at 4x speed: 276 runs, 2.1 million frames, 0 Vulkan call failures, 0 operations not implemented, 0 freezes, 0 audio drops. Cutscenes, the Labo VR stages and the world map have scenes of their own and were not started this way; Luigi's Balloon World and the Koopa races are started by their characters and cannot be started from a save |
-| Played by hand | from Cap Kingdom to Cascade Kingdom's first checkpoint, with an Xbox One controller¹; that save continues on 1.4.1 |
+| Played by hand | from Cap Kingdom to Cascade Kingdom's first checkpoint, with an Xbox One controller¹; that save continues on 1.3.0 |
 | Shaders | every stage in the game's shader files translates and compiles (Maxwell machine code → GLSL → SPIR-V), checked offline by `tests/check_all_shaders.py`: 27,888 of 27,888 distinct stages (7,381 vertex, 20,436 fragment, 3 geometry, 68 compute). The translator's structured control flow equals its reference form on the GPU: 1,519 of 1,519 stages over 6.2 million invocations¹ |
 | Picture | the texture layout equals the one Nintendo's tools stored for all 20,203 textures of the RomFS (`tests/bntx_layout_check.py`). 0 frames with a single-frame flash in captures of every frame while the camera pans in Cascade Kingdom¹. The Ruined Kingdom's lightning (a geometry stage) draws: each bolt brightens about 3,000 pixels before the game draws its clouds over it¹ |
 | Graphics memory | 1.4 GB at the end of the Cap Kingdom run, 2.0 GB in the Cookatiel rematch: textures the game gives up are freed once nothing names them |
@@ -36,9 +36,9 @@ something was not checked, it says so.
 | Save data | journalled like the console's (two-phase commit); the game's autosave and Resume work |
 | Speed | 60 fps, paced to a 60 Hz clock: at Cascade Kingdom's first checkpoint 59.8-60.0 fps in each of 20 windows of 300 frames (1% lows 49.4-56.0); the Cap Kingdom run averages 59.4 fps once play begins, lowest 49.5 while the tower stage loads. Development PC only |
 | Online | not available: the network services answer as a console without a network |
-| Not tried yet | what the 1.4.1 update adds: Balloon World, the new Snapshot Mode filters, the Labo VR mode |
+| Not tried yet | what the 1.3.0 update adds: Balloon World, the new Snapshot Mode filters, the Labo VR mode |
 
-¹ measured on the base game (1.0.0), before this project moved to 1.4.1; not measured again since.
+¹ measured on the base game (1.0.0), before this project moved to 1.3.0; not measured again since.
 
 ## How it works
 
@@ -57,7 +57,7 @@ something was not checked, it says so.
 
 - Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
   `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* dump at version 1.4.1: the program with the update, the RomFS with the update applied
+- Your own *Super Mario Odyssey* dump at version 1.3.0: the program with the update, the RomFS with the update applied
   and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
   the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
@@ -97,7 +97,7 @@ docs/             building, architecture, debugging, scripted runs
 - Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed
   `IPA`).
 - Other physical controllers (PlayStation, Switch Pro) and other GPUs (AMD, Intel).
-- What the 1.4.1 update adds: Balloon World, the Snapshot Mode filters, the Labo VR mode.
+- What the 1.3.0 update adds: Balloon World, the Snapshot Mode filters, the Labo VR mode.
 
 ## Contributing
 

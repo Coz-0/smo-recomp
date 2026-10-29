@@ -16,8 +16,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -101,15 +105,21 @@ static ULONG64 g_thr_cyc[256];
 
 static DWORD WINAPI watchdog(LPVOID arg) {
     (void)arg;
+#ifdef _WIN32
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+#endif
     LARGE_INTEGER prev, now;
     ULONG64 main_cyc = 0, rt_cyc = 0;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     QueryPerformanceCounter(&prev);
     for (;;) {
+#ifdef _WIN32
         LARGE_INTEGER due;
         due.QuadPart = -10000;                    /* 1 ms */
         if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep(1);
+#else
+        Sleep(1);                                 /* nanosleep: 1 ms without a timer object */
+#endif
         QueryPerformanceCounter(&now);
         double dt = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
         prev = now;

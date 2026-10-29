@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T                                   # noqa: E402
-SDK_BASE = 0x7500000000
+SDK_BASE = T.SDK_BASE
 os.environ['RECOMP_ELF'] = T.elf('sdk')
 os.environ['RECOMP_FUNCS'] = T.build('functions', 'sdk_functions.tsv')
 os.environ['RECOMP_BASE'] = hex(SDK_BASE)
