@@ -112,6 +112,8 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Speed
 
+- `SMO_PERF_OVERLAY=0|1|2` starts the performance overlay off, at frame rate or full, whatever `graphics.ini` says
+  (`runtime/gfx/perf_overlay.c`; F10 cycles it). The full overlay writes the renderer's timestamp queries while it is shown.
 - Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
   ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
   the GPU, present), `nvn_vk_hostmem:` (vertex and index data read in place from the game's heap or streamed, waits
@@ -315,11 +317,13 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_VK_RTLOG=1` logs every new size of image that can be a render target, once: the game's size, format, target,
   layers, samples and mip levels, and the image's size; at exit, `nvn_vk_rt:` lines give every render-target size a
   pass began with, its formats and how many passes used it.
-- Internal resolution scale (`resolution_scale` in `graphics.ini`, 0.25 to 1.0, Vulkan only; `SMO_VK_SCALE=<scale>`
-  wins for a run): the game's screen-sized targets (about 16:9, `rs_screen_class` in `nvn_vk_draw.c`) are made at that
+- Internal resolution scale (`resolution_scale` in `graphics.ini`, 0.25 to 1.0 or `auto`, Vulkan only;
+  `SMO_VK_SCALE=<scale>` wins for a run; `auto` takes the window's size at start, at most 1.0): the game's screen-sized targets (about 16:9, `rs_screen_class` in `nvn_vk_draw.c`) are made at that
   scale. The log's `nvn_vk_scale:` lines give the scale and the window picture's size at start, and at exit the images
   made scaled, the fragment stages translated for it and the uploads, read-backs and copies that touched a scaled
-  image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size.
+  image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size. F9 / Shift+F9 change the
+  scale while the game runs (`rs_apply`: a `nvn_vk_scale: F9:` line with the scale and the images let go);
+  `SMO_VK_F9_AT=<frame>[,<frame>...]` (test) presses F9 after those frames.
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
   focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
   the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.

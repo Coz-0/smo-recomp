@@ -233,6 +233,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
         call_guest(&c, fn);
     }
 
+    { void perf_overlay_main_here(void); perf_overlay_main_here(); }      /* perf_overlay.c: the main thread's CPU time */
     printf("[phase 3] nnMain\n");
     trace_printf("=== phase 3: nnMain\n");
     call_guest(&c, NN_MAIN);
