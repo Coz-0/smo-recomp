@@ -68,34 +68,15 @@ void print_devinfo_summary(FILE *out) {
 }
 
 /* ---- memory pools and buffers: the game supplies the memory, so mapping must work for real.
- * Guest objects are opaque; what each one refers to is kept in a side table keyed by address. */
-typedef struct NvnObj { uint64_t key, memory, size, pool, offset, flags; struct NvnObj *next; } NvnObj;
-/* Looked up on every nvnBufferGetAddress and the like (about 8% of the main thread's busy time in New Donk City with one
- * exclusive lock and 4096 buckets): a shared lock for the lookup, the exclusive one only to add, 65536 buckets. */
-#define NOBJ_N 65536
-static NvnObj *g_objs[NOBJ_N];
-static SRWLOCK g_objs_lock = SRWLOCK_INIT;
-static NvnObj *nobj(uint64_t key) {
-    unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
-    AcquireSRWLockShared(&g_objs_lock);
-    NvnObj *o = g_objs[h];
-    while (o && o->key != key) o = o->next;
-    ReleaseSRWLockShared(&g_objs_lock);
-    if (o) return o;
-    AcquireSRWLockExclusive(&g_objs_lock);
-    o = g_objs[h];
-    while (o && o->key != key) o = o->next;
-    if (!o) { o = calloc(1, sizeof *o); o->key = key; o->next = g_objs[h]; g_objs[h] = o; }
-    ReleaseSRWLockExclusive(&g_objs_lock);
-    return o;
-}
-static void nobj_drop(uint64_t key) {                                   /* the object is finalized: forget what it referred to */
-    unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
-    AcquireSRWLockExclusive(&g_objs_lock);
-    for (NvnObj **pp = &g_objs[h]; *pp; pp = &(*pp)->next)
-        if ((*pp)->key == key) { NvnObj *o = *pp; *pp = o->next; free(o); break; }
-    ReleaseSRWLockExclusive(&g_objs_lock);
-}
+ * What the runtime keeps of each object lives in the object itself: the opaque storage the game reserves for it, as the
+ * driver's own state does on the console (and as nvn_gl.c's hnew does for textures and command buffers). Sizes from the
+ * SDK's nvn.h: NVNmemoryPoolBuilder 0x40, NVNmemoryPool 0x100, NVNbufferBuilder 0x40, NVNbuffer 0x30 bytes. A getter
+ * such as nvnBufferGetAddress is then one load: it was a lookup in a global hash under a lock. */
+typedef struct NvnObj { uint64_t memory, size, pool, offset, flags; } NvnObj;
+_Static_assert(sizeof(NvnObj) <= 0x30, "NvnObj must fit in the smallest NVN object it is kept in (NVNbuffer, 0x30 bytes)");
+static NvnObj g_no_obj;                                                  /* what a null pool refers to: nothing */
+static NvnObj *nobj(uint64_t key) { return key ? (NvnObj *)(uintptr_t)key : &g_no_obj; }
+static void nobj_drop(uint64_t key) { if (key) memset(nobj(key), 0, sizeof(NvnObj)); }   /* the object is finalized */
 void nvn_label_set(uint64_t obj, const char *text);                    /* nvn_gl.c */
 void nvn_label_drop(uint64_t obj);
 void nvn_gl_memory_written(uint64_t addr, uint64_t size);
@@ -120,12 +101,12 @@ static void buffer_finalize(Ctx *c) { nvn_label_drop(A0); nobj_drop(A0); }
 static void obj_debug_id(Ctx *c) { RET(A0); }
 static void pool_builder_storage(Ctx *c) { log_call(c); NvnObj *b = nobj(A0); b->memory = A1; b->size = A2; }   /* (builder, memory, size) */
 static void pool_builder_flags(Ctx *c) { nobj(A0)->flags = A1; }                                               /* (builder, flags) */
-static void pool_virtual_init(Ctx *c, NvnObj *p);            /* below */
+static void pool_virtual_init(Ctx *c, uint64_t key, NvnObj *p);  /* below */
 static void pool_initialize(Ctx *c) {
     log_call(c);
     NvnObj *p = nobj(A0), *b = nobj(A1);
-    p->memory = b->memory; p->size = b->size; p->flags = b->flags;
-    if (p->flags & 0x200) { pool_virtual_init(c, p); RET(1); return; }   /* NVN_MEMORY_POOL_FLAGS_VIRTUAL */
+    p->memory = b->memory; p->size = b->size; p->flags = b->flags; p->pool = p->offset = 0;
+    if (p->flags & 0x200) { pool_virtual_init(c, A0, p); RET(1); return; }   /* NVN_MEMORY_POOL_FLAGS_VIRTUAL */
     RET(1);
 }
 static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }
@@ -219,18 +200,18 @@ static int vp_map_view(Ctx *c, VPool *v, VpSeg *s) {
     if (r != (PVOID)(uintptr_t)(v->base + s->start)) vp_fail(c, "MapViewOfFile3", v->base + s->start, s->size);
     return 1;
 }
-static void pool_virtual_init(Ctx *c, NvnObj *p) {
+static void pool_virtual_init(Ctx *c, uint64_t key, NvnObj *p) {
     vp_load(c);
     if (p->memory) vp_fail(c, "a virtual pool was given memory of its own", p->memory, p->size);
     if (!p->size || p->size % VP_GRAN) vp_fail(c, "virtual pool size is not a multiple of 64 KB", p->size, 0);
     PVOID base = p_VirtualAlloc2(GetCurrentProcess(), NULL, (SIZE_T)p->size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
     if (!base) vp_fail(c, "placeholder reservation", p->size, 0);
     VPool *v = calloc(1, sizeof *v);
-    v->key = p->key; v->base = (uint64_t)(uintptr_t)base; v->size = p->size;
+    v->key = key; v->base = (uint64_t)(uintptr_t)base; v->size = p->size;
     v->nseg = 1; v->seg[0].start = 0; v->seg[0].size = p->size;
     AcquireSRWLockExclusive(&g_vp_lock); v->next = g_vpools; g_vpools = v; ReleaseSRWLockExclusive(&g_vp_lock);
     p->memory = v->base;
-    printf("nvn: virtual memory pool %llx: 0x%llx bytes at %llx (placeholder)\n", (unsigned long long)p->key, (unsigned long long)p->size, (unsigned long long)v->base);
+    printf("nvn: virtual memory pool %llx: 0x%llx bytes at %llx (placeholder)\n", (unsigned long long)key, (unsigned long long)p->size, (unsigned long long)v->base);
 }
 static void pool_map_virtual(Ctx *c) {
     log_call(c);
@@ -330,7 +311,7 @@ static void buffer_initialize(Ctx *c) {                              /* (buffer,
     NvnObj *buf = nobj(A0), *b = nobj(A1);
     vp_note_use(b->pool);
     buf->memory = nobj(b->pool)->memory + b->offset;
-    buf->size = b->size; buf->pool = b->pool; buf->offset = b->offset;
+    buf->size = b->size; buf->pool = b->pool; buf->offset = b->offset; buf->flags = 0;
     RET(1);
 }
 static void buffer_map(Ctx *c) { log_call(c); RET(nobj(A0)->memory); }
