@@ -177,7 +177,7 @@ class Env(R.Env):
         return 'f_%x(c);' % addr
 
 
-TAILS = ('return;', 'goto', '{ jt', '{ f_', '{ sdk_host_call', '{ sdk_trap_call', '{ sdk_longjmp', 'guest_trap')
+TAILS = ('return;', 'goto', '{ jt', '{ uint64_t jt', '{ f_', '{ sdk_host_call', '{ sdk_trap_call', '{ sdk_longjmp', 'guest_trap')
 
 
 CODE_SLOT_KEYS = None
