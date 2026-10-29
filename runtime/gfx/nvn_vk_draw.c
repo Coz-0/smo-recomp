@@ -787,6 +787,11 @@ static float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
+        if (v <= 0) {                              /* auto: the window's size (the swapchain is made before the first image), so no pixel is drawn only to be scaled down */
+            float sw = (float)V.extent.width / 1600.0f, sh = (float)V.extent.height / 900.0f;
+            v = sw < sh ? sw : sh;
+            if (v <= 0) v = 1.0f;
+        }
         if (v < 0.25f) v = 0.25f;
         if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
         g_rs = v;
@@ -4366,7 +4371,7 @@ static void vkd_init(void) {
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SMO_VK_DEBUG=1)");
     if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at that scale (the window's picture %d x %d instead of 1600 x 900); fragment stages are another translation\n",
-                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : "graphics.ini", (int)(1600.0f * rs_scale() + 0.5f), (int)(900.0f * rs_scale() + 0.5f));
+                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : gfx_options()->scale > 0 ? "graphics.ini" : "graphics.ini: auto, the window's size", (int)(1600.0f * rs_scale() + 0.5f), (int)(900.0f * rs_scale() + 0.5f));
     fflush(stdout);
 }
 static int frstat_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }

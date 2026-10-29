@@ -56,11 +56,12 @@ static const char *const k_default_ini =
 ";   What nn::oe::GetOperationMode answers. Leave it at docked: handheld is not measured on PC.\r\n"
 "console_mode = docked\r\n"
 "\r\n"
-"; resolution_scale = 1.0\r\n"
-";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is\r\n"
-";   1600x900). 0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the\r\n"
-";   2D interface too (it gets softer), and is scaled to the window size.\r\n"
-"resolution_scale = 1.0\r\n"
+"; resolution_scale = auto | 0.25 .. 1.0\r\n"
+";   Internal resolution scale (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is 1600x900).\r\n"
+";   0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the 2D\r\n"
+";   interface too (it gets softer), and is scaled to the window size. auto: the window's size at start, at most\r\n"
+";   1.0 (a 1280x720 window: 0.8), so no pixel is drawn only to be scaled down.\r\n"
+"resolution_scale = auto\r\n"
 "\r\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
 ";   game: each texture sampler keeps the value the game gave it. A number: at least that much on every sampler that\r\n"
@@ -124,7 +125,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 3;
+    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -148,7 +149,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "vsync")) o->present = !_stricmp(val, "on") ? 1 : !_stricmp(val, "off") ? 2 : !_stricmp(val, "mailbox") ? 3 : 0;
         else if (!_stricmp(key, "gpu")) { if (_stricmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
         else if (!_stricmp(key, "console_mode")) o->handheld = !_stricmp(val, "handheld");
-        else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
+        else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (!_stricmp(val, "auto")) o->scale = 0.0f; else if (v > 0) o->scale = v; }
         else if (!_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "perf_overlay")) o->perf_overlay = !_stricmp(val, "full") ? 2 : !_stricmp(val, "fps") ? 1 : 0;
@@ -164,12 +165,14 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s perf_overlay=%s%s\n", o->path,
+    char scale[16];
+    if (o->scale > 0) snprintf(scale, sizeof scale, "%.2f", o->scale); else snprintf(scale, sizeof scale, "auto");
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%s anisotropic_filtering=%d frame_time_overlay=%s perf_overlay=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height,
-           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->perf_overlay == 2 ? "full" : o->perf_overlay ? "fps" : "off",
+           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", scale, o->aniso, o->overlay ? "on" : "off", o->perf_overlay == 2 ? "full" : o->perf_overlay ? "fps" : "off",
            unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->scale != 1.0f && o->scale > 0 && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
     return TRUE;
 }
