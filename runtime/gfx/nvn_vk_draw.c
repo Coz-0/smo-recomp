@@ -759,8 +759,32 @@ struct VTex {
     uint32_t lvl_drawn[16];                        /* per mip level, the pass that last drew into it: which way a chain over its levels goes */
     int rs; float sx, sy;                          /* rs = 1 when the image is smaller than the game's texture (w, h are the image's; sx, sy = image / game) */
     int storage;                                   /* made with VK_IMAGE_USAGE_STORAGE_BIT (NVN_TEXTURE_FLAGS_IMAGE): it can be bound as an image */
+    int nvf; VkFormat vf[2];                       /* format list (fl_on): the only formats its views may have; 0: any */
     VView *views; VTex *next, *prev;
 };
+/* ---- format lists on render targets. A colour image is made MUTABLE_FORMAT so views of other formats work (NVN texture
+ * views). Mesa's AMD driver keeps DCC (colour compression) before RDNA3 only when the image lists its view formats
+ * (radv_are_formats_dcc_compatible): without a list every render target is uncompressed and every clear writes the whole
+ * image. So a target lists its own format and its sRGB / UNORM twin (none: not mutable at all), as LAS Recomp 03ee802f
+ * and Savage Wind #154; a view of any other format gets the image's own (logged). Not on storage images, which are bound
+ * through views of other formats. On by default on integrated GPUs; SMO_VK_FORMAT_LIST=0 / 1 turns it off / on. */
+static LONG64 g_fl_images, g_fl_fixed, g_fl_refused;
+static int fl_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_VK_FORMAT_LIST"); on = e ? atoi(e) != 0 : V.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU; }
+    return on;
+}
+static VkFormat srgb_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
  * A texture of the screen class (2D, one layer, attachable, the game's size about 16:9: rs_screen_class) gets an image
  * of round(size * scale); everything the game says in ITS pixels about such an image is converted where it is used:
@@ -1185,6 +1209,14 @@ static VTex *vt_get2(Tex *t, int sync) {
             ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; vt->storage = 1; g_storage_tex++;
             if (!fmt_supported(vt->fmt, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) ci.flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;      /* bound through a view of another format (sRGB, r32ui on r32f) */
         }
+        VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        if (can_color && !vt->storage && fl_on()) {
+            vt->vf[0] = vt->fmt; vt->vf[1] = srgb_twin(vt->fmt);
+            vt->nvf = vt->vf[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
+            if (vt->nvf == 1) { ci.flags &= ~(VkFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; g_fl_fixed++; }
+            else { fl.viewFormatCount = 2; fl.pViewFormats = vt->vf; ci.pNext = &fl; }
+            g_fl_images++;
+        }
         if (ci.imageType == VK_IMAGE_TYPE_2D && vt->w == vt->h && vt->layers >= 6 && vt->samples == 1) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         if (vt->is3d && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;      /* its slices can be render targets */
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1332,6 +1364,10 @@ static VView *vt_vview(VTex *vt, const EView *e, int dim, int attach) {
     n->e = *e; n->vtype = dim; n->attach = attach;
     ci.image = vt->img; ci.format = vt->fmt;
     if (e->format != vt->t->b.format && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !vt->decode && !vt->expand) { VkFormat f = tex_vkfmt(e->format, &ex, &dec); if (f && !ex && !dec && fmt_aspect(f) == VK_IMAGE_ASPECT_COLOR_BIT) ci.format = f; }
+    if (vt->nvf && ci.format != vt->vf[0] && (vt->nvf < 2 || ci.format != vt->vf[1])) {      /* not in the image's format list */
+        if (g_fl_refused++ < 10) printf("nvn_vk_fl: frame %lld: a view of format %d of a render target of format %d (not in its list): its own format instead\n", (long long)g_cur_frame, (int)ci.format, (int)vt->fmt);
+        ci.format = vt->fmt;
+    }
     if (attach) {
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D; ci.subresourceRange.aspectMask = vt->aspect;
         ci.subresourceRange.baseMipLevel = (uint32_t)e->lvl0; ci.subresourceRange.levelCount = 1; ci.subresourceRange.baseArrayLayer = (uint32_t)e->lay0; ci.subresourceRange.layerCount = 1;
@@ -4170,6 +4206,7 @@ static void vkd_shutdown(void) {
     if (!R.ring) return;
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double k = 1000.0 / (double)fq.QuadPart;
+        printf("nvn_vk_fl: format lists %s: %lld render targets with one (%lld of them not mutable: no sRGB / UNORM twin), %lld views given the image's own format\n", fl_on() ? "on" : "off (SMO_VK_FORMAT_LIST=1 turns them on)", (long long)g_fl_images, (long long)g_fl_fixed, (long long)g_fl_refused);
         printf("nvn_vk_tex: textures made ahead of their first use: %lld (%.0f MB, %.0f ms in all, at most %.1f ms after one present); made or read at their use: %lld times, %.0f ms (of them in scene frames: %lld, %.0f ms)\n",
                (long long)g_ta_n, (double)g_ta_bytes / 1048576.0, (double)g_ta_tk * k, (double)g_ta_max_tk * k, (long long)g_late_n, (double)g_late_tk * k, (long long)g_late_scene_n, (double)g_late_scene_tk * k);
     }
