@@ -36,6 +36,8 @@ typedef struct {
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
+    int sh_vk;                          /* [hotkeys] shake: virtual key, 0 = none */
+    unsigned sh_combo;                  /* [hotkeys] shake_pad: Pro button bits, 0 = none */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -170,6 +172,11 @@ static const char *const g_default_ini =
 "; no combination. Without this section: F1 and STICK_L+STICK_R (both sticks pressed in).\r\n"
 "amiibo_menu = F1\r\n"
 "amiibo_menu_pad = STICK_L+STICK_R\r\n"
+"; Shaking the controller (the frog's high jump, a spin throw of the cap, ...) for a pad without motion sensors and for the\r\n"
+"; keyboard: while held, the game reads a controller shaken side to side. A pad with sensors shakes for real as well.\r\n"
+"; The game never asks for the left stick to be pressed in. Without these lines: SPACE and STICK_L.\r\n"
+"shake = SPACE\r\n"
+"shake_pad = STICK_L\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
@@ -198,6 +205,8 @@ static void cfg_defaults(Cfg *c) {
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->hk_vk = VK_F1;
     c->hk_combo = 1u << 4 | 1u << 5;                      /* STICK_L + STICK_R */
+    c->sh_vk = VK_SPACE;
+    c->sh_combo = 1u << 4;                                /* STICK_L */
 }
 static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -> Pro button bits; none / unknown names -> 0 */
     unsigned bits = 0;
@@ -302,6 +311,8 @@ static void cfg_parse(Cfg *c, char *text) {
         } else if (sect == 5) {
             if (!_stricmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
             else if (!_stricmp(key, "amiibo_menu_pad")) c->hk_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
+            else if (!_stricmp(key, "shake")) c->sh_vk = parse_vk(val);
+            else if (!_stricmp(key, "shake_pad")) c->sh_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
         }
     }
 }
@@ -691,11 +702,15 @@ int nnpad_kb_vk(int idx) {
 }
 int nnpad_hotkey_vk(int which) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
-    return which == 0 ? g_cfg.hk_vk : 0;
+    return which == 0 ? g_cfg.hk_vk : which == 1 ? g_cfg.sh_vk : 0;
 }
 unsigned nnpad_hotkey_combo(void) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return g_cfg.hk_combo;
+}
+unsigned nnpad_shake_combo(void) {
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    return g_cfg.sh_combo;
 }
 
 /* ================================================================ tools: --pad-test, --pad-map */
@@ -1030,6 +1045,22 @@ int nnpad_selftest(const NnHidHooks *h) {
         settle();
         h->six(0, a, g, &rest);
         check(fabsf(fabsf(g[2]) - 1.0f) < 0.01f && !rest, "six-axis: a turn of 2*pi rad/s arrives as 1 revolution/s, not at rest");
+        /* the shake buttons ([hotkeys] shake_pad, default STICK_L): read as a controller shaken side to side */
+        int amiibo_menu_take_request(void);
+        gy[2] = 0;
+        SDL_SendJoystickVirtualSensorData(js[0], SDL_SENSOR_GYRO, SDL_GetTicksNS(), gy, 3);
+        check(nnpad_hotkey_vk(1) == VK_SPACE && nnpad_shake_combo() == 1u << 4, "[hotkeys] defaults: the shake on SPACE and on STICK_L");
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, true); settle(); h->state(0, &btn, st, &attr);
+        h->six(0, a, g, &rest);
+        int shook = fabsf(fabsf(a[0]) - 3.0f) < 0.01f && fabsf(a[2] + 1.0f) < 0.01f && !rest;
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, true); settle(); h->state(0, &btn, st, &attr);
+        h->six(0, a, g, &rest);
+        int menu_still = fabsf(a[0]) < 0.01f && rest;
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6); settle(); h->state(0, &btn, st, &attr);
+        h->six(0, a, g, &rest);
+        check(shook && menu_still && fabsf(a[0]) < 0.01f && rest, "shake buttons: STICK_L held = +-3 G on x and not at rest; not with the amiibo menu's STICK_L+STICK_R; still again when let go");
+        amiibo_menu_take_request();
     }
     h->vibrate(0, 0, 0);
 

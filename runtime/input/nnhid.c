@@ -47,7 +47,7 @@ static int scripted(int vk) {
  * "<second>[+<duration>]:<keys>", duration 0.15 s by default, keys held together. Key characters are the
  * keyboard keys of the mapping above (Z X C V Q E A S I J K L), '!' = Enter (Plus), '-' = Backspace (Minus),
  * lower-case u d l r = the arrow keys (left stick) and the digits 8 2 4 6 = right stick up, down, left, right (SMO),
- * '*' = the amiibo menu's key (SMO, smo_amiibo.c). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
+ * '*' = the amiibo menu's key (SMO, smo_amiibo.c), '~' = shaking the controller (VK_SHAKE). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
  * Each step is announced on stdout when it starts, so it can be matched against the frame log. */
 #define SCRIPT_MAX 256
 static struct { double at, len; char keys[12]; int said; } g_script[SCRIPT_MAX];
@@ -63,6 +63,7 @@ static int script_vk(char k) {
     case 'l': return VK_LEFT;
     case 'r': return VK_RIGHT;
     case '*': return 0x101;                                   /* VK_AMIIBO_MENU (below) */
+    case '~': return 0x102;                                   /* VK_SHAKE (below) */
     default: return k;
     }
 }
@@ -791,6 +792,29 @@ static void menu_after(uint32_t id, uint64_t *buttons, int *lx, int *ly) {
 }
 void hid_amiibo_hold_after(long long frame, long reads) { g_hold_reads = reads; g_hold_on = 0; g_hold_after = frame; }
 
+/* ---- shaking without a motion sensor (the frog's high jump: "shake the controller").
+ * While the shake key (controllers.ini [hotkeys] shake, default SPACE, for the keyboard's player), the shake buttons
+ * (shake_pad, default STICK_L, held on any pad; not while the amiibo menu's combination is held) or '~' of a test
+ * sequence (player 1) is held, the player's six-axis records read a controller shaken side to side: +-3 G on x, the sign
+ * turned every 50 ms, over gravity. The game's motion analyzer turns the newest acceleration into a swing value and
+ * sets its swing flags above 0.2; such a shake gives about 1.5 ([doc] seedds/nxnative, MIT,
+ * dm/games/0100000000010000/README.md "Input": the analyzer at main+0x5d5590 in 1.4.1, their shake +-3 G). */
+#define VK_SHAKE 0x102                                        /* '~' of the test sequences: not a key of the keyboard */
+static volatile LONG g_shake[8];
+unsigned nnpad_shake_combo(void);
+static void shake_update(uint32_t id, uint64_t pad_buttons) {
+    if (id > 7) return;
+    int on = 0;
+    if (id == 0) on = scripted(VK_SHAKE) || script_key(VK_SHAKE) || seq_key(VK_SHAKE);
+    if (!on && (int)id == g_keyboard_player) {
+        int vk = sdl_on() ? nnpad_hotkey_vk(1) : VK_SPACE;
+        on = vk && keyboard_ours() && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+    uint64_t combo = sdl_on() ? (uint64_t)nnpad_shake_combo() : 0, menu = (uint64_t)nnpad_hotkey_combo();
+    if (!on && combo && (pad_buttons & combo) == combo && !(menu && (pad_buttons & menu) == menu)) on = 1;
+    if (on != g_shake[id]) { InterlockedExchange(&g_shake[id], on); if (on) printf("nn::hid: player %u shakes the controller\n", id + 1); }
+}
+
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     memset((void *)(uintptr_t)out, 0, 0x28);
     wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
@@ -842,6 +866,7 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         wired = !g_x[slot].wireless;
     }
     if (id == 0) record_or_replay(&buttons, &lx, &ly);
+    shake_update(id, buttons);
     menu_after(id, &buttons, &lx, &ly);                       /* after the amiibo menu (above) */
     if (lx < -STICK_MAX / 2) buttons |= 1ull << BTN_SL_LEFT;
     if (lx > STICK_MAX / 2) buttons |= 1ull << BTN_SL_RIGHT;
@@ -1055,7 +1080,10 @@ static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorSta
     wr64(o, 5000000);                                        /* delta time, ns */
     wr64(o + 8, (uint64_t)g_six[id].last);                   /* sampling number */
     {   NnPadState ps;                                       /* a pad with a gyro (SDL): its acceleration (G) at +0x10 and angular velocity (revolutions/s) at +0x1c; angle and direction stay at rest */
-        if (sdl_on() && nnpad_get((int)id, &ps) && ps.has_motion) {
+        if (g_shake[id]) {                                   /* the shake key or buttons (shake_update) */
+            float a[3] = {(GetTickCount64() / 50) & 1 ? 3.0f : -3.0f, 0.0f, -1.0f};
+            memcpy((void *)(uintptr_t)(o + 0x10), a, 12);
+        } else if (sdl_on() && nnpad_get((int)id, &ps) && ps.has_motion) {
             memcpy((void *)(uintptr_t)(o + 0x10), ps.accel, 12); memcpy((void *)(uintptr_t)(o + 0x1c), ps.gyro, 12);
         } else { f = -1.0f; memcpy((void *)(uintptr_t)(o + 0x18), &f, 4); }          /* acceleration z at rest */
     }
@@ -1105,6 +1133,7 @@ static void hid_IsSixAxisSensorAtRest(Ctx *c) {
     if (!(id < 8 || id == 0x10 || id == 0x20) || dev > 2)
         guest_trap("nn::hid::IsSixAxisSensorAtRest with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x250b9c)", c->x[30] - 4);
     {   NnPadState ps;                                       /* a pad with a gyro: at rest while it turns slower than ~7 degrees/s (NOT VERIFIED: the module's threshold) */
+        if (id < 8 && g_shake[id]) { RET(0); return; }      /* the shake key or buttons: a controller being shaken */
         if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.has_motion) { RET(fabsf(ps.gyro[0]) + fabsf(ps.gyro[1]) + fabsf(ps.gyro[2]) < 0.02f); return; }
     }
     RET(1);

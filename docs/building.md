@@ -115,6 +115,9 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F1 again) to close. When the game is
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
   and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]`.
+- Shaking the controller (the frog's high jump, a spin throw of the cap): a pad with motion sensors that SDL sees
+  shakes for real; on any pad, hold the left stick button, and on the keyboard Space - the game then reads a controller
+  shaken side to side. Set in `controllers.ini`, section `[hotkeys]` (`shake`, `shake_pad`).
 - The Capture button: F12, or a pad's share button, saves the frame as a BMP in the save folder's `album`.
 - Translated shaders are cached in `build\cache\vk`. The first run compiles them as the game meets them and is slower;
   later runs reuse them.
