@@ -9,7 +9,8 @@
     manual/         optional: the Help pages (the RomFS of the game's HtmlDocument content: html-document/...)
     fonts/          optional: the console's shared fonts, as .bfttf files the way the console stores them, or .ttf
 Each piece is checked: the program id in main.npdm, the NintendoSDK version main carries (7.3.2 for 1.4.1), the display
-version in control.nacp, and the RomFS and Help folders by what they contain.
+version in control.nacp (1.4.1, or 1.3.0: the earlier update with the same program), and the RomFS and Help folders by
+what they contain.
 
 Writes, all under build/ (ignored by git):
     dump/update/exefs/<name>, elf/<name>.elf, control.nacp   the program; its modules converted to ELF
@@ -144,8 +145,9 @@ def main():
             if not p:
                 raise DumpError('%s: %s is missing (see docs/building.md for what to dump)' % (dump, what))
         info = nso.nacp_info(open(nacp, 'rb').read())
-        if info['display_version'] != T.VERSION:
-            raise DumpError('%s: version %s, this project builds %s' % (nacp, info['display_version'] or '(none)', T.VERSION))
+        if info['display_version'] not in T.DISPLAY_VERSIONS:
+            raise DumpError('%s: version %s, this project builds %s (the control data of update %s)'
+                            % (nacp, info['display_version'] or '(none)', T.VERSION, ' or '.join(T.DISPLAY_VERSIONS)))
         if not all(os.path.isdir(os.path.join(romfs, d)) for d in ('SystemData', 'StageData', 'ObjectData')):
             raise DumpError('%s: not the game\'s RomFS (no SystemData, StageData or ObjectData folder)' % romfs)
         upd_files = read_exefs(exefs, ('main', 'main.npdm', 'sdk', 'rtld'))
