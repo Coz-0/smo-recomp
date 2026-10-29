@@ -330,6 +330,17 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     SetEvent(g_job_event);
 }
 static void gl_barrier(void) { if (g_async_pending) gl_run(job_nop, NULL); }   /* everything queued so far has run when this returns */
+/* Texture and sampler pool registrations and texture finalizes go through the queue (SMO_POOL_QUEUE=0: as before, the
+ * caller waits until the queue is empty and applies the change itself). The replay reads the pools by ID and the
+ * textures it names, so what was queued before the call must see the old entry and a live texture; applied in queue order,
+ * on the render thread, it does, as it did with the wait. The wait was the whole replay of the batch queued before:
+ * measured in New Donk City (route metro, 29/10/2026) the main thread waited 8.5 ms per frame there, nvnSamplerPool-
+ * RegisterSampler 6.1 and nvnTextureFinalize 2.4, and a loader thread 5.4 in nvnTexturePoolRegisterTexture. */
+static int pool_queue_on(void) {
+    static int on = -1;
+    if (on < 0) on = gl_async_on() && !(getenv("SMO_POOL_QUEUE") && !atoi(getenv("SMO_POOL_QUEUE")));
+    return on;
+}
 
 /* ---------------------------------------------------------------- statistics and diagnostics */
 static struct {
@@ -4284,14 +4295,21 @@ static void spool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     sp->used = calloc((size_t)sp->count + 1, 1);
     RET(1);
 }
+typedef struct { SamplerPool *sp; uint32_t id; SamplerParams p; } SpoolRegJob;
+static void job_spool_register(void *arg) {
+    SpoolRegJob *j = arg;
+    AcquireSRWLockExclusive(&g_pool_lock);
+    j->sp->e[j->id] = j->p;
+    j->sp->used[j->id] = 1;
+    ReleaseSRWLockExclusive(&g_pool_lock);
+}
 static void spool_register(Ctx *c) {                   /* (pool, id, sampler) or (pool, id, samplerBuilder): same contents */
-    gl_barrier();
+    if (!pool_queue_on()) gl_barrier();
     SamplerPool *sp = hobj(A0, K_SPOOL);
     if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) return;
-    AcquireSRWLockExclusive(&g_pool_lock);
-    memcpy(&sp->e[(uint32_t)A1], P(A2), sizeof(SamplerParams));
-    sp->used[(uint32_t)A1] = 1;
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    SpoolRegJob j = {sp, (uint32_t)A1};
+    memcpy(&j.p, P(A2), sizeof j.p);
+    if (pool_queue_on()) gl_post(job_spool_register, &j, sizeof j); else job_spool_register(&j);
 }
 
 /* ---- textures */
@@ -4377,8 +4395,28 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
                             t->b.format, t->b.target, (void *)t->mem, t->b.levels, t->b.depth, t->b.samples, t->b.flags, (unsigned long long)t->storage, (long long)g_st.frames, (unsigned long long)c->x[30]);
     RET(1);
 }
+typedef struct { Tex *t; int32_t id; } TexEndJob;      /* id >= 0: a copy giving up that pool slot; -1: the texture itself ends */
+static void job_tex_end(void *arg) {
+    TexEndJob *j = arg;
+    Tex *t = j->t;
+    if (j->id >= 0) {
+        int released = 0;
+        AcquireSRWLockExclusive(&g_pool_lock);
+        for (int i = 0; i < g_ntpools && !released; i++) {
+            TexPool *tp = g_tpools[i];
+            if ((uint32_t)j->id < (uint32_t)tp->count && tp->e[j->id].tex == t && tp->e[j->id].held) { pool_ent_release(&tp->e[j->id]); released = 1; }
+        }
+        ReleaseSRWLockExclusive(&g_pool_lock);
+        InterlockedIncrement64(released ? &g_slot_releases : &g_slot_unknown);
+        if (texlog_on()) printf("texlog: finalize of a copy (host %p): slot %d %s, %d entries left\n", (void *)t, (int)j->id, released ? "released" : "not an entry of it", t->nslots);
+        return;
+    }
+    InterlockedExchange(&t->dead, 1);
+    tp_remove(t);
+    defer_free(K_TEX, t);
+}
 static void tex_finalize(Ctx *c) {
-    gl_barrier();
+    if (!pool_queue_on()) gl_barrier();
     Tex *t = hobj(A0, K_TEX);
     if (!t) return;
     /* an NVNtexture copied byte for byte (agl::driver::NVNtexture_ copies, main 0x777c1c finalizes the copy in its
@@ -4390,28 +4428,19 @@ static void tex_finalize(Ctx *c) {
         /* agl giving up a pool slot (the note above pool_ent_release): an owning NVNtexture_ (+0xc4 bit 0) whose +0xc0
          * is a slot that names this texture */
         int32_t id = -1;
-        int released = 0, own = 0;
+        int own = 0;
         __try { id = (int32_t)rd32(A0 + 0xc0); own = rd8(A0 + 0xc4) & 1; } __except (1) { own = 0; }     /* past the 0xc0 bytes of an NVNtexture: an object of another kind may end there */
-        if (own && id >= 0) {
-            AcquireSRWLockExclusive(&g_pool_lock);
-            for (int i = 0; i < g_ntpools && !released; i++) {
-                TexPool *tp = g_tpools[i];
-                if ((uint32_t)id < (uint32_t)tp->count && tp->e[id].tex == t && tp->e[id].held) { pool_ent_release(&tp->e[id]); released = 1; }
-            }
-            ReleaseSRWLockExclusive(&g_pool_lock);
-            InterlockedIncrement64(released ? &g_slot_releases : &g_slot_unknown);
-        }
-        if (texlog_on()) printf("texlog: finalize of a copy %llx (host %p belongs to %llx): copy cleared only; slot %d %s, %d entries left, frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, (unsigned long long)t->guest,
-                                (int)id, released ? "released" : "not an entry of it", t->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
+        if (texlog_on()) printf("texlog: finalize of a copy %llx (host %p belongs to %llx): copy cleared only; slot %d, frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, (unsigned long long)t->guest,
+                                own ? (int)id : -1, (long long)g_st.frames, (unsigned long long)c->x[30]);
+        if (own && id >= 0) { TexEndJob j = {t, id}; if (pool_queue_on()) gl_post(job_tex_end, &j, sizeof j); else job_tex_end(&j); }
         wr32(A0 + 8, 0);
         return;
     }
-    InterlockedExchange(&t->dead, 1);
-    tp_remove(t);
     if (texlog_on()) printf("texlog: finalize %llx host %p %dx%d fmt 0x%x mem %p (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, (void *)t->mem, (unsigned long long)c->x[30]);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
-    defer_free(K_TEX, t);
+    TexEndJob j = {t, -1};
+    if (pool_queue_on()) gl_post(job_tex_end, &j, sizeof j); else job_tex_end(&j);
 }
 #define TEXGET(name, expr) static void name(Ctx *c) { Tex *t = hobj(A0, K_TEX); RET(t ? (expr) : 0); }
 TEXGET(tex_get_flags, t->b.flags)
@@ -4479,21 +4508,27 @@ static void tpool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     ReleaseSRWLockExclusive(&g_pool_lock);
     RET(1);
 }
-static void tpool_register(Ctx *c) {                   /* (pool, id, texture, view) */
-    gl_barrier();
-    TexPool *tp = hobj(A0, K_TPOOL);
-    TexPoolEnt e;
-    if (!tp || (uint32_t)A1 >= (uint32_t)tp->count) return;
-    memset(&e, 0, sizeof e);
-    e.tex = hobj(A2, K_TEX);
-    if (A3) memcpy(&e.view, P(A3), sizeof e.view);
+typedef struct { TexPool *tp; uint32_t id; TexPoolEnt e; } TpoolRegJob;
+static void job_tpool_register(void *arg) {
+    TpoolRegJob *j = arg;
     AcquireSRWLockExclusive(&g_pool_lock);
-    pool_ent_release(&tp->e[(uint32_t)A1]);             /* registered over: the texture there before loses this entry */
-    if (e.tex) { e.held = 1; e.tex->nslots++; e.tex->nregs++; }
-    tp->e[(uint32_t)A1] = e;
+    pool_ent_release(&j->tp->e[j->id]);                 /* registered over: the texture there before loses this entry */
+    if (j->e.tex) { j->e.held = 1; j->e.tex->nslots++; j->e.tex->nregs++; }
+    j->tp->e[j->id] = j->e;
     ReleaseSRWLockExclusive(&g_pool_lock);
-    if (texlog_on() && e.tex) printf("texlog: register pool %llx slot %u <- %llx host %p %dx%d fmt 0x%x entries %d frame %lld (caller %llx)\n", (unsigned long long)A0, (unsigned)A1, (unsigned long long)A2, (void *)e.tex,
-                                     e.tex->b.width, e.tex->b.height, e.tex->b.format, e.tex->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
+}
+static void tpool_register(Ctx *c) {                   /* (pool, id, texture, view) */
+    if (!pool_queue_on()) gl_barrier();
+    TexPool *tp = hobj(A0, K_TPOOL);
+    if (!tp || (uint32_t)A1 >= (uint32_t)tp->count) return;
+    TpoolRegJob j;
+    memset(&j, 0, sizeof j);
+    j.tp = tp; j.id = (uint32_t)A1;
+    j.e.tex = hobj(A2, K_TEX);
+    if (A3) memcpy(&j.e.view, P(A3), sizeof j.e.view);
+    if (texlog_on() && j.e.tex) printf("texlog: register pool %llx slot %u <- %llx host %p %dx%d fmt 0x%x frame %lld (caller %llx)\n", (unsigned long long)A0, (unsigned)A1, (unsigned long long)A2, (void *)j.e.tex,
+                                       j.e.tex->b.width, j.e.tex->b.height, j.e.tex->b.format, (long long)g_st.frames, (unsigned long long)c->x[30]);
+    if (pool_queue_on()) gl_post(job_tpool_register, &j, sizeof j); else job_tpool_register(&j);
 }
 
 /* ---- small state objects: contents live in the guest object */
