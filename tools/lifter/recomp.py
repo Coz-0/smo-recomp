@@ -1017,10 +1017,11 @@ def lift_function(env, entry):
     fn = Fn(entry, end, env)
     lines, bad = [], []
     pc = entry
+    patches = getattr(env, 'patches', None) or {}
     while pc < end:
         w = word(pc)
         try:
-            stmt = fn.lift(w, pc)
+            stmt = patches.get(pc) or fn.lift(w, pc)
         except Unimpl as e:
             stmt = 'guest_unimpl(0x%xULL, 0x%08xU, "%s");' % (pc, w, e)
             bad.append((pc, w, str(e)))
@@ -1096,12 +1097,13 @@ def cmd_lift(out_path, roots, overrides):
 _worker_env = None
 
 
-def _worker_init(starts):
+def _worker_init(starts, patches=None):
     global _worker_env
     _worker_env = Env()
     _worker_env.imports = set()
     _worker_env.full = True
     _worker_env.starts = starts
+    _worker_env.patches = patches or {}
 
 
 def _worker_lift(entries):
@@ -1240,7 +1242,10 @@ def cmd_full2(outdir, jobs):
     pending = list(starts)
     all_funcs = []
     total = bad = 0
-    with multiprocessing.Pool(jobs, _worker_init, (starts,)) as pool:
+    import game_patches                                  # instructions replaced by C of the runtime's (game_patches.py)
+    patches = game_patches.find(word, BASE, TEXT_SIZE)
+    env.patches = patches
+    with multiprocessing.Pool(jobs, _worker_init, (starts, patches)) as pool:
         while pending:
             pending.sort()
             parts = [pending[i:i + 400] for i in range(0, len(pending), 400)]
