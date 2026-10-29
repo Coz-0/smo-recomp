@@ -160,6 +160,9 @@ The end of every log has the counts that tell whether a run was healthy:
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
   by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
+- `SMO_YAZ0=0` leaves the game's own Yaz0 decoders (sead's `SZSDecompressor`, every `.szs` the game opens) where
+  `runtime/game/smo_yaz0.c` decodes in host code; the lifter puts the call there (`tools/lifter/game_patches.py`), and
+  the exit report counts the chunks and files it decoded. `tests/check_yaz0.py` compares the two on every `.szs`.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
@@ -293,6 +296,23 @@ The end of every log has the counts that tell whether a run was healthy:
   restart's 512 KB scene resource heap (`nn::diag abort` on FileLoadThread); in play the room is entered first and its
   archives are already in the kingdom's heap. Restarts the game makes itself are logged (`the game starts <stage>,
   scenario <n> itself`) and listed per stage (`restarts` in `results.jsonl`).
+
+## Window shape
+
+- The world's cameras at the window's shape: tools/lifter/game_patches.py puts a call to `rt_persp`
+  (runtime/game/smo_aspect.c) at every read of sead's PerspectiveProjection field of view and aspect, and a 16:9 view
+  with a far plane over 10000 (the world's; the HUD's layouts are 16:9 views too, far 10000) is fitted to the
+  swapchain's shape, its values written back for the game's other uses of the view. `smo_aspect: the game's 16:9 views
+  fitted to <aspect>` in the log. `SMO_ASPECT=0`: off; `SMO_ASPECT_TEST=<width/height>`: that shape whatever the window;
+  `SMO_ASPECT_WRITE=0`: the matrix only; `SMO_ASPECT_LOG=1`: each kind of view the first time (aspect, fovy, near, far).
+- The HUD (`hud_fix`, nvn_vk_draw.c): a draw whose vertex c3 is nn::ui2d's block (its view rows -1.0002 2733.02 /
+  -1 2734.47) gets, in a copy of the block, the rows that undo the window's stretch, so the layout keeps its shape in
+  a 16:9 box. In play, a pane over the whole screen or as wide as it and nearly as tall stretches with the window, and
+  one as wide as the screen that touches its top or bottom stays at that edge. A frame without a scene is a 2D screen:
+  all of it in the box, and the present shows only the box (bars). `nvn_vk: HUD layer draws drawn at the window's
+  shape` counts them at exit; `SMO_ASPECT_HUD=0`: off.
+- `SMO_SWAPSHOT=<frame>` saves the window's image of that frame as presented (`swap_<frame>.bmp` in `SMO_SHOT_DIR`);
+  the game's screenshots are its picture before the present.
 
 ## Other switches
 

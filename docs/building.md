@@ -107,6 +107,11 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   way, and `windowed` (with a title bar) and `fullscreen` (on top) are there too. The game keeps running while its
   window is not the active one or is minimised (pads and keyboard count only while it is active); `unfocused = pause`
   in `graphics.ini` stops it then instead, as the console stops a game behind its HOME menu.
+- A window that is not 16:9 shows the game at its own shape: on a wider one (21:9) the world is seen further to the
+  sides, on a taller one (16:10) further up and down, the horizontal view kept. The HUD stays 16:9 in the middle (its
+  bands and the scene's picture fill the window), and 2D screens - the controller notice, loading, the title and pause
+  menus - are shown 16:9 with bars, as on a 16:9 screen. `SMO_ASPECT=0` stretches the 16:9 picture to the window as
+  before.
 - Help (the pause menu's Action Guide) opens inside the game window, scaled to it, and the game waits while it is open,
   as on the console: stick or d-pad and A to choose and open, L / R to turn pages, B to go back and to close (keyboard:
   arrows, Enter, Q / E, Escape). Its Choose Mode item leads to the game's Options, and back to the page when you
