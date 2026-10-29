@@ -62,48 +62,62 @@ static inline V128 rdv(uint64_t a, int n) { V128 v; v.d[0] = 0; v.d[1] = 0; memc
 static inline void wrv(uint64_t a, const V128 *v, int n) { memcpy((void *)(uintptr_t)a, v, (size_t)n); }
 static inline void vzero(V128 *v) { v->d[0] = 0; v->d[1] = 0; }
 
-static inline uint64_t adds64(Ctx *c, uint64_t a, uint64_t b, uint32_t cin) {
+/* Flags. The bodies work on an Nzcv: the context's own (Ctx's N, Z, C, V, same layout) or a function's local copy
+ * (tools/lifter/reglocal.py: the AAPCS64 keeps no flags across a call, so lifted code holds them in a local the
+ * compiler can drop when nothing reads them). The Ctx forms are what the lifter writes without it. */
+typedef struct { uint32_t N, Z, C, V; } Nzcv;
+#define NZCV_OF(c) ((Nzcv *)&(c)->N)
+
+static inline uint64_t adds64_l(Nzcv *f, uint64_t a, uint64_t b, uint32_t cin) {
     uint64_t r = a + b + cin;
-    c->N = (uint32_t)(r >> 63);
-    c->Z = r == 0;
-    c->C = (r < a) || (cin && r == a);
-    c->V = (uint32_t)(((a ^ r) & (b ^ r)) >> 63);
+    f->N = (uint32_t)(r >> 63);
+    f->Z = r == 0;
+    f->C = (r < a) || (cin && r == a);
+    f->V = (uint32_t)(((a ^ r) & (b ^ r)) >> 63);
     return r;
 }
-static inline uint32_t adds32(Ctx *c, uint32_t a, uint32_t b, uint32_t cin) {
+static inline uint32_t adds32_l(Nzcv *f, uint32_t a, uint32_t b, uint32_t cin) {
     uint64_t wide = (uint64_t)a + b + cin;
     uint32_t r = (uint32_t)wide;
-    c->N = r >> 31;
-    c->Z = r == 0;
-    c->C = (uint32_t)(wide >> 32);
-    c->V = ((a ^ r) & (b ^ r)) >> 31;
+    f->N = r >> 31;
+    f->Z = r == 0;
+    f->C = (uint32_t)(wide >> 32);
+    f->V = ((a ^ r) & (b ^ r)) >> 31;
     return r;
 }
-static inline uint64_t logic64(Ctx *c, uint64_t r) { c->N = (uint32_t)(r >> 63); c->Z = r == 0; c->C = 0; c->V = 0; return r; }
-static inline uint32_t logic32(Ctx *c, uint32_t r) { c->N = r >> 31; c->Z = r == 0; c->C = 0; c->V = 0; return r; }
-static inline void set_nzcv(Ctx *c, int f) { c->N = (f >> 3) & 1; c->Z = (f >> 2) & 1; c->C = (f >> 1) & 1; c->V = f & 1; }
+static inline uint64_t logic64_l(Nzcv *f, uint64_t r) { f->N = (uint32_t)(r >> 63); f->Z = r == 0; f->C = 0; f->V = 0; return r; }
+static inline uint32_t logic32_l(Nzcv *f, uint32_t r) { f->N = r >> 31; f->Z = r == 0; f->C = 0; f->V = 0; return r; }
+static inline void set_nzcv_l(Nzcv *f, int v) { f->N = (v >> 3) & 1; f->Z = (v >> 2) & 1; f->C = (v >> 1) & 1; f->V = v & 1; }
 
-static inline int cond(const Ctx *c, int cc) {
+static inline int cond_l(const Nzcv *f, int cc) {
     int r;
     switch (cc >> 1) {
-    case 0: r = c->Z; break;
-    case 1: r = c->C; break;
-    case 2: r = c->N; break;
-    case 3: r = c->V; break;
-    case 4: r = c->C && !c->Z; break;
-    case 5: r = c->N == c->V; break;
-    case 6: r = c->N == c->V && !c->Z; break;
+    case 0: r = f->Z; break;
+    case 1: r = f->C; break;
+    case 2: r = f->N; break;
+    case 3: r = f->V; break;
+    case 4: r = f->C && !f->Z; break;
+    case 5: r = f->N == f->V; break;
+    case 6: r = f->N == f->V && !f->Z; break;
     default: return 1;
     }
     return (cc & 1) ? !r : r;
 }
 
-static inline void fcmp(Ctx *c, double a, double b) {
-    if (a != a || b != b) set_nzcv(c, 3);
-    else if (a == b) set_nzcv(c, 6);
-    else if (a < b) set_nzcv(c, 8);
-    else set_nzcv(c, 2);
+static inline void fcmp_l(Nzcv *f, double a, double b) {
+    if (a != a || b != b) set_nzcv_l(f, 3);
+    else if (a == b) set_nzcv_l(f, 6);
+    else if (a < b) set_nzcv_l(f, 8);
+    else set_nzcv_l(f, 2);
 }
+
+static inline uint64_t adds64(Ctx *c, uint64_t a, uint64_t b, uint32_t cin) { return adds64_l(NZCV_OF(c), a, b, cin); }
+static inline uint32_t adds32(Ctx *c, uint32_t a, uint32_t b, uint32_t cin) { return adds32_l(NZCV_OF(c), a, b, cin); }
+static inline uint64_t logic64(Ctx *c, uint64_t r) { return logic64_l(NZCV_OF(c), r); }
+static inline uint32_t logic32(Ctx *c, uint32_t r) { return logic32_l(NZCV_OF(c), r); }
+static inline void set_nzcv(Ctx *c, int f) { set_nzcv_l(NZCV_OF(c), f); }
+static inline int cond(const Ctx *c, int cc) { return cond_l((const Nzcv *)&c->N, cc); }
+static inline void fcmp(Ctx *c, double a, double b) { fcmp_l(NZCV_OF(c), a, b); }
 
 static inline uint32_t ror32(uint32_t v, unsigned n) { n &= 31; return n ? (v >> n) | (v << (32 - n)) : v; }
 static inline uint64_t ror64(uint64_t v, unsigned n) { n &= 63; return n ? (v >> n) | (v << (64 - n)) : v; }

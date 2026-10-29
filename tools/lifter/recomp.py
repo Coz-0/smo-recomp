@@ -25,6 +25,11 @@ import collections
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO, 'tools'))
 import target as _T  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jumptable  # noqa: E402
+import reglocal  # noqa: E402
+
+INLINE_LEAF = int(os.environ.get('RECOMP_INLINE_LEAF', '8'))     # Env.inline_leaf: 0 = off
 ELF = os.environ.get('RECOMP_ELF') or _T.elf('main')
 FUNCS = os.environ.get('RECOMP_FUNCS') or _T.build('functions', 'main_functions.tsv')
 BASE = int(os.environ.get('RECOMP_BASE', '0x7100000000'), 16)
@@ -89,6 +94,14 @@ def word(addr):
     if PATCHES and addr in PATCHES:
         return PATCHES[addr]
     return struct.unpack_from('<I', IMG, FILE_OFF + addr - BASE)[0]
+
+
+def read_image(addr, fmt):
+    """A value of the module's image at a guest address, None outside it."""
+    off = FILE_OFF + addr - BASE
+    if addr < BASE or off + struct.calcsize(fmt) > len(IMG):
+        return None
+    return struct.unpack_from(fmt, IMG, off)[0]
 
 
 def bits(w, hi, lo):
@@ -267,6 +280,9 @@ class Fn:
         if bits(w, 30, 26) == 5:
             target = pc + sext(bits(w, 25, 0), 26) * 4
             if bits(w, 31, 31):
+                body = self.env.inline_leaf(target)
+                if body is not None:                     # a short straight-line leaf: its instructions here
+                    return 'c->x[30] = 0x%xULL; %s' % (pc + 4, body)
                 return 'c->x[30] = 0x%xULL; %s' % (pc + 4, self.env.call(target))
             return self.jump(target)
         if bits(w, 31, 24) == 0x54:
@@ -286,6 +302,14 @@ class Fn:
             if opc == 1:
                 return '{ uint64_t t = %s; c->x[30] = 0x%xULL; call_indirect(c, t); }' % (X(rn), pc + 4)
             if opc == 0:
+                in_image = read_image(pc, '<I') == w            # not a word lifted on its own (difftest)
+                table = in_image and jumptable.targets(pc, self.entry, self.end, word, read_image)
+                if table:                                # a jump table: its own targets, not every instruction
+                    cases = ' '.join('case 0x%xULL: goto L_%x;' % (t, t) for t in table)
+                    return ('{ uint64_t jt = %s; switch (jt) { %s default: guest_trap("BR outside its jump table", '
+                            '0x%xULL); return; } }' % (X(rn), cases, pc))
+                if in_image and jumptable.loads_pointer(pc, self.entry, word):   # through a pointer: never into this function
+                    return '{ uint64_t t = %s; call_indirect(c, t); return; }' % X(rn)
                 self.has_br = True
                 return '{ jt = %s; goto L_dispatch; }' % X(rn)
             raise Unimpl('br%d' % opc)
@@ -945,6 +969,35 @@ class Env:
         self.wanted.setdefault(target, None)
         return 'f_%x(c);' % target
 
+    def inline_leaf(self, target):
+        """The C of a listed function that is a straight-line leaf of at most RECOMP_INLINE_LEAF instructions (no
+        branch, call, trap or system instruction before one final `ret`), to stand in for a BL to it; None otherwise.
+        Running its instructions in the caller is what the CPU does; the caller's locals then hold its registers and
+        the compiler optimises across (24 686 BL sites of main call such a leaf of <= 8 instructions)."""
+        if not INLINE_LEAF or target in self.overrides:
+            return None
+        if not hasattr(self, '_leaf_ends'):              # the list's exact ends (the full lift's workers have no `ends`)
+            with open(FUNCS, encoding='utf-8') as f:
+                next(f)
+                self._leaf_ends = {BASE + int(t[0], 16): BASE + int(t[1], 16) for t in (ln.split('\t') for ln in f)}
+        if target not in self._leaf_ends:
+            return None
+        cache = self.__dict__.setdefault('_leaf', {})
+        if target not in cache:
+            end = self._leaf_ends[target]
+            body = None
+            if 2 <= (end - target) // 4 <= INLINE_LEAF + 1 and word(end - 4) == 0xd65f03c0 and not self.plt_symbol(target):
+                if all(bits(word(a), 28, 25) not in (0, 1, 2, 3, 10, 11) for a in range(target, end - 4, 4)):
+                    fn = Fn(target, end, self)
+                    try:
+                        stmts = [fn.lift(word(a), a) for a in range(target, end - 4, 4)]
+                    except Unimpl:
+                        stmts = None
+                    if stmts and not any(k in t for t in stmts for k in ('goto', 'return', 'guest_', '(c);', 'call_indirect')):
+                        body = ' '.join(stmts)
+            cache[target] = body
+        return cache[target]
+
     def compute_starts(self):
         """Function entries and exact ends from the function list (module-relative hex in the TSV)."""
         self.ends = {}
@@ -1026,12 +1079,11 @@ def lift_function(env, entry):
             bad.append((pc, w, str(e)))
         lines.append((pc, stmt))
         pc += 4
-    out = ['void f_%x(Ctx *c) {' % entry, '  c->fn = 0x%xULL;' % entry]   # for crash reports
+    head = ['void f_%x(Ctx *c) {' % entry, '  c->fn = 0x%xULL;' % entry]   # for crash reports
     if fn.has_br:
-        out.append('  uint64_t jt = 0;')
-    for pc, stmt in lines:
-        out.append('L_%x: %s' % (pc, stmt))
-    ends_open = not lines[-1][1].startswith(('return;', 'goto', '{ jt', '{ f_', '{ imp_', '{ h_'))
+        head.append('  uint64_t jt = 0;')
+    out = ['L_%x: %s' % (pc, stmt) for pc, stmt in lines]
+    ends_open = not lines[-1][1].startswith(('return;', 'goto', '{ jt', '{ uint64_t jt', '{ f_', '{ imp_', '{ h_'))
     listed = getattr(env, 'ends', None)
     if ends_open and end < BASE + TEXT_SIZE and (not listed or end in listed):
         out.append('  f_%x(c); return;' % end)           # falls through into the next listed function
@@ -1043,7 +1095,10 @@ def lift_function(env, entry):
         out.append('L_dispatch: switch (jt) {')
         out.extend('  case 0x%xULL: goto L_%x;' % (pc, pc) for pc, _ in lines)
         out.append('  default: call_indirect(c, jt); return; }')
-    out.append('}')
+    if reglocal.ENABLED:
+        prologue, out = reglocal.localize(out)
+        head += prologue
+    out = head + out + ['}']
     if lines and ends_open and end < BASE + TEXT_SIZE and (not listed or end in listed):
         env.wanted.setdefault(end, None)
     return '\n'.join(out), len(lines), bad
