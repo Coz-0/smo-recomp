@@ -125,7 +125,9 @@ The end of every log has the counts that tell whether a run was healthy:
 - Speed switches, each bringing back the way before (for comparisons): `SMO_VK_HOSTMEM=0` (vertex and index ranges
   copied into the stream ring instead of read in place from the game's heap, imported into Vulkan with
   VK_EXT_external_memory_host; only the parts of the heap draws read are imported, `SMO_VK_HOSTMEM_MB=<n>` at most:
-  512 on Linux, where everything imported costs at each submission), `SMO_HEAP_MEMFD=1` (Linux: the heap a shared memfd
+  512 on Linux, where everything imported costs at each submission), `SMO_VK_HEAP_PLACED=0` (Linux: the heap is
+  ordinary memory whose parts are imported as above, instead of one allocation of the driver's that it maps at the
+  heap's base with VK_EXT_map_memory_placed), `SMO_HEAP_MEMFD=1` (Linux: the heap a shared memfd
   mapping, as before, so a virtual memory pool can view its pages twice; amdgpu does not import it, so vertex and index
   ranges are copied), `SMO_HEAP_THP=1` (Linux: transparent huge pages in the heap as the kernel's setting says), `SMO_VK_TSET_CACHE=0` (texture descriptor sets per command buffer instead of kept
   across them), `SMO_VK_OCC_LATE=0` (a conditional render waits for the occlusion count it compares instead of using the

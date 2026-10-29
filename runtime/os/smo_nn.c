@@ -112,7 +112,15 @@ static void os_SetMemoryHeapSize(Ctx *c) {
         }
         if (!g_heap) r = RESULT_OUT_OF_MEMORY;
         else if (size > g_heap_size) {
-            if (!VirtualAlloc(g_heap + g_heap_size, size - g_heap_size, MEM_COMMIT, PAGE_READWRITE)) r = RESULT_OUT_OF_MEMORY;
+            /* Linux: the first size given is made driver memory where the GPU driver can map it at the heap's base
+             * (nvn_vk_draw.c nvn_vk_heap_place): read in place by draws without importing it. Fresh and zeroed as
+             * committed pages are; a later growth is committed as before. */
+            int nvn_vk_heap_place(void *base, uint64_t size);
+            int placed = 0;
+#if defined(__linux__)
+            if (!g_heap_size && g_heap_fd < 0) placed = nvn_vk_heap_place(g_heap, size);
+#endif
+            if (!placed && !VirtualAlloc(g_heap + g_heap_size, size - g_heap_size, MEM_COMMIT, PAGE_READWRITE)) r = RESULT_OUT_OF_MEMORY;
         } else if (size < g_heap_size) {
             for (uint64_t g = size / UNIT; g < g_heap_size / UNIT; g++) if (g_used[g]) r = RESULT_OUT_OF_MEMORY;   /* blocks still live above */
             /* pages of a section view cannot be decommitted (VirtualFree MEM_DECOMMIT fails on mapped views): they stay

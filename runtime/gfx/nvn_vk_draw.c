@@ -54,6 +54,10 @@ static struct {
     int has_gpl, ext_gpl, ext_so;
     int has_dcc;                                   /* VK_EXT_depth_clip_control (NVN depth mode NEAR_IS_MINUS_W) */
     int has_emh; uint64_t emh_align;              /* VK_EXT_external_memory_host (SMO_VK_HOSTMEM) */
+#if defined(__linux__) && defined(VK_EXT_map_memory_placed)
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed;
+#endif
+    int has_placed;                                /* VK_EXT_map_memory_placed: the game's heap can be driver memory (nvn_vk_heap_place) */
     VkPhysicalDeviceMemoryProperties mp;
 } D;
 /* NVN's depth mode is honoured, read when a pipeline is made (the game sets it on the device after nvnDeviceInitialize, which
@@ -110,11 +114,21 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     if (D.ext_gpl && vk_gpl_mode()) { D.exts[D.next++] = "VK_KHR_pipeline_library"; EXT(has_gpl, "VK_EXT_graphics_pipeline_library", gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT) }
 #undef EXT
     if (has_name(dext, ndext, "VK_EXT_external_memory_host")) { D.has_emh = 1; D.exts[D.next++] = "VK_EXT_external_memory_host"; }
+#if defined(__linux__) && defined(VK_EXT_map_memory_placed)
+    if (has_name(dext, ndext, "VK_EXT_map_memory_placed") && has_name(dext, ndext, "VK_KHR_map_memory2") && !(getenv("SMO_VK_HEAP_PLACED") && !atoi(getenv("SMO_VK_HEAP_PLACED")))) {
+        D.has_placed = 1; D.exts[D.next++] = "VK_KHR_map_memory2"; D.exts[D.next++] = "VK_EXT_map_memory_placed";
+        D.placed.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT; *tail = &D.placed; tail = &D.placed.pNext;
+    }
+#endif
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SMO_VK_PUSH") && !atoi(getenv("SMO_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
     D.has_pv = D.has_pv && D.pv.provokingVertexLast; D.has_iu8 = D.has_iu8 && D.iu8.indexTypeUint8; D.has_plr = D.has_plr && D.plr.primitiveTopologyListRestart;
     D.has_dcc = D.has_dcc && D.dcc.depthClipControl;
+#if defined(__linux__) && defined(VK_EXT_map_memory_placed)
+    D.has_placed = D.has_placed && D.placed.memoryMapPlaced;
+    D.placed.memoryMapRangePlaced = D.placed.memoryUnmapReserve = VK_FALSE;      /* only whole allocations are mapped, never unmapped */
+#endif
     /* blend / mask / polygon / multisample state out of the pipeline key, only when the GPU has ALL of these (else all stay in the key) */
     D.has_eds3 = D.has_eds3 && D.eds3.extendedDynamicState3ColorBlendEnable && D.eds3.extendedDynamicState3ColorBlendEquation && D.eds3.extendedDynamicState3ColorWriteMask && D.eds3.extendedDynamicState3PolygonMode &&
                  D.eds3.extendedDynamicState3AlphaToCoverageEnable && D.eds3.extendedDynamicState3SampleMask && (D.eds3.extendedDynamicState3DepthClampEnable || !D.f2.features.depthClamp);
@@ -638,11 +652,85 @@ static DWORD WINAPI hm_thread(void *arg) {
     }
     return 0;
 }
+/* The heap as driver memory (Linux, VK_EXT_map_memory_placed; SMO_VK_HEAP_PLACED=0: off). An imported range costs at
+ * every submission (above), and more than its size suggests: with the pieces New Donk City reads (180 MB) a
+ * vkQueueSubmit took ~1 ms, 3.6 ms a frame in 3.6 submissions (route metro, RADV, 29/10/2026; measured with the recorder
+ * thread and the batch sent in pieces of the fork's main), 0.24 ms with the heap placed. So when the game sets its heap size (smo_nn.c, before it writes anything there; the device
+ * exists by then), the heap is made ONE allocation of the driver's, host-visible and cached, which the driver maps at the
+ * heap's base itself (a placed map): the game's pages ARE that memory, draws bind it like any buffer and nothing is
+ * imported. RADV hands out the 3,120 MB of SMO's heap in one piece and zeroed, as fresh heap pages are (a probe,
+ * 29/10/2026). Any failure leaves the heap reserved as before (imports). Returns 1 when [base, base + size) is driver
+ * memory. As LASRecomp e6e26cd580 does for its own heap (an idea taken, no code). */
+static HSpan *g_hm_placed;                         /* the whole heap, once placed: added to the pieces at the next batch */
+#if defined(__linux__) && defined(VK_EXT_map_memory_placed)
+#include <sys/mman.h>
+int nvn_vk_heap_place(void *base, uint64_t size) {
+    if (!D.has_placed || !V.device) return 0;
+    const char *why = NULL;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkMemoryRequirements rq = {0};
+    uint32_t type = 32;
+    const VkFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    PFN_vkMapMemory2KHR map2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(V.device, "vkMapMemory2KHR");
+    PFN_vkUnmapMemory2KHR unmap2 = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(V.device, "vkUnmapMemory2KHR");
+    if (!map2 || !unmap2) why = "no vkMapMemory2KHR";
+    else if (vkCreateBuffer(V.device, &bi, NULL, &buf) != VK_SUCCESS) why = "the buffer could not be made";
+    else {
+        vkGetBufferMemoryRequirements(V.device, buf, &rq);
+        for (uint32_t i = 0; i < D.mp.memoryTypeCount && type == 32; i++) if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & want) == want) type = i;
+        if (type == 32) why = "no host-visible cached memory type for it";
+        else if (rq.size != size) why = "the allocation would not be the heap's size";      /* guest memory follows the mapping */
+    }
+    if (!why) {
+        VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, buf};
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, size, type};
+        if (vkAllocateMemory(V.device, &ai, NULL, &mem) != VK_SUCCESS) why = "the driver has no memory for it";
+        else if (vkBindBufferMemory(V.device, buf, mem, 0) != VK_SUCCESS) why = "binding failed";
+    }
+    if (!why) {                                    /* mapped anywhere first: a placed map replaces the reservation at base before the driver's own mmap can fail */
+        VkMemoryMapInfoKHR mi = {VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, NULL, 0, mem, 0, VK_WHOLE_SIZE};
+        void *p = NULL;
+        if (map2(V.device, &mi, &p) != VK_SUCCESS) why = "the driver cannot map it";
+        else {
+            VkMemoryUnmapInfoKHR ui = {VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, NULL, 0, mem};
+            unmap2(V.device, &ui);
+            VkMemoryMapPlacedInfoEXT pl = {VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, NULL, base};
+            mi.pNext = &pl; mi.flags = VK_MEMORY_MAP_PLACED_BIT_EXT; p = NULL;
+            if (map2(V.device, &mi, &p) != VK_SUCCESS || p != base) {
+                why = "the placed map failed";
+                if (mmap(base, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != base) {
+                    printf("nvn_vk: the game's heap at %p is lost (the placed map failed and the reservation cannot be made again)\n", base);
+                    fflush(stdout); report_and_exit(6);
+                }
+            }
+        }
+    }
+    if (why) {
+        printf("nvn_vk: the game's heap (%llu MB) as driver memory: no, %s: its ranges are imported as before\n", (unsigned long long)(size >> 20), why);
+        if (buf) vkDestroyBuffer(V.device, buf, NULL);
+        if (mem) vkFreeMemory(V.device, mem, NULL);
+        return 0;
+    }
+    HSpan *sp = calloc(1, sizeof *sp);
+    sp->lo = (uint64_t)(uintptr_t)base; sp->hi = sp->lo + size; sp->mem = mem; sp->buf = buf;
+    sp->pg = calloc((size_t)(((size - 1) >> HM_PG) + 1), sizeof *sp->pg);
+    AcquireSRWLockExclusive(&g_hj_lock);
+    g_hm_placed = sp;
+    ReleaseSRWLockExclusive(&g_hj_lock);
+    printf("nvn_vk: the game's heap (%llu MB at %p) is driver memory (memory type %u, placed map): nothing of it is imported\n", (unsigned long long)(size >> 20), base, type);
+    return 1;
+}
+#else
+int nvn_vk_heap_place(void *base, uint64_t size) { (void)base; (void)size; return 0; }
+#endif
 static void hm_init(void) {
     const char *e = getenv("SMO_VK_HOSTMEM");
-    g_hm_on = !(e && atoi(e) == 0) && D.has_emh;      /* on by default; SMO_VK_HOSTMEM=0: streamed by the ring */
-    if (!D.has_emh) printf("nvn_vk: the device has no VK_EXT_external_memory_host: guest memory is streamed by the ring%c", 10);
-    if (!g_hm_on) return;
+    g_hm_on = !(e && atoi(e) == 0) && (D.has_emh || D.has_placed);      /* on by default; SMO_VK_HOSTMEM=0: streamed by the ring */
+    if (!D.has_emh && !D.has_placed) printf("nvn_vk: the device has no VK_EXT_external_memory_host: guest memory is streamed by the ring%c", 10);
+    if (!g_hm_on || !D.has_emh) return;
     vkGetMemoryHostPointerPropertiesEXT_ = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(V.device, "vkGetMemoryHostPointerPropertiesEXT");
     if (!vkGetMemoryHostPointerPropertiesEXT_) { g_hm_on = 0; printf("nvn_vk: no vkGetMemoryHostPointerPropertiesEXT: guest memory is streamed\n"); return; }
     const char *mb = getenv("SMO_VK_HOSTMEM_MB");
@@ -662,6 +750,16 @@ static void hm_batch_begin(void) {      /* the heap's pieces to import, and thos
         hm_want(lo, (g_hm_base + g_hm_size - lo) < (1ull << HM_GRAN) ? g_hm_base + g_hm_size - lo : 1ull << HM_GRAN);
 #endif
     AcquireSRWLockExclusive(&g_hj_lock);
+    static int placed_in;
+    if (g_hm_placed && !placed_in && g_hm_claim && g_hs_n < HM_MAX) {      /* the whole heap: one piece; nothing more of it is queued (hm_want) */
+        HSpan *s = g_hm_placed;
+        placed_in = 1;
+        uint64_t g0 = (s->lo - g_hm_base) >> HM_GRAN, g1 = (s->hi - 1 - g_hm_base) >> HM_GRAN;
+        memset(g_hm_claim + g0, 1, (size_t)(g1 - g0 + 1));
+        int k = 0;
+        while (k < g_hs_n && g_hs[k]->lo <= s->lo) k++;
+        memmove(&g_hs[k + 1], &g_hs[k], sizeof g_hs[0] * (size_t)(g_hs_n - k)); g_hs[k] = s; g_hs_n++; added++;
+    }
     int busy = 0;
     for (int i = 0; i < g_hj_n; i++) {
         if (g_hj[i].state != 2) { busy = 1; continue; }
