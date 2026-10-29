@@ -518,6 +518,8 @@ void report_and_exit(int code) {
     { void smo_heap_report(FILE *out); smo_heap_report(stdout); }   /* smo_nn.c */
     { void smo_audio_report(FILE *out); smo_audio_report(stdout); }   /* smo_audio.c */
     { void smo_fast_report(FILE *out); smo_fast_report(stdout); }     /* smo_fast.c */
+    { void smo_yaz0_report(FILE *out); smo_yaz0_report(stdout); }     /* smo_yaz0.c */
+    { void smo_sharc_report(FILE *out); smo_sharc_report(stdout); }   /* smo_sharc.c */
     { void nerve_report(FILE *out); nerve_report(stdout); }   /* smo_nerve.c */
     { void fontll_report(FILE *out); fontll_report(stdout); }   /* nnfontll.c */
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }
