@@ -775,7 +775,7 @@ static float rs_scale(void) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
         if (v < 0.25f) v = 0.25f;
-        if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
+        if (v > 2.0f) v = 2.0f;                    /* above 1.0 = supersampling: at 2.0 the picture is 3200 x 1800, 4x the GPU work */
         g_rs = v;
     }
     return g_rs;
