@@ -314,7 +314,7 @@ static int compose(int mode, float U, const PerfMachine *m, const char *cpu_name
     fmt(wr[6].value, 48, "%.2f ms", f.render_ms); snprintf(wr[7].value, 48, "%d", slow);
     /* the picture */
     const PerfFrame *p = &f.pic;
-    Row pr[7] = {{"Window", C_PIC}, {"Game image", C_PIC}, {"Rendered at", C_PIC}, {"3D scene", C_PIC}, {"Scaling", C_PIC}, {"Frame limit", C_PIC}, {"Presentation", C_PIC}};
+    Row pr[7] = {{"Window", C_PIC}, {"Game image", C_PIC}, {"Rendered at (F9)", C_PIC}, {"3D scene", C_PIC}, {"Scaling", C_PIC}, {"Frame limit", C_PIC}, {"Presentation", C_PIC}};
     snprintf(pr[0].value, 48, "%dx%d", p->win_w, p->win_h);
     if (p->game_w > 0) snprintf(pr[1].value, 48, "%dx%d", p->game_w, p->game_h); else snprintf(pr[1].value, 48, "-");
     if (p->image_w > 0) snprintf(pr[2].value, 48, "%dx%d, %.0f%% (%s)", p->image_w, p->image_h, p->scale * 100.0f, f.scale_from); else snprintf(pr[2].value, 48, "-");
@@ -357,11 +357,13 @@ static int compose(int mode, float U, const PerfMachine *m, const char *cpu_name
     return 1;
 }
 
-/* ---- the overlay's thread: the machine twice a second (full overlay only), the picture ten times a second */
+/* ---- the overlay's thread: the machine twice a second (full overlay only), the pictures ten times a second: the panel
+ * (PERF_PANEL) and a notice (PERF_NOTICE, perf_overlay_notice), each published under g_plock with a version */
 static CRITICAL_SECTION g_plock;
-static uint8_t *g_pic;                     /* the latest picture, RGBA premultiplied */
-static int g_pic_w, g_pic_h, g_pic_margin;
-static unsigned g_pic_ver;
+static struct { uint8_t *px; int w, h; unsigned ver; } g_pic[2];      /* the latest pictures, RGBA premultiplied */
+static int g_pic_margin;
+static char g_notice[96];                  /* the notice's text and until when it is shown (seconds, now_s) */
+static double g_notice_until;
 static int load_font(void) {
     static int tried;
     if (tried) return g_font != NULL;
@@ -374,19 +376,37 @@ static int load_font(void) {
     if (!g_font) printf("perf overlay: the game's MessageFont38 could not be read: no overlay\n");
     return g_font != NULL;
 }
-static void publish(int ok) {
-    uint8_t *out = ok ? malloc((size_t)g_cv.w * g_cv.h * 4) : NULL;
-    if (out) memcpy(out, g_cv.px, (size_t)g_cv.w * g_cv.h * 4);
+static void publish(int which, int ok, float fade) {     /* the canvas, times `fade` */
+    size_t n = ok ? (size_t)g_cv.w * g_cv.h * 4 : 0;
+    uint8_t *out = ok ? malloc(n) : NULL;
+    unsigned f = (unsigned)(fade * 256.0f);
+    for (size_t i = 0; out && i < n; i++) out[i] = (uint8_t)(g_cv.px[i] * f >> 8);
     EnterCriticalSection(&g_plock);
-    free(g_pic); g_pic = out; g_pic_w = out ? g_cv.w : 0; g_pic_h = out ? g_cv.h : 0; g_pic_margin = (int)fmaxf(8.0f, (float)g_win_h / 90.0f); g_pic_ver++;
+    free(g_pic[which].px); g_pic[which].px = out; g_pic[which].w = out ? g_cv.w : 0; g_pic[which].h = out ? g_cv.h : 0; g_pic[which].ver++;
+    g_pic_margin = (int)fmaxf(8.0f, (float)g_win_h / 90.0f);
     LeaveCriticalSection(&g_plock);
+}
+static int compose_notice(float U, const char *s) {   /* one line, larger than the panel's, white on a dark box */
+    UiFontInfo fi;
+    ui_font_info(g_font, &fi);
+    g_em = 0.72f * U; g_ts = g_em / (float)fi.height;
+    glyphs_make();
+    float pad = 0.7f * U;
+    int w = (int)(text_w(s) + 2 * pad + 1), h = (int)(U + pad + 1);
+    if (g_cv.w != w || g_cv.h != h) { free(g_cv.px); g_cv.px = malloc((size_t)w * h * 4); g_cv.w = w; g_cv.h = h; g_cv.ch = 4; }
+    if (!g_cv.px) return 0;
+    memset(g_cv.px, 0, (size_t)w * h * 4);
+    rrect(0, 0, (float)w, (float)h, 0.35f * U, 0x000000b4u);
+    text(pad, pad * 0.5f, U, 0xffffffffu, s);
+    return 1;
 }
 static DWORD WINAPI overlay_thread(LPVOID arg) {
     (void)arg;
     PerfMachine m = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-    char cpu_name[64];
+    char cpu_name[64], notice[96];
     perf_machine_cpu_name(cpu_name, sizeof cpu_name);
     double sampled = 0;
+    int notice_shown = 0;
     for (int was = PERF_OFF;; Sleep(100)) {
         int mode = perf_overlay_mode();
         float u = fmaxf(17.0f, (float)g_win_h / 48.0f);              /* a row: 22.5 pixels on a window 1080 high, at least 17 */
@@ -398,13 +418,22 @@ static DWORD WINAPI overlay_thread(LPVOID arg) {
             static int n; static double sum;
             if (ok && mode == PERF_FULL && n < 21 && ++n > 1 && (sum += now_s() - t0, n == 21))      /* the mean of 20, the font's loading left out */
                 printf("perf overlay: the full panel (%dx%d) composed in %.1f ms on its own thread (mean of 20), ten times a second\n", g_cv.w, g_cv.h, sum * 1000.0 / 20);
-            publish(ok);
+            publish(PERF_PANEL, ok, 1.0f);
         }
         was = mode;
+        EnterCriticalSection(&g_plock);
+        double left = g_notice_until - now_s();
+        snprintf(notice, sizeof notice, "%s", g_notice);
+        LeaveCriticalSection(&g_plock);
+        if (left > 0 || notice_shown) {                           /* shown, then faded out over its last half second */
+            int ok = left > 0 && load_font() && compose_notice(1.3f * u, notice);
+            publish(PERF_NOTICE, ok, left > 0.5 ? 1.0f : (float)(left / 0.5));
+            notice_shown = ok;
+        }
     }
     return 0;
 }
-static void thread_start(void) {          /* render thread, the first frame with the overlay on */
+static void thread_start(void) {          /* render thread: the first frame with the overlay on, or the first notice */
     static int started;
     if (started) return;
     started = 1;
@@ -412,16 +441,24 @@ static void thread_start(void) {          /* render thread, the first frame with
     HANDLE h = CreateThread(NULL, 0, overlay_thread, NULL, 0, NULL);
     if (h) CloseHandle(h);
 }
+void perf_overlay_notice(const char *text, int win_h) {
+    thread_start();
+    InterlockedExchange(&g_win_h, win_h);
+    EnterCriticalSection(&g_plock);
+    snprintf(g_notice, sizeof g_notice, "%s", text);
+    g_notice_until = now_s() + 2.5;
+    LeaveCriticalSection(&g_plock);
+}
 
-int perf_overlay_picture(uint8_t *dst, size_t cap, int *w, int *h, unsigned *version, int *margin) {
-    if (perf_overlay_mode() == PERF_OFF || !g_pic_ver) return 0;
+int perf_overlay_picture(int which, uint8_t *dst, size_t cap, int *w, int *h, unsigned *version, int *margin) {
+    if ((which == PERF_PANEL && perf_overlay_mode() == PERF_OFF) || !g_pic[which].ver) return 0;
     int r;
     EnterCriticalSection(&g_plock);
-    *w = g_pic_w; *h = g_pic_h; *margin = g_pic_margin;
-    if (!g_pic) r = 0;
-    else if (*version == g_pic_ver) r = 1;
-    else if (cap < (size_t)g_pic_w * g_pic_h * 4) r = -1;
-    else { memcpy(dst, g_pic, (size_t)g_pic_w * g_pic_h * 4); *version = g_pic_ver; r = 2; }
+    *w = g_pic[which].w; *h = g_pic[which].h; *margin = g_pic_margin;
+    if (!g_pic[which].px) r = 0;
+    else if (*version == g_pic[which].ver) r = 1;
+    else if (cap < (size_t)*w * *h * 4) r = -1;
+    else { memcpy(dst, g_pic[which].px, (size_t)*w * *h * 4); *version = g_pic[which].ver; r = 2; }
     LeaveCriticalSection(&g_plock);
     return r;
 }

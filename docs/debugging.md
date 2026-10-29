@@ -321,7 +321,9 @@ The end of every log has the counts that tell whether a run was healthy:
   `SMO_VK_SCALE=<scale>` wins for a run; `auto` takes the window's size at start, at most 1.0): the game's screen-sized targets (about 16:9, `rs_screen_class` in `nvn_vk_draw.c`) are made at that
   scale. The log's `nvn_vk_scale:` lines give the scale and the window picture's size at start, and at exit the images
   made scaled, the fragment stages translated for it and the uploads, read-backs and copies that touched a scaled
-  image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size.
+  image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size. F9 / Shift+F9 change the
+  scale while the game runs (`rs_apply`: a `nvn_vk_scale: F9:` line with the scale and the images let go);
+  `SMO_VK_F9_AT=<frame>[,<frame>...]` (test) presses F9 after those frames.
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
   focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
   the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.

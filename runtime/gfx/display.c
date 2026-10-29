@@ -141,6 +141,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     if (m == WM_ERASEBKGND) return 1;
     if (m == WM_KEYDOWN && w == VK_F10 && !(l & (1 << 30))) { perf_overlay_toggle(); return 0; }     /* F10 = the performance overlay (perf_overlay.c) */
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) { void nvn_vk_scale_step(int dir); nvn_vk_scale_step(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); return 0; }     /* F9 / Shift+F9 = the next / previous internal resolution scale (nvn_vk_draw.c) */
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) {      /* F12 = the console's Capture button (once per press) */
         void smo_capture_request(void);
         smo_capture_request();

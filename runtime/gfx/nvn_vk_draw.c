@@ -782,24 +782,30 @@ struct VTex {
  * reads keep the game's sizes. Fragment stages are translated with MxIn.screen_scale (another hash: ssrc_hb). At 1.0 none
  * of this runs: every branch is behind RS_ON or VTex.rs / R.pass_rs, which are then 0. */
 static float g_rs = -1.0f;
+static int g_rs_tr;                                /* fragment stages are translated with screen_scale: from the first scale below 1.0 on (RS_ON) */
+static int g_rs_step = -1;                         /* the F9 step in use (k_rs_steps); -1: the start's */
 static LONG64 g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, g_rs_blits;
+static float rs_auto(void) {                       /* auto: the window's size (the swapchain is made before the first image), so no pixel is drawn only to be scaled down */
+    float sw = (float)V.extent.width / 1600.0f, sh = (float)V.extent.height / 900.0f, v = sw < sh ? sw : sh;
+    return v > 0 ? v : 1.0f;
+}
+static float rs_clamp(float v) { return v < 0.25f ? 0.25f : v > 1.0f ? 1.0f : v; }      /* above 1.0 (supersampling) is not offered: not tested */
 static float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
-        if (v <= 0) {                              /* auto: the window's size (the swapchain is made before the first image), so no pixel is drawn only to be scaled down */
-            float sw = (float)V.extent.width / 1600.0f, sh = (float)V.extent.height / 900.0f;
-            v = sw < sh ? sw : sh;
-            if (v <= 0) v = 1.0f;
-        }
-        if (v < 0.25f) v = 0.25f;
-        if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
-        g_rs = v;
+        g_rs = rs_clamp(v <= 0 ? rs_auto() : v);
+        g_rs_tr = g_rs != 1.0f;
     }
     return g_rs;
 }
-static const char *rs_from(void) { return getenv("SMO_VK_SCALE") && atof(getenv("SMO_VK_SCALE")) > 0 ? "SMO_VK_SCALE" : "graphics.ini"; }
-#define RS_ON (rs_scale() != 1.0f)
+static const float k_rs_steps[] = {0.0f, 1.0f, 0.85f, 0.75f, 0.67f, 0.5f};      /* F9 goes right, Shift+F9 left; 0 = auto */
+#define RS_NSTEPS ((int)(sizeof k_rs_steps / sizeof k_rs_steps[0]))
+static const char *rs_from(void) {
+    if (g_rs_step >= 0) return k_rs_steps[g_rs_step] > 0 ? "F9" : "auto, F9";
+    return getenv("SMO_VK_SCALE") && atof(getenv("SMO_VK_SCALE")) > 0 ? "SMO_VK_SCALE" : gfx_options()->scale > 0 ? "graphics.ini" : "auto";
+}
+#define RS_ON (rs_scale(), g_rs_tr)              /* the translations and push constants of a scaled run (once on, they stay: switching back to 1.0 keeps the stages) */
 /* The game's screen-sized targets (measured with SMO_VK_RTLOG): its window textures (1600 x 900), the title's and every stage's
  * scene buffers (1600 x 900, 1440 x 810 in Cascade Kingdom, ...) and their halvings down to 11 x 6 are all about 16:9; every
  * other target it makes is square, 2:1, 4:1 or upright (shadow and cube maps, look-up tables, icons). So the screen class is
@@ -1054,6 +1060,101 @@ static void tex_reclaim(LONG64 frame) {
     g_rc_n = n;
 }
 static int lvl_(int v, int l) { v >>= l; return v > 0 ? v : 1; }
+/* F9 / Shift+F9 (display.c) while the game runs: the next / previous internal resolution scale of k_rs_steps, written to
+ * graphics.ini. The render thread applies it after a present (rs_apply): every texture of the screen class gets a new
+ * image at the new scale at once (vt_get2), what the old one holds blitted into it level by level (linear for colour,
+ * nearest for depth where the format can be blitted), and the old one goes when the command buffer has finished with it.
+ * The content matters: the game draws some of these images once, when a stage loads (the ground markings of the Metro
+ * Kingdom's rooftops were gone after a step when the image was only let go). Fragment stages translated for a scale stay
+ * in use at 1.0 (mx_fcs = 1; mx_tf compares sizes), so going back to 1.0 makes no stage again; the first step below 1.0
+ * in a run that started at 1.0 translates the fragment stages again as the game uses them (a stutter while they compile). */
+static volatile LONG g_rs_req = -1;                /* the step asked for and not applied yet; -1: none */
+static int rs_step_now(void) {                     /* the step in use: the start's is auto, else the nearest */
+    if (g_rs_step >= 0) return g_rs_step;
+    if (!getenv("SMO_VK_SCALE") && gfx_options()->scale <= 0) return 0;
+    int k = 1;
+    for (int i = 2; i < RS_NSTEPS; i++) if (fabsf(k_rs_steps[i] - rs_scale()) < fabsf(k_rs_steps[k] - rs_scale())) k = i;
+    return k;
+}
+void nvn_vk_scale_step(int dir) {                  /* display.c, the window's thread */
+    if (!V.alive) { printf("nvn_vk_scale: F9 changes the internal resolution of the Vulkan renderer only\n"); return; }
+    LONG cur = g_rs_req >= 0 ? g_rs_req : rs_step_now();
+    InterlockedExchange(&g_rs_req, (LONG)(((cur + dir) % RS_NSTEPS + RS_NSTEPS) % RS_NSTEPS));
+}
+static VTex *vt_get2(Tex *t, int sync);
+static int rs_remake(Tex *t) {                     /* the texture's image at the current scale, its content kept; 1 = remade */
+    VTex *o = t->vk;
+    t->vk = NULL;
+    VTex *n = vt_get2(t, 0);
+    if (n->w == o->w && n->h == o->h) {            /* not scaled at either scale (a format that cannot be a target): the old one stays */
+        t->vk = o;
+        if (g_ngarbage == g_garbage_cap) { g_garbage_cap = g_garbage_cap ? g_garbage_cap * 2 : 256; g_garbage = realloc(g_garbage, sizeof *g_garbage * (size_t)g_garbage_cap); }
+        g_garbage[g_ngarbage].vt = n; g_garbage[g_ngarbage++].serial = R.serial + 1;
+        return 0;
+    }
+    VkFlags feat = o->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+                                                          : VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if (o->samples == 1 && n->samples == 1 && o->layout != VK_IMAGE_LAYOUT_UNDEFINED && fmt_supported(o->fmt, feat)) {
+        vt_layout(o, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(n, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        {   /* after the zero clear of the new image (vt_get2): two transfer writes */
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        }
+        int lv = o->levels < n->levels ? o->levels : n->levels;
+        for (int l = 0; l < lv; l++) {
+            VkImageBlit b;
+            memset(&b, 0, sizeof b);
+            b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = o->aspect; b.srcSubresource.mipLevel = b.dstSubresource.mipLevel = (uint32_t)l;
+            b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+            b.srcOffsets[1].x = lvl_(o->w, l); b.srcOffsets[1].y = lvl_(o->h, l); b.srcOffsets[1].z = 1;
+            b.dstOffsets[1].x = lvl_(n->w, l); b.dstOffsets[1].y = lvl_(n->h, l); b.dstOffsets[1].z = 1;
+            vkCmdBlitImage(R.cmd, o->img, LAYOUT(o, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), n->img, LAYOUT(n, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &b,
+                           o->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        }
+        g_rs_blits++;
+    }
+    memcpy(n->lvl_drawn, o->lvl_drawn, sizeof n->lvl_drawn);
+    if (g_ngarbage == g_garbage_cap) { g_garbage_cap = g_garbage_cap ? g_garbage_cap * 2 : 256; g_garbage = realloc(g_garbage, sizeof *g_garbage * (size_t)g_garbage_cap); }
+    g_garbage[g_ngarbage].vt = o; g_garbage[g_ngarbage++].serial = R.serial + 1;       /* the command buffer being recorded reads it */
+    return 1;
+}
+static void rs_apply(LONG64 frame) {               /* render thread, after a present: outside any pass */
+    {   /* SMO_VK_F9_AT=<frame>[,<frame>...] (test aid): F9 as if pressed after those frames */
+        static char *at = (char *)-1;
+        if (at == (char *)-1) at = getenv("SMO_VK_F9_AT");
+        for (const char *p = at; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : "") if (atoll(p) == frame) { printf("nvn_vk_scale: F9 at frame %lld (SMO_VK_F9_AT)\n", (long long)frame); nvn_vk_scale_step(1); }
+    }
+    LONG k = g_rs_req < 0 ? -1 : InterlockedExchange(&g_rs_req, -1);
+    if (k < 0) return;
+    float was = rs_scale(), v = rs_clamp(k_rs_steps[k] > 0 ? k_rs_steps[k] : rs_auto());
+    int n = 0;
+    g_rs_step = (int)k;
+    if (v != was) {
+        Tex **list = NULL;
+        int nl = 0, cap = 0;
+        for (VTex *vt = g_vtex_all; vt; vt = vt->next) {      /* first the list: rs_remake adds to g_vtex_all */
+            Tex *t = vt->t;
+            if (!t || t->dead || t->vk != vt || vt->layers != 1 || vt->decode || vt->is3d || !rs_screen_class(t->b.width, t->b.height)) continue;
+            if (t->b.target != 1 && t->b.target != 4 && t->b.target != 5) continue;
+            if (nl == cap) { cap = cap ? cap * 2 : 256; list = realloc(list, sizeof *list * (size_t)cap); }
+            list[nl++] = t;
+        }
+        g_rs = v;
+        if (v != 1.0f) g_rs_tr = 1;
+        pass_end(); cmd_begin();
+        for (int i = 0; i < nl; i++) n += rs_remake(list[i]);
+        free(list);
+    }
+    int saved = gfx_options_write_scale(k_rs_steps[k]);
+    {   char msg[96];
+        snprintf(msg, sizeof msg, "Internal resolution %.0f%%%s  %dx%d  (F9)", (double)v * 100.0, k_rs_steps[k] > 0 ? "" : ", auto", (int)(1600.0f * v + 0.5f), (int)(900.0f * v + 0.5f));
+        perf_overlay_notice(msg, (int)V.extent.height);
+    }
+    printf("nvn_vk_scale: F9: internal resolution scale %.2f%s (was %.2f): %d images made again at it, their content blitted; graphics.ini %s\n", (double)v,
+           k_rs_steps[k] > 0 ? "" : " (auto)", (double)was, n, saved ? "updated" : "NOT written");
+    if (gfx_options()->profile == 1) printf("nvn_vk_scale: graphics.ini has profile = low, whose resolution_scale wins at the next start\n");
+}
 /* A temporary image of w x h (one level, one layer, the format of `like`) for an upload into, or a read-back from,
  * an image that is smaller than the game's texture. The command buffer is being recorded; the image goes when it has finished. */
 static VTex *rs_temp(VTex *like, int w, int h) {
@@ -1169,7 +1270,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         vt->levels = nvn_front_tex_levels(t); vt->layers = nvn_front_tex_layers(t); vt->samples = b->samples > 1 ? b->samples : 1; vt->is3d = b->target == 2;
         if (b->target == 0 || b->target == 3) { ci.imageType = VK_IMAGE_TYPE_1D; vt->h = 1; if (b->target == 3) vt->layers = b->height > 0 && b->depth <= 1 ? b->height : vt->layers; }
         else ci.imageType = vt->is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        if (RS_ON && (b->target == 1 || b->target == 4 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
+        if (rs_scale() != 1.0f && (b->target == 1 || b->target == 4 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
             (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)))) {      /* a screen-class target */
             int gw = vt->w, gh = vt->h, lv = 1;
             vt->w = (int)((float)gw * rs_scale() + 0.5f); vt->h = (int)((float)gh * rs_scale() + 0.5f);
@@ -3594,21 +3695,25 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
-/* the performance overlay (perf_overlay.c): its picture (RGBA, alpha premultiplied) blended over the window image's
- * top-left corner by one textured rectangle, so the game shows through the panel as through TotK recomp's. The picture
- * goes into an image of its own only when perf_overlay.c composed a new one (about ten times a second), from an upload
- * buffer of the command buffer being recorded (one per slot: a slot is waited for before it records again). The image
- * grows when the panel does; the one it replaces is destroyed once the submissions that read it have finished. The
- * window images get views of their own, dropped with the swapchain (perf_views_drop). */
-static struct {
+/* the performance overlay (perf_overlay.c): its pictures (RGBA, alpha premultiplied) - the panel in the top-left corner,
+ * a notice (F9's new resolution) at the top middle - blended over the window image by one textured rectangle each, so
+ * the game shows through them as through TotK recomp's panel. A picture goes into an image of its own only when
+ * perf_overlay.c composed a new one (about ten times a second), from an upload buffer of the command buffer being
+ * recorded (one per slot: a slot is waited for before it records again). An image grows when its picture does; the one
+ * it replaces is destroyed once the submissions that read it have finished. The window images get views of their own,
+ * dropped with the swapchain (perf_views_drop). */
+typedef struct {
     VkImage img; VMem mem; VkImageView view; VkDescriptorSet set; int iw, ih;      /* the picture's image (iw x ih, >= w x h) */
     struct { VkImage img; VMem mem; VkImageView view; VkDescriptorSet set; uint64_t serial; } old;
     int w, h, margin, have; unsigned ver;
-    VkFormat fmt;                                  /* the window's format: the pipeline's, and the picture's in its encoding */
+    struct { VkBuffer buf; VMem mem; uint64_t size; } up[NSLOT];
+} PerfLayer;
+static struct {
+    PerfLayer l[2];                                /* PERF_PANEL, PERF_NOTICE */
+    VkFormat fmt;                                  /* the window's format: the pipeline's, and the pictures' in its encoding */
     VkSampler smp; VkDescriptorSetLayout dsl; VkDescriptorPool dp; VkPipelineLayout pl; VkPipeline pipe; int failed;
     VkImage wimg[16]; VkImageView wview[16];
 } g_po;
-static struct { VkBuffer buf; VMem mem; uint64_t size; } g_perf[NSLOT];
 static void perf_views_drop(void) {                /* swapchain_destroy (nvn_vk.c), after the device is idle */
     for (int i = 0; i < 16; i++) if (g_po.wview[i]) { vkDestroyImageView(V.device, g_po.wview[i], NULL); g_po.wview[i] = NULL; g_po.wimg[i] = NULL; }
 }
@@ -3635,9 +3740,9 @@ static int perf_pipeline(void) {
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = 1; li.pBindings = &lb;
         VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &g_po.dsl));
-        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};
         VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; pi.maxSets = 2; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; pi.maxSets = 4; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
         VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &g_po.dp));
         VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 24};
         VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -3672,60 +3777,54 @@ static int perf_pipeline(void) {
     g_po.fmt = V.format.format;
     return 1;
 }
-static int perf_image(int w, int h) {              /* an image for a w x h picture, the old one kept until it is not read any more; 0: not yet */
-    if (g_po.old.img && R.done >= g_po.old.serial) {
-        vkFreeDescriptorSets(V.device, g_po.dp, 1, &g_po.old.set); vkDestroyImageView(V.device, g_po.old.view, NULL);
-        vkDestroyImage(V.device, g_po.old.img, NULL); vmem_free(g_po.old.mem); memset(&g_po.old, 0, sizeof g_po.old);
-    }
-    if (g_po.img && w <= g_po.iw && h <= g_po.ih) return 1;
-    if (g_po.old.img) return 0;                    /* a second growth while the first old image may still be read: a later frame */
-    if (g_po.img) { g_po.old.img = g_po.img; g_po.old.mem = g_po.mem; g_po.old.view = g_po.view; g_po.old.set = g_po.set; g_po.old.serial = R.serial + 1; }
-    g_po.iw = (w + 63) & ~63; g_po.ih = (h + 63) & ~63;
+static void perf_old_free(PerfLayer *L) {
+    vkFreeDescriptorSets(V.device, g_po.dp, 1, &L->old.set); vkDestroyImageView(V.device, L->old.view, NULL);
+    vkDestroyImage(V.device, L->old.img, NULL); vmem_free(L->old.mem); memset(&L->old, 0, sizeof L->old);
+}
+static int perf_image(PerfLayer *L, int w, int h) { /* an image for a w x h picture, the old one kept until it is not read any more; 0: not yet */
+    if (L->old.img && R.done >= L->old.serial) perf_old_free(L);
+    if (L->img && w <= L->iw && h <= L->ih) return 1;
+    if (L->old.img) return 0;                      /* a second growth while the first old image may still be read: a later frame */
+    if (L->img) { L->old.img = L->img; L->old.mem = L->mem; L->old.view = L->view; L->old.set = L->set; L->old.serial = R.serial + 1; }
+    L->iw = (w + 63) & ~63; L->ih = (h + 63) & ~63;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkMemoryRequirements rq;
-    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = perf_unorm(V.format.format); ci.extent.width = (uint32_t)g_po.iw; ci.extent.height = (uint32_t)g_po.ih; ci.extent.depth = 1;
+    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = perf_unorm(V.format.format); ci.extent.width = (uint32_t)L->iw; ci.extent.height = (uint32_t)L->ih; ci.extent.depth = 1;
     ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VKC(vkCreateImage(V.device, &ci, NULL, &g_po.img));
-    vkGetImageMemoryRequirements(V.device, g_po.img, &rq);
-    g_po.mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    VKC(vkBindImageMemory(V.device, g_po.img, g_po.mem.mem, g_po.mem.off));
+    VKC(vkCreateImage(V.device, &ci, NULL, &L->img));
+    vkGetImageMemoryRequirements(V.device, L->img, &rq);
+    L->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VKC(vkBindImageMemory(V.device, L->img, L->mem.mem, L->mem.off));
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = g_po.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format; vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
-    VKC(vkCreateImageView(V.device, &vi, NULL, &g_po.view));
+    vi.image = L->img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format; vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+    VKC(vkCreateImageView(V.device, &vi, NULL, &L->view));
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = g_po.dp; ai.descriptorSetCount = 1; ai.pSetLayouts = &g_po.dsl;
-    VKC(vkAllocateDescriptorSets(V.device, &ai, &g_po.set));
-    VkDescriptorImageInfo ii = {NULL, g_po.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VKC(vkAllocateDescriptorSets(V.device, &ai, &L->set));
+    VkDescriptorImageInfo ii = {NULL, L->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wr.dstSet = g_po.set; wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii;
+    wr.dstSet = L->set; wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii;
     vkUpdateDescriptorSets(V.device, 1, &wr, 0, NULL);
-    image_barrier(g_po.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    g_po.have = 0;
+    image_barrier(L->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    L->have = 0;
     return 1;
 }
-static void perf_draw(uint32_t index) {
-    if (index >= 16) return;
-    if (!g_po.pipe) {                              /* nothing made until there is something to draw */
-        int w, h, m; unsigned v0 = 0;
-        if (!perf_overlay_picture(NULL, 0, &w, &h, &v0, &m)) return;
-    }
-    if (!perf_pipeline()) return;
+static int perf_update(int which) {                /* the layer's latest picture into its image; 1 = something to draw */
+    PerfLayer *L = &g_po.l[which];
     int w = 0, h = 0, margin = 0;
-    unsigned ver = g_po.ver;
-    uint64_t cap = g_perf[R.cur].size;
-    int r = perf_overlay_picture(g_perf[R.cur].buf ? g_perf[R.cur].mem.map : NULL, (size_t)cap, &w, &h, &ver, &margin);
+    unsigned ver = L->ver;
+    int r = perf_overlay_picture(which, L->up[R.cur].buf ? L->up[R.cur].mem.map : NULL, (size_t)L->up[R.cur].size, &w, &h, &ver, &margin);
     if (r == -1) {                                 /* this slot's upload buffer is too small: a larger one, then again */
-        if (g_perf[R.cur].buf) { vkDestroyBuffer(V.device, g_perf[R.cur].buf, NULL); vmem_free(g_perf[R.cur].mem); }
-        g_perf[R.cur].size = (uint64_t)w * h * 4 * 2;
-        g_perf[R.cur].buf = vbuf_new(g_perf[R.cur].size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_perf[R.cur].mem);
-        r = perf_overlay_picture(g_perf[R.cur].mem.map, (size_t)g_perf[R.cur].size, &w, &h, &ver, &margin);
+        if (L->up[R.cur].buf) { vkDestroyBuffer(V.device, L->up[R.cur].buf, NULL); vmem_free(L->up[R.cur].mem); }
+        L->up[R.cur].size = (uint64_t)w * h * 4 * 2;
+        L->up[R.cur].buf = vbuf_new(L->up[R.cur].size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &L->up[R.cur].mem);
+        r = perf_overlay_picture(which, L->up[R.cur].mem.map, (size_t)L->up[R.cur].size, &w, &h, &ver, &margin);
     }
-    if (r <= 0 || w <= 0 || h <= 0) return;
-    if (w + margin > (int)V.extent.width || h + margin > (int)V.extent.height) return;
-    if (r == 2 && perf_image(w, h)) {              /* a new picture: into the image */
+    if (r <= 0 || w <= 0 || h <= 0 || w + margin > (int)V.extent.width || h + margin > (int)V.extent.height) return 0;
+    if (r == 2 && perf_image(L, w, h)) {           /* a new picture: into the image */
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = g_po.img;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = L->img;
         b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
         b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3734,13 +3833,23 @@ static void perf_draw(uint32_t index) {
         memset(&c, 0, sizeof c);
         c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
         c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
-        vkCmdCopyBufferToImage(R.cmd, g_perf[R.cur].buf, g_po.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        vkCmdCopyBufferToImage(R.cmd, L->up[R.cur].buf, L->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-        g_po.ver = ver; g_po.w = w; g_po.h = h; g_po.margin = margin; g_po.have = 1;
+        L->ver = ver; L->w = w; L->h = h; L->margin = margin; L->have = 1;
     }
-    if (!g_po.have) return;
+    return L->have;
+}
+static void perf_draw(uint32_t index) {
+    if (index >= 16) return;
+    if (!g_po.pipe) {                              /* nothing made until there is something to draw */
+        int w, h, m; unsigned v0 = 0, v1 = 0;
+        if (!perf_overlay_picture(PERF_PANEL, NULL, 0, &w, &h, &v0, &m) && !perf_overlay_picture(PERF_NOTICE, NULL, 0, &w, &h, &v1, &m)) return;
+    }
+    if (!perf_pipeline()) return;
+    int on[2] = {perf_update(PERF_PANEL), perf_update(PERF_NOTICE)};
+    if (!on[0] && !on[1]) return;
     if (g_po.wimg[index] != V.images[index]) {     /* this window image's view */
         if (g_po.wview[index]) vkDestroyImageView(V.device, g_po.wview[index], NULL);
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -3748,33 +3857,38 @@ static void perf_draw(uint32_t index) {
         VKC(vkCreateImageView(V.device, &vi, NULL, &g_po.wview[index]));
         g_po.wimg[index] = V.images[index];
     }
-    {   /* the window image: from the blits into it (transfer) to a colour target, and back for what follows */
-        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = V.images[index];
-        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
-        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-        VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        ca.imageView = g_po.wview[index]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea.offset.x = g_po.margin; ri.renderArea.offset.y = g_po.margin; ri.renderArea.extent.width = (uint32_t)g_po.w; ri.renderArea.extent.height = (uint32_t)g_po.h;
-        ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
-        vkCmdBeginRendering(R.cmd, &ri);
-        VkViewport vp = {0, 0, (float)V.extent.width, (float)V.extent.height, 0, 1};
-        vkCmdSetViewport(R.cmd, 0, 1, &vp); vkCmdSetScissor(R.cmd, 0, 1, &ri.renderArea);
-        vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pipe);
-        vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pl, 0, 1, &g_po.set, 0, NULL);
-        float pc[6] = {(float)g_po.margin / (float)V.extent.width * 2 - 1, (float)g_po.margin / (float)V.extent.height * 2 - 1,
-                       (float)(g_po.margin + g_po.w) / (float)V.extent.width * 2 - 1, (float)(g_po.margin + g_po.h) / (float)V.extent.height * 2 - 1,
-                       (float)g_po.w / (float)g_po.iw, (float)g_po.h / (float)g_po.ih};
+    /* the window image: from the blits into it (transfer) to a colour target, and back for what follows */
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = V.images[index];
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = g_po.wview[index]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea.extent = V.extent; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(R.cmd, &ri);
+    VkViewport vp = {0, 0, (float)V.extent.width, (float)V.extent.height, 0, 1};
+    vkCmdSetViewport(R.cmd, 0, 1, &vp);
+    vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pipe);
+    for (int k = 0; k < 2; k++) {
+        PerfLayer *L = &g_po.l[k];
+        if (!on[k]) continue;
+        int x = k == PERF_PANEL ? L->margin : ((int)V.extent.width - L->w) / 2, y = k == PERF_PANEL ? L->margin : (int)V.extent.height / 14;
+        VkRect2D sc = {{x, y}, {(uint32_t)L->w, (uint32_t)L->h}};
+        vkCmdSetScissor(R.cmd, 0, 1, &sc);
+        vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_po.pl, 0, 1, &L->set, 0, NULL);
+        float pc[6] = {(float)x / (float)V.extent.width * 2 - 1, (float)y / (float)V.extent.height * 2 - 1,
+                       (float)(x + L->w) / (float)V.extent.width * 2 - 1, (float)(y + L->h) / (float)V.extent.height * 2 - 1,
+                       (float)L->w / (float)L->iw, (float)L->h / (float)L->ih};
         vkCmdPushConstants(R.cmd, g_po.pl, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
         vkCmdDraw(R.cmd, 4, 1, 0, 0);
-        vkCmdEndRendering(R.cmd);
-        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     }
+    vkCmdEndRendering(R.cmd);
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     R.pipe_bound = NULL; R.dyn_dirty = 1; R.vi_dirty = 1; R.dyn3_dirty = 1; g_dyn_inval = 1;      /* the game's draws set their own pipeline and states again */
 }
 static void overlay_draw(uint32_t index) {
@@ -4214,6 +4328,7 @@ swap: ;
         }
         t_prev = t_now;
         g_cur_frame = frame + 1;
+        rs_apply(frame);
     }
     {   /* what this frame paid for textures made or read at their use (hold log), then the textures made ahead */
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
@@ -4430,9 +4545,12 @@ static void vkd_shutdown(void) {
     if (g_occ_pool) { vkDestroyQueryPool(V.device, g_occ_pool, NULL); g_occ_pool = NULL; g_occ_qn = 0; }
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
     tc_shutdown();
-    for (int i = 0; i < NSLOT; i++) if (g_perf[i].buf) { vkDestroyBuffer(V.device, g_perf[i].buf, NULL); vmem_free(g_perf[i].mem); g_perf[i].buf = NULL; g_perf[i].size = 0; }
-    perf_image(0, 0);                              /* the device is idle: the replaced picture image goes */
-    if (g_po.img) { vkDestroyImageView(V.device, g_po.view, NULL); vkDestroyImage(V.device, g_po.img, NULL); vmem_free(g_po.mem); }
+    for (int k = 0; k < 2; k++) {                  /* the device is idle: the overlay's images and buffers go */
+        PerfLayer *L = &g_po.l[k];
+        for (int i = 0; i < NSLOT; i++) if (L->up[i].buf) { vkDestroyBuffer(V.device, L->up[i].buf, NULL); vmem_free(L->up[i].mem); }
+        if (L->old.img) perf_old_free(L);
+        if (L->img) { vkDestroyImageView(V.device, L->view, NULL); vkDestroyImage(V.device, L->img, NULL); vmem_free(L->mem); }
+    }
     if (g_po.pipe) vkDestroyPipeline(V.device, g_po.pipe, NULL);
     if (g_po.pl) { vkDestroyPipelineLayout(V.device, g_po.pl, NULL); vkDestroyDescriptorPool(V.device, g_po.dp, NULL); vkDestroyDescriptorSetLayout(V.device, g_po.dsl, NULL); vkDestroySampler(V.device, g_po.smp, NULL); }
     perf_views_drop();

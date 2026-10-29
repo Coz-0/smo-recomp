@@ -61,6 +61,7 @@ static const char *const k_default_ini =
 ";   0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the 2D\r\n"
 ";   interface too (it gets softer), and is scaled to the window size. auto: the window's size at start, at most\r\n"
 ";   1.0 (a 1280x720 window: 0.8), so no pixel is drawn only to be scaled down.\r\n"
+";   F9 / Shift+F9 step it while the game runs (auto, 1.0, 0.85, 0.75, 0.67, 0.5) and write it here.\r\n"
 "resolution_scale = auto\r\n"
 "\r\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
@@ -182,3 +183,37 @@ const GfxOptions *gfx_options(void) {
 }
 
 int perf_overlay_default(void) { return gfx_options()->perf_overlay; }      /* perf_overlay.c */
+
+/* F9 (nvn_vk_draw.c rs_step): the resolution_scale line of graphics.ini set to `v` (0 = auto) in place, the rest of
+ * the file kept; a file without the key gets it at the end. 1 = written. */
+int gfx_options_write_scale(float v) {
+    const char *path = gfx_options()->path;
+    FILE *f = fopen(path, "rb");
+    char *old = NULL, *out;
+    long n = 0;
+    if (f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); old = malloc((size_t)n + 1); if (old && fread(old, 1, (size_t)n, f) != (size_t)n) n = 0; fclose(f); }
+    if (!old) { old = malloc(1); n = 0; }
+    if (!old) return 0;
+    old[n] = 0;
+    char val[32];
+    if (v > 0) snprintf(val, sizeof val, "%.2f", v); else snprintf(val, sizeof val, "auto");
+    out = malloc((size_t)n + 64);
+    if (!out) { free(old); return 0; }
+    size_t o = 0;
+    int done = 0;
+    for (char *l = old; *l;) {                     /* line by line: the first active resolution_scale line is replaced */
+        char *e = strchr(l, '\n'), *k = l;
+        size_t len = e ? (size_t)(e - l + 1) : strlen(l);
+        while (*k == ' ' || *k == '\t') k++;
+        if (!done && !_strnicmp(k, "resolution_scale", 16) && (k[16] == ' ' || k[16] == '=' || k[16] == '\t')) {
+            o += (size_t)sprintf(out + o, "resolution_scale = %s%s", val, len > 1 && l[len - 2] == '\r' ? "\r\n" : "\n");
+            done = 1;
+        } else { memcpy(out + o, l, len); o += len; }
+        l += len;
+    }
+    if (!done) o += (size_t)sprintf(out + o, "%sresolution_scale = %s\r\n", o && out[o - 1] != '\n' ? "\r\n" : "", val);
+    int ok = (f = fopen(path, "wb")) != NULL && fwrite(out, 1, o, f) == o;
+    if (f && fclose(f) != 0) ok = 0;
+    free(old); free(out);
+    return ok;
+}

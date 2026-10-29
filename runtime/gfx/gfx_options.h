@@ -19,4 +19,5 @@ typedef struct {
     int pause_unfocused;     /* unfocused: 0 run (the game goes on while the window is not active), 1 pause (nnmisc.c oe_watch stops it) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
+int gfx_options_write_scale(float v);      /* F9: resolution_scale in the file set to v (0 = auto), the rest kept; 1 = written */
 #endif

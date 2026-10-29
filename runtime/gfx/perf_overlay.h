@@ -25,9 +25,12 @@ typedef struct {
 } PerfFrame;
 void perf_overlay_frame(const PerfFrame *f);
 
-/* The overlay's latest picture (RGBA8, alpha premultiplied, w x h), composed on the overlay's own thread about ten times a
- * second, for the renderer to blend over the window image's top-left corner, *margin pixels in. *version (in: the one the
- * caller has) changes with every new picture. Returns 0: nothing to draw; 1: the caller's picture is still the latest;
- * 2: a new one copied into dst; -1: dst holds less than w x h x 4 bytes (nothing copied). */
-int perf_overlay_picture(uint8_t *dst, size_t cap, int *w, int *h, unsigned *version, int *margin);
+/* The overlay's latest pictures (RGBA8, alpha premultiplied, w x h), composed on the overlay's own thread about ten times
+ * a second: the panel, for the top-left corner *margin pixels in, and a notice, for the top middle. *version (in: the one
+ * the caller has) changes with every new picture. Returns 0: nothing to draw; 1: the caller's picture is still the
+ * latest; 2: a new one copied into dst; -1: dst holds less than w x h x 4 bytes (nothing copied). */
+enum { PERF_PANEL = 0, PERF_NOTICE = 1 };
+int perf_overlay_picture(int which, uint8_t *dst, size_t cap, int *w, int *h, unsigned *version, int *margin);
+/* A line shown for 2.5 s at the top of the window whatever the overlay's mode (F9's new resolution); render thread */
+void perf_overlay_notice(const char *text, int win_h);
 int perf_overlay_default(void);              /* gfx_options.c: graphics.ini perf_overlay (off / fps / full) */

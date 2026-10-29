@@ -18,6 +18,7 @@ typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
     int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
     int gprim;                                     /* a geometry stage: the primitive class of the draws it serves (MxIn.gs_in_prim; part of hb) */
+    int rs;                                        /* a fragment stage whose hb has "rs1" (vstage_get): F9 can turn RS_ON on during a run */
     uint32_t images_w; uint16_t img_fmt[8]; uint8_t img_type[8];      /* a compute stage's images (MxOut): written ones, declared format and type */
     uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly;      /* fragonly: handed over by a program without a vertex stage */
     VkPipeline cp; VkPipelineLayout cl; VkDescriptorSetLayout cdl[2];      /* compute stage: its pipeline */
@@ -378,7 +379,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
     SSrc src;
     int how;
     if (!st->code) return NULL;
-    if (v && v->state == 2 && v->fo == fo && v->gprim == gprim && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
+    if (v && v->state == 2 && v->fo == fo && v->gprim == gprim && v->rs == (s == 1 && RS_ON) && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
     g_vstage_slow++;
     if (!ssrc_of(&src, p, s)) return NULL;
     src.gprim = gprim;
@@ -402,6 +403,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
             printf("nvn_vk_hold:     %s; jobs waiting now: %lld foreground, %lld background\n", ho_text(v->hb), (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done));
             LeaveCriticalSection(&g_sh_lock); } }
     st->vk = v; memcpy(v->local, st->local, sizeof v->local);
+    v->rs = s == 1 && RS_ON;                       /* found under this RS_ON: its hash says the same */
     return v->ok ? v : NULL;
 }
 
