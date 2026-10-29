@@ -1076,10 +1076,13 @@ static int rs_step_now(void) {                     /* the step in use: the start
     for (int i = 2; i < RS_NSTEPS; i++) if (fabsf(k_rs_steps[i] - rs_scale()) < fabsf(k_rs_steps[k] - rs_scale())) k = i;
     return k;
 }
+static float rs_step_scale(LONG k) { return rs_clamp(k_rs_steps[k] > 0 ? k_rs_steps[k] : rs_auto()); }
 void nvn_vk_scale_step(int dir) {                  /* display.c, the window's thread */
     if (!V.alive) { printf("nvn_vk_scale: F9 changes the internal resolution of the Vulkan renderer only\n"); return; }
-    LONG cur = g_rs_req >= 0 ? g_rs_req : rs_step_now();
-    InterlockedExchange(&g_rs_req, (LONG)(((cur + dir) % RS_NSTEPS + RS_NSTEPS) % RS_NSTEPS));
+    LONG cur = g_rs_req >= 0 ? g_rs_req : rs_step_now(), nx = cur;
+    do nx = ((nx + dir) % RS_NSTEPS + RS_NSTEPS) % RS_NSTEPS;      /* a step with the scale of the one in use is passed over (auto is 1.0 on a window of 1600x900 or more) */
+    while (nx != cur && rs_step_scale(nx) == rs_step_scale(cur));
+    InterlockedExchange(&g_rs_req, nx);
 }
 static VTex *vt_get2(Tex *t, int sync);
 static int rs_remake(Tex *t) {                     /* the texture's image at the current scale, its content kept; 1 = remade */
@@ -1127,7 +1130,7 @@ static void rs_apply(LONG64 frame) {               /* render thread, after a pre
     }
     LONG k = g_rs_req < 0 ? -1 : InterlockedExchange(&g_rs_req, -1);
     if (k < 0) return;
-    float was = rs_scale(), v = rs_clamp(k_rs_steps[k] > 0 ? k_rs_steps[k] : rs_auto());
+    float was = rs_scale(), v = rs_step_scale(k);
     int n = 0;
     g_rs_step = (int)k;
     if (v != was) {
