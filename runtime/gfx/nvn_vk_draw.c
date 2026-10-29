@@ -213,7 +213,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 }
 
 /* ---------------------------------------------------------------- command buffers in flight */
-#define NSLOT 8
+#define NSLOT 16                                  /* SMO_VK_SUBMIT_DRAWS: a frame takes up to about 7 */
 typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
 typedef struct VTex VTex;
 static struct {
@@ -406,6 +406,7 @@ static void cmd_begin(void) {
     garbage_collect();
 }
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
+static LONG64 g_sub_draws0;                       /* frame_draws at the last submission (submit_early) */
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
     pass_end();
@@ -420,6 +421,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     nvn_tl(15, (int)R.frame_draws);               /* SMO_FRAMETL: a submission, with the draws of the frame so far */
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
     s->pending = 1; s->serial = ++R.serial;
+    g_sub_draws0 = R.frame_draws;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
@@ -2974,6 +2976,20 @@ static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t 
                count, nq * 2, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1);
     return ring_raw(buf, (uint64_t)*n * 4);
 }
+/* SMO_VK_SUBMIT_DRAWS=<n>: a draw after n draws in the command buffer being recorded submits that buffer first (inside a
+ * pass too: the pass is ended there and begun again, its targets loaded). A batch used to go to the GPU in one piece at
+ * its end (New Donk City: ~780 draws, the G-buffer among them), so the GPU stood idle while the render thread replayed
+ * it, 8.4 of the frame's 21 ms. 0: one submission per batch, as before. Called at the top of a draw, before anything of
+ * it is recorded or noted for the buffer being recorded (R.serial + 1: ring ranges, texture sets). 800: a submission
+ * costs ~0.85 ms in vkQueueSubmit (RADV, the heap imported in pieces), and 400 or 200 gave the same frame time. */
+static LONG64 g_sub_split;                         /* submissions made here */
+static void submit_early(void) {
+    static int n = -1;
+    if (n < 0) n = getenv("SMO_VK_SUBMIT_DRAWS") ? atoi(getenv("SMO_VK_SUBMIT_DRAWS")) : 800;
+    if (R.frame_draws < g_sub_draws0) g_sub_draws0 = 0;      /* a new frame */
+    if (n <= 0 || !R.recording || R.frame_draws - g_sub_draws0 < n) return;
+    cmd_submit(NULL, NULL); g_sub_split++;
+}
 /* The two kinds of draw (nvnCommandBufferDrawArrays* / DrawElements*, and each draw of an indirect one). */
 static LONG64 g_indirect_draws, g_indirect_disp;
 static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
@@ -2994,6 +3010,7 @@ static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_
 }
 static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32_t base_inst, uint32_t inst) {
     if (R.render_off) { g_fr_offskip++; R.frame_skipped++; nvn_front_count(1, 1); return; }      /* a conditional render said no: nothing of the draw is prepared (about 540 draws a frame in New Donk City) */
+    submit_early();
     if (prim == 7) { vk_draw_quads(first, count, 0, 0, 0, base_inst, inst); return; }
     int gsr = R.prog[2] && g_gs_draws % 20 == 0 && g_gs_draws <= 400 && (gs_dbg_mode() == 1 || gs_dbg_mode() == 3);      /* SMO_VK_GS_DEBUG: gs_dbg_read */
     if (gsr) gs_dbg_read(0);
@@ -3012,6 +3029,7 @@ static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t i
     if (R.render_off) { g_fr_offskip++; R.frame_skipped++; nvn_front_count(1, 1); return; }
     unsigned t = type < 3 ? type : 1;
     if (count <= 0 || !indices) { R.frame_skipped++; nvn_front_count(1, 1); return; }
+    submit_early();
     if (prim == 7) { vk_draw_quads(0, (uint32_t)count, type, indices, base_vertex, base_inst, inst); return; }
     if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); return; }
     BufRef ib;
@@ -4208,6 +4226,7 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: drawing part shut down: %lld images, %lld pipelines, %lld shader modules, %d samplers destroyed; %lld bytes of block space lost to fragmentation records\n", (long long)R.images, (long long)R.pipelines, (long long)R.modules, g_nsmp, (long long)g_mem_leak);
     printf("nvn_vk: draws reading vertices past the range the game bound: %lld%s, %lld left as bound (over 16 MB more); index ranges scanned for their largest index: %lld\n",
            (long long)g_vtx_over, g_vtxgrow > 0 ? " (copied as far as they read)" : g_vtxgrow == 0 ? " (SMO_VK_VTXGROW=0: left as bound)" : "", (long long)g_vtx_capped, (long long)g_imax_scans);
+    printf("nvn_vk: submissions made at a draw after SMO_VK_SUBMIT_DRAWS draws: %lld\n", (long long)g_sub_split);
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
