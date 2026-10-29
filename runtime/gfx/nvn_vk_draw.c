@@ -478,8 +478,10 @@ static void ring_reuse(uint64_t lo, uint64_t hi) {   /* [lo, hi) of this lap is 
         if (a < hi && lo < b) { slot_wait(s); g_ring_waits++; }
     }
 }
+static uint64_t g_ring_max_n;
 static uint64_t ring_raw(const void *p, uint64_t n) {
     R.ring_pos = (R.ring_pos + RING_ALIGN - 1) & ~(uint64_t)(RING_ALIGN - 1);
+    if (n > g_ring_max_n) g_ring_max_n = n;       /* the largest range: how small the ring may be (a range may take a quarter) */
     if (n > R.ring_size / 4) vkd_fail("a range of %llu bytes does not fit the stream ring (%llu MB)", (unsigned long long)n, (unsigned long long)(R.ring_size >> 20));
     if (g_ring_drain < 0) g_ring_drain = getenv("SMO_VK_RING_DRAIN") && atoi(getenv("SMO_VK_RING_DRAIN"));
     if (R.ring_pos + n > R.ring_size) {
@@ -4118,7 +4120,13 @@ static void vkd_init(void) {
         VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].cmd));
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
-    R.ring_size = 256ull << 20;
+    {   /* SMO_VK_RING_MB (64-1024, default 128): the stream ring, host-visible memory the GPU reads (on an integrated GPU,
+         * RAM). Measured in New Donk City, the most streamed scene: 256 MB 0 waits, 128 MB 8 waits a run at the same frame
+         * rate, 64 MB 14 waits and slower; the largest range 5.6 MB. */
+        const char *e = getenv("SMO_VK_RING_MB");
+        int mb = e ? atoi(e) : 128;
+        R.ring_size = (uint64_t)(mb < 64 ? 64 : mb > 1024 ? 1024 : mb) << 20;
+    }
     R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &R.ring_mem);
     R.zero = vbuf_new(65536 + 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &R.zero_mem);
     memset(R.zero_mem.map, 0, 65536 + 64);
@@ -4209,7 +4217,7 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: draws reading vertices past the range the game bound: %lld%s, %lld left as bound (over 16 MB more); index ranges scanned for their largest index: %lld\n",
            (long long)g_vtx_over, g_vtxgrow > 0 ? " (copied as far as they read)" : g_vtxgrow == 0 ? " (SMO_VK_VTXGROW=0: left as bound)" : "", (long long)g_vtx_capped, (long long)g_imax_scans);
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
-    printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
+    printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s; %llu MB, largest range %llu KB\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "", (unsigned long long)(R.ring_size >> 20), (unsigned long long)(g_ring_max_n >> 10));
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
     printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
