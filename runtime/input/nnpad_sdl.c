@@ -6,6 +6,7 @@
  * opened as a plain JOYSTICK and gets a guessed default (buttons in order, hat 0 = d-pad, axes 0..3 = sticks) that
  * controllers.ini or `--pad-map` corrects.
  * What the file does and how it is written: see the comment block written to controllers.ini (default_ini below). */
+#include "glyph_icons.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@ typedef struct {
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
+    int icons;                          /* [general] button_icons: -1 auto, else GLYPH_ICONS_* */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -136,6 +138,10 @@ static const char *const g_default_ini =
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
 ";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers, positional otherwise.\r\n"
 "layout = auto\r\n"
+"; Button icons in the game's prompts. auto = by the letter printed on player 1's bottom face button: A (Xbox and most\r\n"
+";   generic pads) gives Xbox icons with the positional layout, a cross PlayStation's, B Nintendo's. xbox / playstation /\r\n"
+";   nintendo = always those.\r\n"
+"button_icons = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
 "deadzone = 0.10\r\n"
@@ -193,7 +199,7 @@ static void cfg_init_dev(DevCfg *d) {
 static void cfg_defaults(Cfg *c) {
     memset(c, 0, sizeof *c);
     cfg_init_dev(&c->def);
-    c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
+    c->icons = -1; c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->hk_vk = VK_F1;
@@ -290,6 +296,7 @@ static void cfg_parse(Cfg *c, char *text) {
         if (_stricmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
         for (char *p = val + strlen(val); p > val && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
         if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
+        else if (sect == 1 && !_stricmp(key, "button_icons")) c->icons = !_stricmp(val, "xbox") ? GLYPH_ICONS_XBOX : !_stricmp(val, "playstation") ? GLYPH_ICONS_PLAYSTATION : !_stricmp(val, "nintendo") ? GLYPH_ICONS_NINTENDO : -1;
         else if (sect == 1) cfg_set(c, &c->def, 0, key, val);
         else if (sect == 4 && cur) cfg_set(c, cur, 1, key, val);
         else if (sect == 2 && !_strnicmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
@@ -501,6 +508,8 @@ int nnpad_init(void) {
     unlock();
     return 1;
 }
+static int icon_style_now(void);
+static volatile LONG g_icon_style;                 /* icon_style_now() at the last poll: read by the render thread */
 void nnpad_poll(int force) {
     LARGE_INTEGER t;
     if (!g_sdl_ok) return;
@@ -510,6 +519,9 @@ void nnpad_poll(int force) {
     g_last_poll = t;
     poll_devices();
     check_config(force);
+    {   int st = icon_style_now();
+        if (InterlockedExchange(&g_icon_style, st) != st) printf("nn::pad: button icons: %s\n", st == GLYPH_ICONS_XBOX ? "Xbox" : st == GLYPH_ICONS_PLAYSTATION ? "PlayStation" : "Nintendo");
+    }
     unlock();
 }
 
@@ -619,6 +631,23 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     /* SDL's misc1 is the Switch Pro Controller's capture button, the Xbox Series pad's share button, the
      * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
     o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
+}
+/* glyph_icons.h: the button icon style for the game's prompts (glyph_icons.c changes the glyph sheet with it). By what
+ * SDL says is printed on player 1's south face button: A (Xbox pads and generic ones SDL knows no better, such as a
+ * Machenike G5 Pro in its XInput mode, 2345:e02f) gives Xbox icons with the positional layout (that button acts as
+ * Nintendo's B), a cross gives PlayStation's, B (Nintendo's own, the G5 Pro in its Switch mode) Nintendo's. */
+int glyph_icons_style(void) { return (int)g_icon_style; }
+static int icon_style_now(void) {
+    if (g_cfg.icons >= 0) return g_cfg.icons;
+    for (int i = 0; i < MAXDEV; i++) {
+        const Dev *d = &g_dev[i];
+        if (!d->used || d->ignored || d->slot != 0 || !d->gp) continue;
+        SDL_GamepadButtonLabel south = SDL_GetGamepadButtonLabel(d->gp, SDL_GAMEPAD_BUTTON_SOUTH);
+        if (south == SDL_GAMEPAD_BUTTON_LABEL_CROSS) return GLYPH_ICONS_PLAYSTATION;
+        if (south == SDL_GAMEPAD_BUTTON_LABEL_A && !eff_layout(d)) return GLYPH_ICONS_XBOX;
+        return GLYPH_ICONS_NINTENDO;
+    }
+    return GLYPH_ICONS_NINTENDO;
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
 
@@ -1167,6 +1196,50 @@ int nnpad_selftest(const NnHidHooks *h) {
     for (int i = 0; i < 8; i++) { if (id[i] && js[i]) { SDL_CloseJoystick(js[i]); SDL_DetachVirtualJoystick(id[i]); } }
     settle();
     check(h->style(0) == 0 && h->style(7) == 0, "all pads detached: no player present");
+
+    /* ---- button icons of the game's prompts (glyph_icons.c): by what SDL says is printed on player 1's south button */
+    {
+        static const struct { Uint16 vid, pid; const char *name; int want; } pads[] = {
+            {0x045e, 0x028e, "Xbox 360 pad", GLYPH_ICONS_XBOX},
+            {0x045e, 0x0b12, "Xbox Series pad", GLYPH_ICONS_XBOX},
+            {0x054c, 0x09cc, "DualShock 4", GLYPH_ICONS_PLAYSTATION},
+            {0x054c, 0x0ce6, "DualSense", GLYPH_ICONS_PLAYSTATION},
+            {0x057e, 0x2009, "Switch Pro (and a Machenike G5 Pro in Switch mode)", GLYPH_ICONS_NINTENDO},
+            {0x2345, 0xe02f, "Machenike G5 Pro in XInput mode (not in SDL's list)", GLYPH_ICONS_XBOX},
+            {0x2dc8, 0x6001, "8BitDo SN30 Pro (not in SDL's list: Xbox icons, its print is Nintendo's)", GLYPH_ICONS_XBOX},
+        };
+        char what[160];
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: no pad gives Nintendo's");
+        for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++) {
+            SDL_VirtualJoystickDesc d;
+            SDL_INIT_INTERFACE(&d);
+            d.type = SDL_JOYSTICK_TYPE_GAMEPAD; d.vendor_id = pads[i].vid; d.product_id = pads[i].pid;
+            d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT; d.name = pads[i].name;
+            SDL_JoystickID vid = SDL_AttachVirtualJoystick(&d);
+            settle();
+            snprintf(what, sizeof what, "button icons: %s (%04x:%04x) as player 1 gives %s", pads[i].name, pads[i].vid, pads[i].pid,
+                     pads[i].want == GLYPH_ICONS_XBOX ? "Xbox's" : pads[i].want == GLYPH_ICONS_PLAYSTATION ? "PlayStation's" : "Nintendo's");
+            int got = glyph_icons_style();
+            if (got != pads[i].want) printf("    got style %d, SDL type %d\n", got, (int)SDL_GetGamepadTypeForID(vid));
+            check(vid && got == pads[i].want, what);
+            SDL_DetachVirtualJoystick(vid);
+            settle();
+        }
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: back to Nintendo's when the pad is gone (the sheet is read again)");
+        write_text(path, "[general]\r\nlayout = labels\r\n");
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD; d.vendor_id = 0x045e; d.product_id = 0x028e; d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT; d.name = "Xbox 360 pad";
+        SDL_JoystickID xid = SDL_AttachVirtualJoystick(&d);
+        Sleep(1100); settle();
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: an Xbox pad with layout = labels gives Nintendo's (its A is the game's A)");
+        write_text(path, "[general]\r\nbutton_icons = playstation\r\n");
+        Sleep(1100); settle();
+        check(glyph_icons_style() == GLYPH_ICONS_PLAYSTATION, "button icons: button_icons = playstation overrides the pad");
+        SDL_DetachVirtualJoystick(xid);
+        write_text(path, "");
+        Sleep(1100); settle();
+    }
     h->test_mode(0);
     printf("pad self-test: %d passed, %d failed\n", g_t_pass, g_t_fail);
     printf("PAD SELFTEST %s (%d/%d)\n", g_t_fail ? "FAILED" : "PASSED", g_t_pass, g_t_pass + g_t_fail);

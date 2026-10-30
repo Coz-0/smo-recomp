@@ -50,6 +50,7 @@
 #include "smo_ui.h"
 #include "nvn_sdk.h"
 #include "nvn_misc.h"
+#include "glyph_icons.h"
 
 #pragma comment(lib, "opengl32.lib")
 
@@ -831,6 +832,27 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     return newest;
 }
 
+/* The button glyph sheet of the game's DeviceFont80 changed for the controller in use (glyph_icons.c), as it is uploaded:
+ * level 0 of a one-level BC4 texture of its size, already deswizzled. The texture is remembered with the style it got:
+ * at a frame's end glyph_sheet_recheck reads it out again when the style changed (another pad became player 1). */
+static Tex *g_glyph_tex;
+static int g_glyph_style = -1;
+static void glyph_sheet_hook(Tex *t, int levels, int l, int layer, uint8_t *lin) {
+    const TexBuilder *b = &t->b;
+    if (l || layer || b->format != 0x49 || !glyph_icons_is_sheet(b->width, b->height, levels, 1, lin)) return;
+    static const char *const names[] = {"Nintendo", "Xbox", "PlayStation"};
+    int style = glyph_icons_style();
+    glyph_icons_apply(lin, style);
+    if (style != g_glyph_style || t != g_glyph_tex) printf("nvn: button glyph sheet: %s icons\n", names[style]);
+    g_glyph_tex = t; g_glyph_style = style;
+}
+static void glyph_sheet_recheck(void) {
+    Tex *t = g_glyph_tex;
+    static int asked = -1;
+    if (!t || t->dead || glyph_icons_style() == g_glyph_style) return;
+    if (asked != glyph_icons_style()) { asked = glyph_icons_style(); printf("nvn: button glyph sheet: read again for the new icon style\n"); }
+    t->uploaded = 0; t->checked = 0;               /* read out of its memory again at its next use, with the new style */
+}
 static void tex_upload_memory(Tex *t, const Fmt *f) {
     static uint8_t *tmp;
     static size_t tmp_cap;
@@ -861,6 +883,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
             }
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
+            glyph_sheet_hook(t, L.levels, l, layer, tmp);
             if (tf && tf->sw_decode) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 tex_put(t, &sw, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin);
@@ -4407,6 +4430,7 @@ static void tex_finalize(Ctx *c) {
         return;
     }
     InterlockedExchange(&t->dead, 1);
+    if (t == g_glyph_tex) g_glyph_tex = NULL;
     tp_remove(t);
     if (texlog_on()) printf("texlog: finalize %llx host %p %dx%d fmt 0x%x mem %p (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, (void *)t->mem, (unsigned long long)c->x[30]);
     wr32(A0 + 8, 0);
@@ -5506,6 +5530,7 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
+            glyph_sheet_hook(t, levels, l, layer, tmp);
             if (decode) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin, (size_t)L.lvl_w[l] * L.lvl_h[l] * 4, 1, 0);
@@ -5596,6 +5621,7 @@ void nvn_front_ccmp_landed(void) {
 }
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears) {
     LONG64 frame = g_st.frames + 1;
+    glyph_sheet_recheck();
     pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;
