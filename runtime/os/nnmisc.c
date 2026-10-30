@@ -302,12 +302,25 @@ static uint64_t language_code(uint32_t lang) {
     if (lang < sizeof g_language_codes / sizeof g_language_codes[0]) memcpy(&v, g_language_codes[lang], strlen(g_language_codes[lang]));
     return v;
 }
+/* Chinese has two spellings: the old Language entries Chinese (6, "zh-CN") and Taiwanese (11, "zh-TW") and the newer
+ * SimplifiedChinese (15, "zh-Hans") and TraditionalChinese (16, "zh-Hant"). The game's language selectors (main+0x977b30,
+ * main+0x977d30) compare the desired language only with entries 0 to 14, so with "zh-Hans" / "zh-Hant", what
+ * desired_language gives, they matched neither and a Chinese system got another language. Each spelling matches its twin
+ * here, as nxnative found for this game (docs/reference/services.md, "Chinese language aliases in settings comparisons");
+ * the codes themselves are left as they are. */
+static int language_code_equal(const char *a, const char *b) {
+    static const char *const twins[][2] = {{"zh-CN", "zh-Hans"}, {"zh-TW", "zh-Hant"}};
+    if (!strcmp(a, b)) return 1;
+    for (size_t i = 0; i < sizeof twins / sizeof twins[0]; i++)
+        if ((!strcmp(a, twins[i][0]) && !strcmp(b, twins[i][1])) || (!strcmp(a, twins[i][1]) && !strcmp(b, twins[i][0]))) return 1;
+    return 0;
+}
 static void settings_LanguageEqualsCode(Ctx *c) {         /* operator==(const Language&, const LanguageCode&) */
     char a[9] = {0}, b[9] = {0};
     uint64_t v = language_code(rd32(A0));
     memcpy(a, &v, 8);
     memcpy(b, (void *)(uintptr_t)A1, 8);
-    RET(v != 0 && strcmp(a, b) == 0);
+    RET(v != 0 && language_code_equal(a, b));
 }
 static void settings_CodeEqualsLanguage(Ctx *c) {         /* operator==(const LanguageCode&, const Language&): the same comparison, arguments swapped */
     uint64_t t = c->x[0];
