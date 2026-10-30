@@ -136,6 +136,15 @@ def T(sf):
     return 'uint64_t' if sf else 'uint32_t'
 
 
+# DMB / DSB by CRm bits 1-0 (the domain does not matter: one process): 1 LD orders earlier loads before later accesses
+# (an acquire fence), 2 ST earlier stores before later stores (a release fence is the nearest), 3 everything (a full
+# fence: on x86 the only one that is an instruction, the others only keep clang from moving accesses across); 0 is
+# SSBB / PSSBB, speculation barriers with no ordering. LDAR / STLR are acquire loads / release stores the same way
+# (rdacq / wrrel in runtime.h): as plain accesses, clang may move other accesses across them.
+BARRIER = {0: ';', 1: '__atomic_thread_fence(__ATOMIC_ACQUIRE);', 2: '__atomic_thread_fence(__ATOMIC_RELEASE);',
+           3: '__atomic_thread_fence(__ATOMIC_SEQ_CST);'}
+
+
 def decode_bitmasks(n, imms, immr, datasize):
     v = (n << 6) | (~imms & 0x3f)
     length = v.bit_length() - 1
@@ -305,8 +314,10 @@ class Fn:
             return SET(bits(w, 4, 0), 1, '0ULL')        # fpcr / fpsr read
         if (w & 0xffffffe0) in (0xd51b4400, 0xd51b4420):
             return ';'                                   # fpcr / fpsr write
-        if (w & 0xfffff0ff) in (0xd503305f, 0xd50330bf, 0xd503309f, 0xd50330df):
-            return ';'                                   # clrex / dmb / dsb / isb
+        if (w & 0xfffff0ff) in (0xd50330bf, 0xd503309f):   # dmb / dsb: CRm bits 1-0 say which accesses they order
+            return BARRIER[bits(w, 9, 8)]
+        if (w & 0xfffff0ff) in (0xd503305f, 0xd50330df):
+            return ';'                                   # clrex / isb
         # SMO additions (SDK code: a data-cache maintenance loop in the audio server)
         if (w & 0xffffffe0) == 0xd53b0020:               # mrs ctr_el0: the console's Cortex-A57 reset value 0x8444C004
             return SET(bits(w, 4, 0), 1, '0x8444c004ULL')  # [doc] ARM Cortex-A57 TRM, CTR_EL0: 64-byte I and D lines
@@ -410,10 +421,10 @@ class Fn:
                 raise Unimpl('excl-pair')
             nb = 8 << size
             rs = bits(w, 20, 16)
-            if o2:                                       # ldar / stlr: ordered, not exclusive
+            if o2:                                       # ldar / stlr: ordered, not exclusive (acquire / release)
                 if load:
-                    return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
-                return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
+                    return SET(rt, 1, 'rdacq%d(%s)' % (nb, XS(rn)))
+                return 'wrrel%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
                 return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
