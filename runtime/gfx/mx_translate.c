@@ -1747,6 +1747,114 @@ static const char *const k_prelude =
     "  if (kind == 3u) return uint(int(clamp(f, -32768.0, 32767.0)));\n"
     "  return uint(clamp(f, 0.0, 65535.0)); }\n";
 
+/* A 32-bit integer multiply has no single Maxwell instruction: the compiler emits three 16-bit XMADs for d = x * y
+ * (XMAD lo = x.lo * y.lo; XMAD.MRG m = (x.lo * y.hi).lo | y.lo << 16; XMAD.PSL.CBCC d = (x.hi * m.hi << 16) +
+ * (m << 16) + lo), often with other instructions in between. Translated one by one, ACO keeps the 16-bit pieces.
+ * The first XMAD may add a register z (d = x * y + z). Where the three are in one run of lines that only fall through
+ * ("{ ... }" or predicated, no jump, no target), the first two in either order, x is not written up to the third, y
+ * not before the first two are done, and lo and m not between their line and the third, the lo line also sets a new
+ * variable to x * y + z and the third takes it; lo and m keep their values for any other reader. Over the game's
+ * 27,888 stages: 46,423 such multiplies (nearly all in vertex stages), 45,631 of them folded. */
+#define XMAD_LO "{ uint prod = bitfieldExtract(r%u, 0, 16) * bitfieldExtract(r%u, 0, 16); uint res = prod + %4[0-9ru]; r%u = res; }%n"
+#define XMAD_MRG "{ uint prod = bitfieldExtract(r%u, 0, 16) * bitfieldExtract(r%u, 16, 16); uint res = prod + 0u; " \
+                 "res = (res & 0xffffu) | (r%u << 16); r%u = res; }%n"
+#define XMAD_PSL "{ uint prod = bitfieldExtract(r%u, 16, 16) * bitfieldExtract(r%u, 16, 16) << 16; uint res = prod + " \
+                 "((r%u << 16) + r%u); r%u = res; }%n"
+static int xmad_whole(const char *l, int n) { return n > 0 && (l[n] == '\n' || !l[n]); }
+static int xmad_has(const char *l, size_t len, const char *w) {      /* w within the len bytes at l */
+    size_t n = strlen(w);
+    for (size_t i = 0; i + n <= len; i++) if (!memcmp(l + i, w, n)) return 1;
+    return 0;
+}
+static int xmad_writes(const char *l, const char *end, unsigned r) {   /* does the line write "rR = "? */
+    for (const char *m = l; (m = strstr(m, " r")) && m < end;) {
+        m += 2;
+        if (*m < '0' || *m > '9') continue;
+        unsigned k = (unsigned)atoi(m);
+        while (*m >= '0' && *m <= '9') m++;
+        if (k == r && m[0] == ' ' && m[1] == '=' && m[2] != '=') return 1;
+    }
+    return 0;
+}
+static int xmad_lo(const char *l, unsigned *x, unsigned *y, int *z, unsigned *lo) {   /* z: the addend's register, -1 for 0u */
+    char add[5] = "";
+    int k = -1;
+    sscanf(l, XMAD_LO, x, y, add, lo, &k);
+    if (!xmad_whole(l, k)) return 0;
+    if (!strcmp(add, "0u")) *z = -1;
+    else if (add[0] == 'r' && add[1] >= '0' && add[1] <= '9') *z = atoi(add + 1);
+    else return 0;
+    return 1;
+}
+static void fold_xmad(Mx *e) {
+    size_t nl = 1, n = 0;
+    for (const char *c = e->s; *c; c++) nl += *c == '\n';
+    char **ls = malloc((nl + 1) * sizeof *ls);                   /* each line's start, and the end of the text */
+    int *fold = calloc(nl, sizeof *fold);                         /* lo line: 1 + the variable; third: -(1 + it) */
+    int *reg = calloc(nl * 3, sizeof *reg);                      /* lo line: x, y, addend (-1: none); third line: d */
+    for (char *c = e->s; *c; n++) { ls[n] = c; c = strchr(c, '\n'); c = c ? c + 1 : ls[n] + strlen(ls[n]); }
+    ls[n] = e->s + e->len;
+    int folds = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned x, y, lo = 0, m = 0, u, v, w, z, d;
+        int k = -1, add = -1, add2;
+        if (fold[i]) continue;                                     /* a line takes part in one fold at most */
+        size_t at_lo = i;                                          /* the lo line: the variable is set there */
+        int have_lo = xmad_lo(ls[i], &x, &y, &add, &lo), have_m = 0;
+        if (!have_lo) {
+            sscanf(ls[i], XMAD_MRG, &x, &y, &u, &m, &k);
+            if (!xmad_whole(ls[i], k) || u != y) continue;
+            have_m = 1;
+        }
+        if (x == y || (have_lo && (lo == x || lo == y)) || (have_m && (m == x || m == y))) continue;
+        for (size_t j = i + 1; j < n && j < i + 64; j++) {
+            const char *l = ls[j], *end = ls[j + 1];
+            size_t len = (size_t)(end - l);
+            if ((l[0] != '{' && strncmp(l, "if (p", 5) && strncmp(l, "if (!p", 6)) || xmad_has(l, len, "go = ") ||
+                xmad_has(l, len, "continue") || xmad_has(l, len, "break") || xmad_has(l, len, "return")) break;   /* not a fall-through line */
+            k = -1;
+            if (fold[j]) { /* in another fold: leave it */ }
+            else if (!have_lo) {
+                if (xmad_lo(l, &u, &v, &add2, &w) && u == x && v == y && w != x && w != y && w != m) { lo = w; add = add2; at_lo = j; have_lo = 1; continue; }
+            } else if (!have_m) {
+                sscanf(l, XMAD_MRG, &u, &v, &w, &z, &k);
+                if (xmad_whole(l, k) && u == x && v == y && w == y && z != x && z != lo) { m = z; have_m = 1; continue; }
+            } else {
+                sscanf(l, XMAD_PSL, &u, &v, &w, &z, &d, &k);
+                if (xmad_whole(l, k) && u == x && v == m && w == m && z == lo) {
+                    folds++;
+                    fold[at_lo] = folds; reg[at_lo * 3] = (int)x; reg[at_lo * 3 + 1] = (int)y; reg[at_lo * 3 + 2] = add;
+                    fold[j] = -folds; reg[j * 3] = (int)d;
+                    break;
+                }
+            }
+            if (xmad_writes(l, end, x) || (!(have_lo && have_m) && xmad_writes(l, end, y)) ||
+                (have_lo && xmad_writes(l, end, lo)) || (have_m && xmad_writes(l, end, m))) break;
+        }
+    }
+    if (folds) {
+        size_t cap = e->len + (size_t)folds * 48 + 1, o = 0;
+        char *out = malloc(cap);
+        for (size_t i = 0; i < n; i++) {
+            const char *l = ls[i], *end = ls[i + 1];
+            if (fold[i] < 0) {
+                o += (size_t)snprintf(out + o, cap - o, "{ r%d = xm%d; }%s", reg[i * 3], -fold[i] - 1, end[-1] == '\n' ? "\n" : "");
+                continue;
+            }
+            if (fold[i] > 0) {
+                int *r = reg + i * 3;
+                if (r[2] < 0) o += (size_t)snprintf(out + o, cap - o, "uint xm%d = r%d * r%d; ", fold[i] - 1, r[0], r[1]);
+                else o += (size_t)snprintf(out + o, cap - o, "uint xm%d = r%d * r%d + r%d; ", fold[i] - 1, r[0], r[1], r[2]);
+            }
+            memcpy(out + o, l, (size_t)(end - l)); o += (size_t)(end - l);
+        }
+        out[o] = 0;
+        free(e->s);
+        e->s = out; e->len = o; e->cap = cap;
+    }
+    free(ls); free(fold); free(reg);
+}
+
 int mx_translate(const MxIn *in, MxOut *out) {
     Mx *e = calloc(1, sizeof *e);
     char *res = NULL;
@@ -1830,6 +1938,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         goto done;
     }
 
+    if (in->target == 1 && e->s && !getenv("SMO_MX_NO_XMAD_FOLD")) fold_xmad(e);
     /* assemble: header, declarations, helpers, main */
     {
         Mx h;
