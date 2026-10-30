@@ -65,7 +65,7 @@ if T.MAC:
     HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
     HOST_SOURCES['services'] = HOST_SOURCES['services'] + ['nnmovie_av.m']      # nnmovie_mf.c's reader on AVFoundation
     HOST_SOURCES['game'] = HOST_SOURCES['game'] + ['smo_guide_mac.m']           # the Help in the game window (WKWebView)
-    LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Wl,-rpath,' + SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
+    LIBS = ['-L', SDL3_LIB, '-lSDL3', '-Xlinker', '-rpath', '-Xlinker', SDL3_LIB] + [a for f in T.MAC_FRAMEWORKS for a in ('-framework', f)]
 if T.LINUX:
     HOST_SOURCES['compat'] = ['win32_posix.c', 'gl_stub.c']
     HOST_SOURCES['os'] = HOST_SOURCES['os'] + ['core_model.c']
@@ -150,10 +150,10 @@ def main():
     out = os.path.join(BIN, exe)
     if T.MAC:
         cmd = [CLANG] + objs + [os.path.join(BIN, T.GAME_LIB), '-Wl,-rpath,@executable_path'] + LIBS \
-            + ['-Wl,-map,' + os.path.splitext(out)[0] + '.map', '-o', out]
+            + ['-Xlinker', '-map', '-Xlinker', os.path.splitext(out)[0] + '.map', '-o', out]      # -Xlinker: a comma in the path would split -Wl,
     elif T.LINUX:   # -rdynamic: the game library and the shim's GetProcAddress find the program's own functions
         cmd = [CLANG, '-fuse-ld=lld', '-rdynamic', '-Wl,--no-dependent-libraries'] + objs + [os.path.join(BIN, T.GAME_LIB), "-Wl,-rpath,$ORIGIN"] + LIBS \
-            + ['-Wl,-Map,' + out + '.map', '-o', out]
+            + ['-Xlinker', '-Map', '-Xlinker', out + '.map', '-o', out]
     else:
         cmd = [CLANG] + objs + [os.path.join(BIN, 'smo_game.lib'), os.path.join(SDL3_LIB, 'SDL3.lib')] \
             + LIBS + ['-Xlinker', '/MAP:' + out[:-4] + '.map', '-o', out]
