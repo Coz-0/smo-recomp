@@ -27,7 +27,7 @@ typedef struct VStage {
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
-#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+#define MX_VK_VERSION 12u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
