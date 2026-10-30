@@ -1747,14 +1747,16 @@ static const char *const k_prelude =
     "  if (kind == 3u) return uint(int(clamp(f, -32768.0, 32767.0)));\n"
     "  return uint(clamp(f, 0.0, 65535.0)); }\n";
 
-/* A 32-bit integer multiply has no single Maxwell instruction: the compiler emits three 16-bit XMADs for d = x * y
+/* Maxwell's 32-bit IMUL is not full rate (CUDA C Programming Guide: "multiple instructions" on 5.x) and NVIDIA's compiler
+ * does not use it (the game's stages have none): it emits three 16-bit XMADs for d = x * y
  * (XMAD lo = x.lo * y.lo; XMAD.MRG m = (x.lo * y.hi).lo | y.lo << 16; XMAD.PSL.CBCC d = (x.hi * m.hi << 16) +
  * (m << 16) + lo), often with other instructions in between. Translated one by one, ACO keeps the 16-bit pieces.
  * The first XMAD may add a register z (d = x * y + z). Where the three are in one run of lines that only fall through
  * ("{ ... }" or predicated, no jump, no target), the first two in either order, x is not written up to the third, y
  * not before the first two are done, and lo and m not between their line and the third, the lo line also sets a new
  * variable to x * y + z and the third takes it; lo and m keep their values for any other reader. Over the game's
- * 27,888 stages: 46,423 such multiplies (nearly all in vertex stages), 45,631 of them folded. */
+ * 27,888 stages: 46,423 such multiplies (nearly all in vertex stages), 45,631 of them folded. Ryujinx's translator has the
+ * same fold (Translation/Optimizations/XmadOptimizer.cs, MIT); this one is written separately, over the text. */
 #define XMAD_LO "{ uint prod = bitfieldExtract(r%u, 0, 16) * bitfieldExtract(r%u, 0, 16); uint res = prod + %4[0-9ru]; r%u = res; }%n"
 #define XMAD_MRG "{ uint prod = bitfieldExtract(r%u, 0, 16) * bitfieldExtract(r%u, 16, 16); uint res = prod + 0u; " \
                  "res = (res & 0xffffu) | (r%u << 16); r%u = res; }%n"
