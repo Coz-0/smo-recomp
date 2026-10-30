@@ -138,8 +138,9 @@ static const char *const g_default_ini =
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
 ";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers, positional otherwise.\r\n"
 "layout = auto\r\n"
-"; Button icons in the game's prompts. auto = Xbox letters while player 1 is an Xbox pad with the positional layout (the\r\n"
-";   button in the south shows A), Nintendo's otherwise; xbox / nintendo = always those. Read when the game loads its font.\r\n"
+"; Button icons in the game's prompts. auto = by the letter printed on player 1's bottom face button: A (Xbox and most\r\n"
+";   generic pads) gives Xbox icons with the positional layout, a cross PlayStation's, B Nintendo's. xbox / playstation /\r\n"
+";   nintendo = always those.\r\n"
 "button_icons = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
@@ -295,7 +296,7 @@ static void cfg_parse(Cfg *c, char *text) {
         if (_stricmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
         for (char *p = val + strlen(val); p > val && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
         if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
-        else if (sect == 1 && !_stricmp(key, "button_icons")) c->icons = !_stricmp(val, "xbox") ? GLYPH_ICONS_XBOX : !_stricmp(val, "nintendo") ? GLYPH_ICONS_NINTENDO : -1;
+        else if (sect == 1 && !_stricmp(key, "button_icons")) c->icons = !_stricmp(val, "xbox") ? GLYPH_ICONS_XBOX : !_stricmp(val, "playstation") ? GLYPH_ICONS_PLAYSTATION : !_stricmp(val, "nintendo") ? GLYPH_ICONS_NINTENDO : -1;
         else if (sect == 1) cfg_set(c, &c->def, 0, key, val);
         else if (sect == 4 && cur) cfg_set(c, cur, 1, key, val);
         else if (sect == 2 && !_strnicmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
@@ -507,6 +508,8 @@ int nnpad_init(void) {
     unlock();
     return 1;
 }
+static int icon_style_now(void);
+static volatile LONG g_icon_style;                 /* icon_style_now() at the last poll: read by the render thread */
 void nnpad_poll(int force) {
     LARGE_INTEGER t;
     if (!g_sdl_ok) return;
@@ -516,6 +519,7 @@ void nnpad_poll(int force) {
     g_last_poll = t;
     poll_devices();
     check_config(force);
+    InterlockedExchange(&g_icon_style, icon_style_now());
     unlock();
 }
 
@@ -626,14 +630,20 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
      * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
     o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
 }
-/* glyph_icons.h: the button icon style for the game's prompts (glyph_icons.c changes the glyph sheet with it). */
-int glyph_icons_style(void) {
+/* glyph_icons.h: the button icon style for the game's prompts (glyph_icons.c changes the glyph sheet with it). By what
+ * SDL says is printed on player 1's south face button: A (Xbox pads and generic ones SDL knows no better, such as a
+ * Machenike G5 Pro in its XInput mode, 2345:e02f) gives Xbox icons with the positional layout (that button acts as
+ * Nintendo's B), a cross gives PlayStation's, B (Nintendo's own, the G5 Pro in its Switch mode) Nintendo's. */
+int glyph_icons_style(void) { return (int)g_icon_style; }
+static int icon_style_now(void) {
     if (g_cfg.icons >= 0) return g_cfg.icons;
     for (int i = 0; i < MAXDEV; i++) {
         const Dev *d = &g_dev[i];
-        if (!d->used || d->ignored || d->slot != 0) continue;
-        int xbox = d->gp && (d->gtype == SDL_GAMEPAD_TYPE_XBOX360 || d->gtype == SDL_GAMEPAD_TYPE_XBOXONE);
-        return xbox && !eff_layout(d) ? GLYPH_ICONS_XBOX : GLYPH_ICONS_NINTENDO;
+        if (!d->used || d->ignored || d->slot != 0 || !d->gp) continue;
+        SDL_GamepadButtonLabel south = SDL_GetGamepadButtonLabel(d->gp, SDL_GAMEPAD_BUTTON_SOUTH);
+        if (south == SDL_GAMEPAD_BUTTON_LABEL_CROSS) return GLYPH_ICONS_PLAYSTATION;
+        if (south == SDL_GAMEPAD_BUTTON_LABEL_A && !eff_layout(d)) return GLYPH_ICONS_XBOX;
+        return GLYPH_ICONS_NINTENDO;
     }
     return GLYPH_ICONS_NINTENDO;
 }

@@ -3,17 +3,21 @@
  * glyph sheet: a BC4 texture of 512 x 1024, stored upside down, with 80 x 84 cells every 81 x 85 pixels, 6 to a row, 39
  * glyphs (CMAP index n at column n % 6, row n / 6 from the bottom). When that sheet is uploaded, its cells are changed for
  * the controller's buttons. Xbox pads have their face buttons by position as the Switch has them but named the other way
- * round (the south button is Nintendo's B and Xbox's A), so the sheet's A and B cells trade places, and X and Y.
+ * round (the south button is Nintendo's B and Xbox's A), so the sheet's A and B cells trade places, and X and Y; the
+ * shoulders say LB RB LT RT and + / - become Menu and View. PlayStation's pads: the face cells get the cross, circle, square
+ * and triangle by position, the shoulders L1 R1 L2 R2, + its Options lines. The new marks are drawn here (strokes and rings,
+ * antialiased), nothing taken from elsewhere.
  *
  * The sheet is told by its shape, not by its bytes: BC4, 512 x 1024, one level, and glyphs in exactly the 39 cells of six
  * full rows and half of a seventh, the rest empty. The blocks whose pixels change are encoded again; the rest keep their bytes.
  * Which controller: glyph_icons_style() (nnpad_sdl.c). */
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 #include "glyph_icons.h"
 
 enum { SHEET_W = 512, SHEET_H = 1024, CELL_W = 80, CELL_H = 84, STEP_W = 81, STEP_H = 85, COLS = 6, GLYPHS = 39 };
-enum { CELL_A = 8, CELL_B = 9, CELL_X = 10, CELL_Y = 11 };       /* CMAP indices of U+E0E0..U+E0E3 */
+enum { CELL_A = 8, CELL_B = 9, CELL_X = 10, CELL_Y = 11, CELL_L = 12, CELL_R = 13, CELL_ZL = 14, CELL_ZR = 15, CELL_PLUS = 22, CELL_MINUS = 23 };   /* CMAP indices: U+E0E0..E3, E4..E7, E0EF, E0F0 */
 
 static void bc4_decode(const uint8_t *b, uint8_t *px) {          /* 8 bytes -> 16 values, row by row */
     uint8_t pal[8];
@@ -90,11 +94,127 @@ static void swap_cells(int a, int b) {
         }
 }
 
+/* ---- drawing over a cell, upright (the sheet is stored upside down). A shape is a union of primitives in cell pixels;
+ * each pixel takes its coverage from 4 x 4 samples, black over what is there. */
+typedef struct { int kind; float a, b, c, d, e; } Prim;          /* 0 segment (a,b)-(c,d) width e; 1 ring centre (a,b) radius c width d */
+typedef struct { Prim p[48]; int n; } Shape;
+static float cellpx(int n, int x, int y) { return g_img[cell_y(n) + CELL_H - 1 - y][cell_x(n) + x]; }
+static void cellset(int n, int x, int y, float v) { g_img[cell_y(n) + CELL_H - 1 - y][cell_x(n) + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f); }
+static void seg(Shape *s, float x0, float y0, float x1, float y1, float w) { if (s->n < 48) s->p[s->n++] = (Prim){0, x0, y0, x1, y1, w}; }
+static void ring(Shape *s, float cx, float cy, float r, float w) { if (s->n < 48) s->p[s->n++] = (Prim){1, cx, cy, r, w, 0}; }
+static int inside(const Shape *s, float x, float y) {
+    for (int i = 0; i < s->n; i++) {
+        const Prim *p = &s->p[i];
+        if (p->kind == 0) {
+            float dx = p->c - p->a, dy = p->d - p->b, l2 = dx * dx + dy * dy, t = l2 > 0 ? ((x - p->a) * dx + (y - p->b) * dy) / l2 : 0;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            float ex = x - (p->a + t * dx), ey = y - (p->b + t * dy);
+            if (ex * ex + ey * ey <= p->e * p->e / 4) return 1;
+        } else {
+            float r = sqrtf((x - p->a) * (x - p->a) + (y - p->b) * (y - p->b));
+            if (fabsf(r - p->c) <= p->d / 2) return 1;
+        }
+    }
+    return 0;
+}
+static void paint(int n, const Shape *s) {
+    for (int y = 0; y < CELL_H; y++)
+        for (int x = 0; x < CELL_W; x++) {
+            int hit = 0;
+            for (int k = 0; k < 16; k++) hit += inside(s, x + (k % 4 + 0.5f) / 4, y + (k / 4 + 0.5f) / 4);
+            if (hit) cellset(n, x, y, cellpx(n, x, y) * (1 - hit / 16.0f));
+        }
+}
+/* The white disk of a face or +/- button: centre and radius from its ink; everything inside made white again. */
+static void clear_disk(int n, float *cx, float *cy, float *r) {
+    int x0 = CELL_W, x1 = -1, y0 = CELL_H, y1 = -1;
+    for (int y = 0; y < CELL_H; y++) for (int x = 0; x < CELL_W; x++) if (cellpx(n, x, y) > 128) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    *cx = (x0 + x1 + 1) / 2.0f; *cy = (y0 + y1 + 1) / 2.0f; *r = (x1 - x0 + 1) / 2.0f;
+    for (int y = 0; y < CELL_H; y++)
+        for (int x = 0; x < CELL_W; x++) { float dx = x + 0.5f - *cx, dy = y + 0.5f - *cy; if (dx * dx + dy * dy < (*r - 2) * (*r - 2)) cellset(n, x, y, 255); }
+}
+/* The white tab of a shoulder button: its letters (dark pixels with the tab's white on all four sides) made white again;
+ * the box they took is returned (where the new text goes). */
+static int white_from(int n, int x, int y, int dx, int dy) {
+    for (x += dx, y += dy; x >= 0 && x < CELL_W && y >= 0 && y < CELL_H; x += dx, y += dy) if (cellpx(n, x, y) > 200) return 1;
+    return 0;
+}
+static void clear_tab(int n, float *bx0, float *by0, float *bx1, float *by1) {
+    static uint8_t ink[CELL_H][CELL_W];
+    int lx0 = CELL_W, lx1 = -1, ly0 = CELL_H, ly1 = -1;
+    for (int y = 0; y < CELL_H; y++)
+        for (int x = 0; x < CELL_W; x++)
+            ink[y][x] = cellpx(n, x, y) < 200 && white_from(n, x, y, -1, 0) && white_from(n, x, y, 1, 0) && white_from(n, x, y, 0, -1) && white_from(n, x, y, 0, 1);
+    for (int y = 0; y < CELL_H; y++)
+        for (int x = 0; x < CELL_W; x++)
+            if (ink[y][x]) { if (x < lx0) lx0 = x; if (x > lx1) lx1 = x; if (y < ly0) ly0 = y; if (y > ly1) ly1 = y; cellset(n, x, y, 255); }
+    *bx0 = (float)lx0; *by0 = (float)ly0; *bx1 = lx1 + 1.0f; *by1 = ly1 + 1.0f;
+}
+/* Strokes of the few characters the shoulder labels need, in a box 0.62 wide and 1 high (y down). */
+static void glyph(Shape *s, char c, float x, float y, float h, float w) {
+    float u = h, ax[12], ay[12];
+    #define S(a, b, c2, d) seg(s, x + (a) * u, y + (b) * u, x + (c2) * u, y + (d) * u, w)
+    #define ARC(cx, cy, rx, ry, t0, t1) do { for (int k = 0; k < 12; k++) { float t = (t0) + ((t1) - (t0)) * k / 11.0f; ax[k] = (cx) + (rx) * cosf(t); ay[k] = (cy) + (ry) * sinf(t); } \
+                                             for (int k = 0; k < 11; k++) S(ax[k], ay[k], ax[k + 1], ay[k + 1]); } while (0)
+    const float P = 3.14159265f;
+    switch (c) {
+    case 'L': S(0, 0, 0, 1); S(0, 1, 0.55f, 1); break;
+    case 'T': S(0, 0, 0.62f, 0); S(0.31f, 0, 0.31f, 1); break;
+    case 'R': S(0, 0, 0, 1); S(0, 0, 0.32f, 0); S(0, 0.5f, 0.32f, 0.5f); ARC(0.32f, 0.25f, 0.25f, 0.25f, -P / 2, P / 2); S(0.3f, 0.5f, 0.6f, 1); break;
+    case 'B': S(0, 0, 0, 1); S(0, 0, 0.3f, 0); S(0, 0.48f, 0.34f, 0.48f); S(0, 1, 0.34f, 1);
+              ARC(0.3f, 0.24f, 0.24f, 0.24f, -P / 2, P / 2); ARC(0.34f, 0.74f, 0.26f, 0.26f, -P / 2, P / 2); break;
+    case '1': S(0.34f, 0, 0.34f, 1); S(0.1f, 0.2f, 0.34f, 0); break;
+    case '2': ARC(0.3f, 0.28f, 0.28f, 0.28f, -P, 0.25f * P); S(0.5f, 0.48f, 0.02f, 1); S(0.02f, 1, 0.6f, 1); break;
+    default: break;
+    }
+    #undef S
+    #undef ARC
+}
+static void tab_text(int n, const char *text) {
+    float x0, y0, x1, y1;
+    clear_tab(n, &x0, &y0, &x1, &y1);
+    Shape s = {0};
+    float h = (y1 - y0) * 0.92f, w = h * 0.17f, gap = h * 0.16f, width = 0;
+    for (const char *c = text; *c; c++) width += h * 0.62f + (c[1] ? gap : 0);
+    float x = (x0 + x1 - width) / 2, y = (y0 + y1 - h) / 2;
+    for (const char *c = text; *c; c++) { glyph(&s, *c, x, y, h, w); x += h * 0.62f + gap; }
+    paint(n, &s);
+}
+static void disk_symbol(int n, char what) {          /* PlayStation's face symbols, Xbox's Menu (≡) and View (two windows) */
+    float cx, cy, r;
+    clear_disk(n, &cx, &cy, &r);
+    Shape s = {0};
+    float w = r * 0.16f, k = r * 0.42f;
+    switch (what) {
+    case 'x': seg(&s, cx - k, cy - k, cx + k, cy + k, w); seg(&s, cx - k, cy + k, cx + k, cy - k, w); break;
+    case 'o': ring(&s, cx, cy, r * 0.45f, w); break;
+    case 's': seg(&s, cx - k, cy - k, cx + k, cy - k, w); seg(&s, cx + k, cy - k, cx + k, cy + k, w);
+              seg(&s, cx + k, cy + k, cx - k, cy + k, w); seg(&s, cx - k, cy + k, cx - k, cy - k, w); break;
+    case 't': { float t = r * 0.5f, hgt = t * 1.5f, top = cy - hgt * 0.62f, bot = cy + hgt * 0.38f;
+                seg(&s, cx, top, cx + t, bot, w); seg(&s, cx + t, bot, cx - t, bot, w); seg(&s, cx - t, bot, cx, top, w); break; }
+    case 'm': for (int i = -1; i <= 1; i++) seg(&s, cx - k, cy + i * k * 0.62f, cx + k, cy + i * k * 0.62f, w); break;
+    case 'v': { float a = k * 0.62f;
+                seg(&s, cx - k, cy - k, cx + a * 0.6f, cy - k, w); seg(&s, cx - k, cy - k, cx - k, cy + a * 0.6f, w);
+                seg(&s, cx - a * 0.4f, cy - a * 0.4f, cx + k, cy - a * 0.4f, w); seg(&s, cx + k, cy - a * 0.4f, cx + k, cy + k, w);
+                seg(&s, cx + k, cy + k, cx - a * 0.4f, cy + k, w); seg(&s, cx - a * 0.4f, cy + k, cx - a * 0.4f, cy - a * 0.4f, w); break; }
+    default: break;
+    }
+    paint(n, &s);
+}
+
 int glyph_icons_apply(uint8_t *bc4, int style) {
-    if (style != GLYPH_ICONS_XBOX) return 0;
+    if (style != GLYPH_ICONS_XBOX && style != GLYPH_ICONS_PLAYSTATION) return 0;
     sheet_decode(bc4);
-    swap_cells(CELL_A, CELL_B);
-    swap_cells(CELL_X, CELL_Y);
+    if (style == GLYPH_ICONS_XBOX) {                          /* the same buttons by position, Xbox's names */
+        swap_cells(CELL_A, CELL_B);
+        swap_cells(CELL_X, CELL_Y);
+        tab_text(CELL_L, "LB"); tab_text(CELL_R, "RB"); tab_text(CELL_ZL, "LT"); tab_text(CELL_ZR, "RT");
+        disk_symbol(CELL_PLUS, 'm'); disk_symbol(CELL_MINUS, 'v');
+    } else {                                                  /* by position: A east circle, B south cross, X north triangle, Y west square */
+        disk_symbol(CELL_A, 'o'); disk_symbol(CELL_B, 'x'); disk_symbol(CELL_X, 't'); disk_symbol(CELL_Y, 's');
+        tab_text(CELL_L, "L1"); tab_text(CELL_R, "R1"); tab_text(CELL_ZL, "L2"); tab_text(CELL_ZR, "R2");
+        disk_symbol(CELL_PLUS, 'm');
+    }
     sheet_encode_changed(bc4);
     return 1;
 }
