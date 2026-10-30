@@ -1194,6 +1194,50 @@ int nnpad_selftest(const NnHidHooks *h) {
     for (int i = 0; i < 8; i++) { if (id[i] && js[i]) { SDL_CloseJoystick(js[i]); SDL_DetachVirtualJoystick(id[i]); } }
     settle();
     check(h->style(0) == 0 && h->style(7) == 0, "all pads detached: no player present");
+
+    /* ---- button icons of the game's prompts (glyph_icons.c): by what SDL says is printed on player 1's south button */
+    {
+        static const struct { Uint16 vid, pid; const char *name; int want; } pads[] = {
+            {0x045e, 0x028e, "Xbox 360 pad", GLYPH_ICONS_XBOX},
+            {0x045e, 0x0b12, "Xbox Series pad", GLYPH_ICONS_XBOX},
+            {0x054c, 0x09cc, "DualShock 4", GLYPH_ICONS_PLAYSTATION},
+            {0x054c, 0x0ce6, "DualSense", GLYPH_ICONS_PLAYSTATION},
+            {0x057e, 0x2009, "Switch Pro (and a Machenike G5 Pro in Switch mode)", GLYPH_ICONS_NINTENDO},
+            {0x2345, 0xe02f, "Machenike G5 Pro in XInput mode (not in SDL's list)", GLYPH_ICONS_XBOX},
+            {0x2dc8, 0x6001, "8BitDo SN30 Pro (not in SDL's list: Xbox icons, its print is Nintendo's)", GLYPH_ICONS_XBOX},
+        };
+        char what[160];
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: no pad gives Nintendo's");
+        for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++) {
+            SDL_VirtualJoystickDesc d;
+            SDL_INIT_INTERFACE(&d);
+            d.type = SDL_JOYSTICK_TYPE_GAMEPAD; d.vendor_id = pads[i].vid; d.product_id = pads[i].pid;
+            d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT; d.name = pads[i].name;
+            SDL_JoystickID vid = SDL_AttachVirtualJoystick(&d);
+            settle();
+            snprintf(what, sizeof what, "button icons: %s (%04x:%04x) as player 1 gives %s", pads[i].name, pads[i].vid, pads[i].pid,
+                     pads[i].want == GLYPH_ICONS_XBOX ? "Xbox's" : pads[i].want == GLYPH_ICONS_PLAYSTATION ? "PlayStation's" : "Nintendo's");
+            int got = glyph_icons_style();
+            if (got != pads[i].want) printf("    got style %d, SDL type %d\n", got, (int)SDL_GetGamepadTypeForID(vid));
+            check(vid && got == pads[i].want, what);
+            SDL_DetachVirtualJoystick(vid);
+            settle();
+        }
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: back to Nintendo's when the pad is gone (the sheet is read again)");
+        write_text(path, "[general]\r\nlayout = labels\r\n");
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD; d.vendor_id = 0x045e; d.product_id = 0x028e; d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT; d.name = "Xbox 360 pad";
+        SDL_JoystickID xid = SDL_AttachVirtualJoystick(&d);
+        Sleep(1100); settle();
+        check(glyph_icons_style() == GLYPH_ICONS_NINTENDO, "button icons: an Xbox pad with layout = labels gives Nintendo's (its A is the game's A)");
+        write_text(path, "[general]\r\nbutton_icons = playstation\r\n");
+        Sleep(1100); settle();
+        check(glyph_icons_style() == GLYPH_ICONS_PLAYSTATION, "button icons: button_icons = playstation overrides the pad");
+        SDL_DetachVirtualJoystick(xid);
+        write_text(path, "");
+        Sleep(1100); settle();
+    }
     h->test_mode(0);
     printf("pad self-test: %d passed, %d failed\n", g_t_pass, g_t_fail);
     printf("PAD SELFTEST %s (%d/%d)\n", g_t_fail ? "FAILED" : "PASSED", g_t_pass, g_t_pass + g_t_fail);
