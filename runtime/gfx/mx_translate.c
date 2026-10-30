@@ -110,6 +110,13 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
     if (b == 0 && w == 0x610 / 4 && e->in->target == 1 && e->in->stage != MX_COMPUTE && e->in->stage != MX_FRAGMENT)
         return "0x44ffe000u";      /* c0 byte 0x610: the driver's largest point size, which the compiler clamps a written point size to
                                     * (the game's 96 point-size stages read it and nothing else of c0); no c0 is bound here: 2047.0 */
+    if (b == 1 && e->in->target == 1 && e->in->cdata && (w + 1) * 4 <= e->in->cdata_size && !getenv("SMO_MX_NO_C1_INLINE")) {
+        /* c1 is the shader's own immediate data, which the Vulkan back end always binds unchanged (and hashes with the code):
+         * the word as a literal lets glslang and the driver fold it (a reciprocal, a mask) instead of loading it at every use */
+        uint32_t v;
+        memcpy(&v, e->in->cdata + w * 4, 4);
+        return S(e, "0x%08xu", v);
+    }
     e->cbufs |= 1u << b;
     return S(e, "c%u[%uu]", b, w);
 }
