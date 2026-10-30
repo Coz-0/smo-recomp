@@ -6,6 +6,7 @@
  * opened as a plain JOYSTICK and gets a guessed default (buttons in order, hat 0 = d-pad, axes 0..3 = sticks) that
  * controllers.ini or `--pad-map` corrects.
  * What the file does and how it is written: see the comment block written to controllers.ini (default_ini below). */
+#include "glyph_icons.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@ typedef struct {
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
+    int icons;                          /* [general] button_icons: -1 auto, else GLYPH_ICONS_* */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -136,6 +138,9 @@ static const char *const g_default_ini =
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
 ";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers, positional otherwise.\r\n"
 "layout = auto\r\n"
+"; Button icons in the game's prompts. auto = Xbox letters while player 1 is an Xbox pad with the positional layout (the\r\n"
+";   button in the south shows A), Nintendo's otherwise; xbox / nintendo = always those. Read when the game loads its font.\r\n"
+"button_icons = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
 "deadzone = 0.10\r\n"
@@ -193,7 +198,7 @@ static void cfg_init_dev(DevCfg *d) {
 static void cfg_defaults(Cfg *c) {
     memset(c, 0, sizeof *c);
     cfg_init_dev(&c->def);
-    c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
+    c->icons = -1; c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->hk_vk = VK_F1;
@@ -290,6 +295,7 @@ static void cfg_parse(Cfg *c, char *text) {
         if (_stricmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
         for (char *p = val + strlen(val); p > val && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
         if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
+        else if (sect == 1 && !_stricmp(key, "button_icons")) c->icons = !_stricmp(val, "xbox") ? GLYPH_ICONS_XBOX : !_stricmp(val, "nintendo") ? GLYPH_ICONS_NINTENDO : -1;
         else if (sect == 1) cfg_set(c, &c->def, 0, key, val);
         else if (sect == 4 && cur) cfg_set(c, cur, 1, key, val);
         else if (sect == 2 && !_strnicmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
@@ -619,6 +625,17 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     /* SDL's misc1 is the Switch Pro Controller's capture button, the Xbox Series pad's share button, the
      * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
     o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
+}
+/* glyph_icons.h: the button icon style for the game's prompts (glyph_icons.c changes the glyph sheet with it). */
+int glyph_icons_style(void) {
+    if (g_cfg.icons >= 0) return g_cfg.icons;
+    for (int i = 0; i < MAXDEV; i++) {
+        const Dev *d = &g_dev[i];
+        if (!d->used || d->ignored || d->slot != 0) continue;
+        int xbox = d->gp && (d->gtype == SDL_GAMEPAD_TYPE_XBOX360 || d->gtype == SDL_GAMEPAD_TYPE_XBOXONE);
+        return xbox && !eff_layout(d) ? GLYPH_ICONS_XBOX : GLYPH_ICONS_NINTENDO;
+    }
+    return GLYPH_ICONS_NINTENDO;
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
 

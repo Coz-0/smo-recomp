@@ -50,6 +50,7 @@
 #include "smo_ui.h"
 #include "nvn_sdk.h"
 #include "nvn_misc.h"
+#include "glyph_icons.h"
 
 #pragma comment(lib, "opengl32.lib")
 
@@ -831,6 +832,13 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     return newest;
 }
 
+/* The button glyph sheet of the game's DeviceFont80 changed for the controller in use (glyph_icons.c), as it is uploaded:
+ * level 0 of a one-level BC4 texture of its size, already deswizzled. */
+static void glyph_sheet_hook(const TexBuilder *b, int levels, int l, int layer, uint8_t *lin) {
+    if (l || layer || b->format != 0x49 || !glyph_icons_is_sheet(b->width, b->height, levels, 1, lin)) return;
+    int style = glyph_icons_style();
+    if (glyph_icons_apply(lin, style)) printf("nvn: button glyph sheet: %s icons\n", style == GLYPH_ICONS_XBOX ? "Xbox" : "Nintendo");
+}
 static void tex_upload_memory(Tex *t, const Fmt *f) {
     static uint8_t *tmp;
     static size_t tmp_cap;
@@ -861,6 +869,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
             }
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
+            glyph_sheet_hook(b, L.levels, l, layer, tmp);
             if (tf && tf->sw_decode) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 tex_put(t, &sw, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin);
@@ -5506,6 +5515,7 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
+            glyph_sheet_hook(b, levels, l, layer, tmp);
             if (decode) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin, (size_t)L.lvl_w[l] * L.lvl_h[l] * 4, 1, 0);
