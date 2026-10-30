@@ -14,7 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -37,7 +41,31 @@ static const char *const free_files[FONT_TYPES][4] = {
     {"NotoSans-Regular.ttf", "NotoSans-Regular.otf", "NotoSans[wdth,wght].ttf", NULL},
 };
 /* Windows' own, in %WINDIR%\Fonts: Segoe UI, Microsoft YaHei, Microsoft JhengHei, Malgun Gothic */
+#ifdef _WIN32
 static const char *const windows_files[FONT_TYPES] = {"segoeui.ttf", "msyh.ttc", "msyh.ttc", "msjh.ttc", "malgun.ttf", "segoeui.ttf", "segoeui.ttf"};
+#endif
+/* Linux: what fontconfig picks for these families (fc-match), Noto Sans and Noto Sans CJK on most systems (NOT VERIFIED in
+ * the game yet: the Windows fonts above were). A CJK collection's first face is the one used (Japanese glyph shapes in
+ * Noto Sans CJK; it has the Chinese and Korean characters too). */
+#ifdef __linux__
+static const char *const linux_families[FONT_TYPES] = {"Noto Sans", "Noto Sans CJK SC", "Noto Sans CJK SC", "Noto Sans CJK TC",
+                                                       "Noto Sans CJK KR", "Noto Sans", "Noto Sans"};
+static int fc_match(const char *family, char *path, size_t n) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "fc-match -f '%%{file}' '%s:style=Regular' 2>/dev/null", family);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    size_t got = fread(path, 1, n - 1, p);
+    pclose(p);
+    path[got] = 0;
+    return got > 0;
+}
+#endif
+/* macOS's own, in /System/Library/Fonts: Arial Unicode, Hiragino Sans GB, STHeiti, Apple SD Gothic Neo (NOT VERIFIED in the
+ * game yet: the Windows fonts above were) */
+static const char *const mac_files[FONT_TYPES] = {"Supplemental/Arial Unicode.ttf", "Hiragino Sans GB.ttc", "Hiragino Sans GB.ttc",
+                                                  "STHeiti Light.ttc", "AppleSDGothicNeo.ttc", "Supplemental/Arial Unicode.ttf",
+                                                  "Supplemental/Arial Unicode.ttf"};
 static struct { void *data; size_t size; int tried; } g_fonts[FONT_TYPES];
 static CRITICAL_SECTION g_lock;
 
@@ -69,16 +97,26 @@ static void load_font(unsigned type) {
             snprintf(path, sizeof path, "..\\..\\deps\\fonts\\%s", free_files[type][k]);
             if ((ok = read_font(type, path))) from = "a free font (deps\\fonts)";
         }
+#ifdef _WIN32
         if (!ok) {
             char windir[MAX_PATH] = "C:\\Windows";
             GetWindowsDirectoryA(windir, sizeof windir);
             snprintf(path, sizeof path, "%s\\Fonts\\%s", windir, windows_files[type]);
             if ((ok = read_font(type, path))) from = "Windows' own (no dumped or free font found)";
         }
+#elif defined(__linux__)
+        (void)mac_files;
+        if (!ok && fc_match(linux_families[type], path, sizeof path) && (ok = read_font(type, path))) from = "the system's (fontconfig; no dumped or free font found)";
+#else
+        if (!ok) {
+            snprintf(path, sizeof path, "/System/Library/Fonts/%s", mac_files[type]);
+            if ((ok = read_font(type, path))) from = "macOS's own (no dumped or free font found)";
+        }
+#endif
         printf("nn::pl: shared font %u %s (%s, %zu bytes)%s%s\n", type, ok ? "loaded" : "NOT FOUND", path, g_fonts[type].size,
                ok ? ": " : "", ok ? from : "");
         if (!ok) {
-            printf("nn::pl: no font for shared font type %u (not in your dump, deps\\fonts or %%WINDIR%%\\Fonts): stopping\n", type);
+            printf("nn::pl: no font for shared font type %u (not in your dump, deps\\fonts or the system's fonts): stopping\n", type);
             fflush(stdout);
             report_and_exit(7);
         }

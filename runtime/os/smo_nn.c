@@ -25,7 +25,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#ifdef __APPLE__
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#endif
 #include "hostrt.h"
 #include "sdklift.h"
 
@@ -41,6 +51,10 @@ static uint8_t g_used[HEAP_RESERVE / UNIT];    /* 1 = granule belongs to an allo
 static unsigned long long g_alloc_calls, g_alloc_fail, g_peak;
 
 int smo_heap_section_handle(HANDLE *h) { *h = g_heap_section; return g_heap_section != NULL; }
+#ifdef __linux__
+static int g_heap_fd = -1;                     /* Linux: the memfd the heap is a shared mapping of */
+int smo_heap_memfd(void) { return g_heap_fd; }
+#endif
 /* The committed heap: base and size (0 before SetMemoryHeapSize). */
 int smo_heap_range(uint64_t *base, uint64_t *size) { *base = (uint64_t)(uintptr_t)g_heap; *size = g_heap ? g_heap_size : 0; return g_heap != NULL; }
 
@@ -60,10 +74,41 @@ static void os_SetMemoryHeapSize(Ctx *c) {
     if (size % UNIT || size > HEAP_RESERVE) r = RESULT_OUT_OF_MEMORY;
     else {
         if (!g_heap) {
+#ifdef _WIN32
             g_heap_section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE,
                                                 (DWORD)(HEAP_RESERVE >> 32), (DWORD)HEAP_RESERVE, NULL);
             if (g_heap_section) g_heap = MapViewOfFile(g_heap_section, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)HEAP_RESERVE);
-            if (!g_heap) printf("nn::os::SetMemoryHeapSize: cannot create the heap section (error %lu)\n", GetLastError());
+#elif defined(__linux__)
+            /* Linux: plain private memory by default. The renderer imports the heap into Vulkan (nvn_vk_draw.c, guest
+             * memory read in place), and the amdgpu driver imports anonymous private memory only: a shared mapping fails
+             * with VK_ERROR_INVALID_EXTERNAL_HANDLE (RADV, Mesa 26.2), and every vertex and index range is then copied
+             * (42 MB a frame in New Donk City). The game's one virtual memory pool is a direct alias of its physical
+             * pool (nvn_stub.c) and needs no second view. SMO_HEAP_MEMFD=1: a shared mapping of a memfd as large as the
+             * reserve (sparse), so a second view of its pages is an mmap of the same file range, as a second view of a
+             * section is on Windows. The "section" is the heap's base, as on macOS. Committing is mprotect. */
+            const char *memfd = getenv("SMO_HEAP_MEMFD");
+            if (memfd && atoi(memfd)) {
+                g_heap_fd = memfd_create("smo-heap", MFD_CLOEXEC);
+                if (g_heap_fd >= 0 && !ftruncate(g_heap_fd, (off_t)HEAP_RESERVE)) {
+                    void *p = mmap(NULL, (size_t)HEAP_RESERVE, PROT_NONE, MAP_SHARED | MAP_NORESERVE, g_heap_fd, 0);
+                    g_heap = p == MAP_FAILED ? NULL : p;
+                }
+            } else {
+                g_heap = VirtualAlloc(NULL, (SIZE_T)HEAP_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+                /* no transparent huge pages, as the memfd had none (shmem: "advise" by default): with them the game
+                 * thread took 2.5 ms more a frame in New Donk City, and runs had bursts of 45 ms frames. SMO_HEAP_THP=1
+                 * leaves them to the kernel's setting. */
+                const char *thp = getenv("SMO_HEAP_THP");
+                if (g_heap && !(thp && atoi(thp))) madvise(g_heap, (size_t)HEAP_RESERVE, MADV_NOHUGEPAGE);
+            }
+            g_heap_section = g_heap;
+#else
+            /* macOS: plain reserved memory. A second view of its pages (graphics memory pools) is made with mach_vm_remap
+             * without copying, which shares them as a second view of a section does; the "section" is the heap's base. */
+            g_heap = VirtualAlloc(NULL, (SIZE_T)HEAP_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+            g_heap_section = g_heap;
+#endif
+            if (!g_heap) printf("nn::os::SetMemoryHeapSize: cannot create the heap section (error %lu)\n", (unsigned long)GetLastError());
         }
         if (!g_heap) r = RESULT_OUT_OF_MEMORY;
         else if (size > g_heap_size) {
@@ -313,6 +358,18 @@ static HANDLE g_inact_req;
 static int g_inact_ext;
 static void oe_SetUserInactivityDetectionTimeExtended(Ctx *c) {
     int on = (int)(c->x[0] & 1);
+#ifdef __linux__
+    /* Linux: SDL keeps the screen saver off while the game's window is up (SDL_HINT_VIDEO_ALLOW_SCREENSAVER is 0 by
+     * default), which is what the request is for */
+    (void)on; (void)g_inact_req;
+#elif !defined(_WIN32)
+    /* macOS: a power assertion that keeps the display awake, as the power request does on Windows */
+    static IOPMAssertionID assertion;
+    if (on && !g_inact_ext && IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+            CFSTR("Super Mario Odyssey (smo-recomp): the game asked for a longer time before the screen dims"), &assertion) != kIOReturnSuccess) assertion = 0;
+    if (!on && g_inact_ext && assertion) { IOPMAssertionRelease(assertion); assertion = 0; }
+    (void)g_inact_req;
+#else
     if (!g_inact_req) {
         REASON_CONTEXT rc;
         memset(&rc, 0, sizeof rc);
@@ -322,6 +379,7 @@ static void oe_SetUserInactivityDetectionTimeExtended(Ctx *c) {
         if (g_inact_req == INVALID_HANDLE_VALUE) g_inact_req = NULL;
     }
     if (g_inact_req && on != g_inact_ext) { if (on) PowerSetRequest(g_inact_req, PowerRequestDisplayRequired); else PowerClearRequest(g_inact_req, PowerRequestDisplayRequired); }
+#endif
     g_inact_ext = on;
 }
 static void oe_IsUserInactivityDetectionTimeExtended(Ctx *c) { c->x[0] = (uint64_t)g_inact_ext; }

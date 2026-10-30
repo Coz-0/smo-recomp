@@ -3,8 +3,12 @@
  * names the mangled symbol; behaviour follows the public SDK semantics. */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"

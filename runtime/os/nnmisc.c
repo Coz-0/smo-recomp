@@ -12,14 +12,37 @@
  * (below). */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
 #include <wincrypt.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
+#elif defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <CommonCrypto/CommonDigest.h>
+#else
+/* Linux: OpenSSL's MD5 and SHA-1 under CommonCrypto's names (deprecated in OpenSSL 3 for security use; the game's use,
+ * checksums, is not one) */
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/md5.h>
+#include <openssl/sha.h>
+typedef size_t CC_LONG;
+typedef MD5_CTX CC_MD5_CTX;
+#define CC_MD5_DIGEST_LENGTH MD5_DIGEST_LENGTH
+#define CC_SHA1_DIGEST_LENGTH SHA_DIGEST_LENGTH
+#define CC_MD5_Init MD5_Init
+#define CC_MD5_Update MD5_Update
+#define CC_MD5_Final MD5_Final
+#define CC_SHA1 SHA1
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -132,7 +155,16 @@ static uint8_t g_oe_event[0x40];
 static uint32_t g_oe_queue[16];
 static int g_oe_count, g_oe_event_ready, g_oe_focus_state = 1, g_oe_focus_mode = 0, g_oe_was_foreground;
 static int g_oe_opmode_notify, g_oe_resume_notify, g_oe_focus_pending, g_oe_focus_recheck;
+#ifdef _WIN32
 static HWND g_oe_window;
+#else
+/* display (macOS): the state of the game's window, as the applet manager's rule below needs it */
+int display_window_foreground(void);                  /* the window is the key window of the active application */
+int display_window_minimised(void);
+void display_window_minimise(int on);                 /* SMO_FOCUS_TEST */
+static int g_oe_window;                               /* the window has been seen (as the HWND above) */
+#define IsIconic(w) ((void)(w), display_window_minimised())
+#endif
 static CRITICAL_SECTION g_oe_lock;
 static void oe_event_setup(void) {
     if (!g_oe_event_ready) { os_init_event((uint64_t)(uintptr_t)g_oe_event, 0); g_oe_event_ready = 1; }
@@ -159,11 +191,13 @@ extern volatile LONG g_guest_frozen;
 static volatile LONG g_oe_poll_count;
 static int g_oe_exit_requested;                           /* defined with the exit request code below */
 #define OE_MSG_RESUME 16u
+#ifdef _WIN32
 static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
     DWORD pid = 0;
     if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
     return TRUE;
 }
+#endif
 static DWORD WINAPI oe_watch(LPVOID pause) {
     static const char *const k_test_state[] = {"", "not active (another program has the focus)", "minimised"};
     const char *test = getenv("SMO_FOCUS_TEST");
@@ -176,15 +210,29 @@ static DWORD WINAPI oe_watch(LPVOID pause) {
         Sleep(20);
         double t = (double)(GetTickCount64() - t0) / 1000.0;
         if (test && test_phase < 3 && t >= t_start + test_phase * t_len) {
+#ifdef _WIN32
             HWND w = NULL;
+#else
+            int w = display_window_foreground() || display_window_minimised() || g_oe_window;   /* a window on screen */
+#endif
             if (test_phase > 0)
                 printf("nn::oe: focus test: %s for %llu ms: the game's main loop polled %ld times\n", k_test_state[test_phase],
                        (unsigned long long)(GetTickCount64() - phase_at), (long)(g_oe_poll_count - phase_polls));
+#ifdef _WIN32
             if (test_phase == 1) EnumWindows(oe_find_window, (LPARAM)&w);
+#endif
             if (test_phase == 0) g_oe_was_foreground = 1;  /* never the foreground window, so from now on another program has the focus */
+#ifdef _WIN32
             else if (test_phase == 1 && w) { g_oe_window = w; ShowWindow(w, SW_SHOWMINNOACTIVE); }
+#else
+            else if (test_phase == 1 && w) { g_oe_window = 1; display_window_minimise(1); }
+#endif
             else {                                        /* restored (or no window on screen to minimise: SMO_SHOW=1 for a test copy) */
+#ifdef _WIN32
                 if (test_phase == 2) ShowWindow(g_oe_window, SW_SHOWNOACTIVATE);
+#else
+                if (test_phase == 2) display_window_minimise(0);
+#endif
                 else printf("nn::oe: focus test: no window on screen to minimise (a test copy needs SMO_SHOW=1)\n");
                 g_oe_was_foreground = 0;                  /* a window that was never the foreground window counts as in focus again */
                 test_phase = 2;
@@ -194,11 +242,16 @@ static DWORD WINAPI oe_watch(LPVOID pause) {
             if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run", g_oe_focus_mode);
             fflush(stdout);
         }
+        int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real foreground */
+#ifdef _WIN32
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
-        int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real foreground */
         int ours = !testing && fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
         if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
+#else
+        int ours = !testing && display_window_foreground();
+        if (ours) { g_oe_was_foreground = 1; g_oe_window = 1; }
+#endif
         int minimised = g_oe_window && IsIconic(g_oe_window);
         int runnable = !pause || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
@@ -229,10 +282,15 @@ static void oe_track_focus(void) {
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
     g_oe_focus_recheck = 0;
+#ifdef _WIN32
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
     int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
     if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
+#else
+    int ours = display_window_foreground();
+    if (ours) { g_oe_was_foreground = 1; g_oe_window = 1; }
+#endif
     if (!g_oe_was_foreground) return;
     /* the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
      * the window as the activity state: foreground = ForegroundVisible; visible but not the foreground window = ForegroundObscured
@@ -325,11 +383,37 @@ static uint64_t desired_language(void) {
     static uint64_t cached;
     static const char *const supported[] = {"ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "zh-Hans", "zh-Hant", "ko", "nl", "ru"};
     if (cached) return cached;
+#ifndef _WIN32
+#define LOCALE_NAME_MAX_LENGTH 85
+#endif
     char name[LOCALE_NAME_MAX_LENGTH * 3] = "", pick[16] = "en-US";
     const char *env = getenv("SMO_LANGUAGE");
+#ifdef _WIN32
     wchar_t wname[LOCALE_NAME_MAX_LENGTH] = L"";
     ULONG count = 0, size = 0;
+#endif
     if (env && env[0]) snprintf(name, sizeof name, "%s", env);
+#ifndef _WIN32
+#ifdef __linux__
+    else {                                                /* the user's language (LANGUAGE's first, else LC_ALL, LC_MESSAGES, LANG) */
+        const char *v = getenv("LANGUAGE");
+        if (!v || !v[0]) v = getenv("LC_ALL");
+        if (!v || !v[0]) v = getenv("LC_MESSAGES");
+        if (!v || !v[0]) v = getenv("LANG");
+        if (v && v[0] && strcmp(v, "C") && strcmp(v, "POSIX")) {
+            snprintf(name, sizeof name, "%s", v);
+            name[strcspn(name, ":.@")] = 0;               /* es_ES.UTF-8 -> es_ES */
+            for (char *p = name; *p; p++) if (*p == '_') *p = '-';
+        }
+    }
+#else
+    else {                                                /* the first of the user's preferred languages (System Settings) */
+        CFArrayRef langs = CFLocaleCopyPreferredLanguages();
+        if (langs && CFArrayGetCount(langs) > 0) CFStringGetCString((CFStringRef)CFArrayGetValueAtIndex(langs, 0), name, sizeof name, kCFStringEncodingUTF8);
+        if (langs) CFRelease(langs);
+    }
+#endif
+#else
     else {
         /* the display language of the user interface, not the regional format */
         wchar_t list[512];
@@ -338,6 +422,7 @@ static uint64_t desired_language(void) {
         else GetUserDefaultLocaleName(wname, LOCALE_NAME_MAX_LENGTH);
         WideCharToMultiByte(CP_UTF8, 0, wname, -1, name, sizeof name, NULL, NULL);
     }
+#endif
     int exact = 0;
     for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!_stricmp(name, supported[i])) { strcpy(pick, supported[i]); exact = 1; }
     if (!exact) {
@@ -352,7 +437,11 @@ static uint64_t desired_language(void) {
     }
     uint64_t v = 0;
     memcpy(&v, pick, strlen(pick));
+#ifdef _WIN32
     printf("nn::oe::GetDesiredLanguage: Windows display language \"%s\" -> \"%s\"\n", name, pick);
+#else
+    printf("nn::oe::GetDesiredLanguage: macOS preferred language \"%s\" -> \"%s\"\n", name, pick);
+#endif
     cached = v;
     return v;
 }
@@ -380,6 +469,7 @@ static void err_ShowErrorResult(Ctx *c) {                 /* (Result): the conso
 }
 
 /* ---------------------------------------------------------------- nn::util */
+#ifdef _WIN32
 static HCRYPTPROV crypt_provider(void) {
     static HCRYPTPROV prov;
     static volatile LONG lock;
@@ -388,6 +478,7 @@ static HCRYPTPROV crypt_provider(void) {
     InterlockedExchange(&lock, 0);
     return prov;
 }
+#endif
 /* [sdk] BinaryFileHeader checks (layout in nnsdk.c): signature = first 8 bytes; alignment shift u8 @0xe;
  * byte-order mark i16 @0xc, reversed when it reads 0xFFFE. */
 static void util_BinaryFileHeader_IsSignatureValid(Ctx *c) { RET(rd64(A0) == A1); }
@@ -395,6 +486,45 @@ static void util_BinaryFileHeader_IsAlignmentValid(Ctx *c) { RET((A0 & ~(~0ull <
 static void util_BinaryFileHeader_IsEndianReverse(Ctx *c) { RET(rd16(A0 + 0xc) == 0xfffe); }
 
 /* ---------------------------------------------------------------- nn::crypto (Windows CryptoAPI) */
+#ifndef _WIN32
+/* macOS: CommonCrypto. MD5 is deprecated there for security use; the game's use (checksums) is not one. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
+    uint8_t digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1((const void *)(uintptr_t)A2, (CC_LONG)A3, digest);
+    memcpy((void *)(uintptr_t)A0, digest, A1 < sizeof digest ? (size_t)A1 : sizeof digest);
+}
+static struct { uint64_t key; CC_MD5_CTX h; } g_md5[64];
+static CRITICAL_SECTION g_md5_lock;
+static CC_MD5_CTX *md5_slot(uint64_t key, int create) {
+    CC_MD5_CTX *found = NULL;
+    EnterCriticalSection(&g_md5_lock);
+    for (int i = 0; i < 64 && !found; i++) if (g_md5[i].key == key) found = &g_md5[i].h;
+    for (int i = 0; i < 64 && !found && create; i++) if (!g_md5[i].key) { g_md5[i].key = key; found = &g_md5[i].h; }
+    LeaveCriticalSection(&g_md5_lock);
+    return found;
+}
+static void md5_drop(uint64_t key) {
+    EnterCriticalSection(&g_md5_lock);
+    for (int i = 0; i < 64; i++) if (g_md5[i].key == key) g_md5[i].key = 0;
+    LeaveCriticalSection(&g_md5_lock);
+}
+static void crypto_Md5_Initialize(Ctx *c) {
+    md5_drop(A0);
+    CC_MD5_CTX *h = md5_slot(A0, 1);
+    if (!h) fatal(c, "nn::crypto Md5Impl: more than 64 hashes in progress");
+    CC_MD5_Init(h);
+}
+static void crypto_Md5_Update(Ctx *c) { CC_MD5_CTX *h = md5_slot(A0, 0); if (h) CC_MD5_Update(h, (const void *)(uintptr_t)A1, (CC_LONG)A2); }
+static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, size_t outSize) */
+    CC_MD5_CTX *h = md5_slot(A0, 0), copy;
+    uint8_t digest[CC_MD5_DIGEST_LENGTH] = {0};
+    if (h) { copy = *h; CC_MD5_Final(digest, &copy); }    /* the running hash stays usable, as CryptGetHashParam leaves it */
+    memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
+}
+#pragma clang diagnostic pop
+#else
 static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
     HCRYPTHASH h = 0;
     uint8_t digest[20] = {0};
@@ -436,6 +566,7 @@ static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, s
     if (h && *h) CryptGetHashParam(*h, HP_HASHVAL, digest, &len, 0);
     memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
 }
+#endif
 static void crypto_Md5_dtor(Ctx *c) { md5_drop(A0); }
 
 /* ---------------------------------------------------------------- nn::friends, nn::account: no friends, no network

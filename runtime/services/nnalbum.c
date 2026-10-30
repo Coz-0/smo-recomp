@@ -1,6 +1,10 @@
 /* The album: pictures of the Capture button, kept in <userdata>\album (<userdata> = %SMO_USERDATA% or ..\userdata) as
  * <date>_<time>_<nn>.bmp (32-bit BMP; a console stores JPEG). The game imports no nn::album function. */
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

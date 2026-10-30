@@ -302,6 +302,13 @@ static inline void v_xtn(V128 *d, const V128 *pn, int sz) {
     for (int i = 0; i < (8 >> sz); i++) vset(&r, sz, i, vget(&a, sz + 1, i));
     *d = r;
 }
+/* XTN2: the narrowed lanes go to the upper half; the lower half of the destination is kept */
+static inline void v_xtn2(V128 *d, const V128 *pn, int sz) {
+    V128 a = *pn, r = *d;
+    r.d[1] = 0;
+    for (int i = 0; i < (8 >> sz); i++) vset(&r, sz, (8 >> sz) + i, vget(&a, sz + 1, i));
+    *d = r;
+}
 
 /* BSL / BIT / BIF */
 static inline void v_bitsel(V128 *d, const V128 *pn, const V128 *pm, int kind, int q) {

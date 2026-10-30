@@ -3,7 +3,7 @@
 
     python scripts/setup.py --dump <folder> [--jobs N]
 
-The game is Super Mario Odyssey 1.4.1. <folder> is your decrypted dump of it (docs/building.md: what to dump with
+The game is Super Mario Odyssey 1.3.0. <folder> is your decrypted dump of it (docs/building.md: what to dump with
 nxdumptool and how to lay it out): the program's ExeFS with the update, the RomFS with the update applied and the
 update's control.nacp; the Help pages and the console's shared fonts are optional. No keys and no
 firmware are read: the files are already decrypted by your console. Where the files go: tools/target.py.
@@ -57,13 +57,28 @@ def check_deps(a):
         except ImportError:
             print('  missing Python package %s (pip install %s)' % (mod, pip))
             ok = False
-    clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
-    sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
-    wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
-    wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
-    for what, path in (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
-                       ('WebView2 SDK (WEBVIEW2_ROOT)', wv2)):
+    vkh = T.vulkan_headers()
+    vkh = os.path.join(vkh, 'vulkan', 'vulkan.h') if vkh else ''
+    if T.MAC:                                         # docs/macos-port.md: Apple clang, Homebrew's SDL3, the LunarG SDK
+        import shutil
+        clang = shutil.which(T.clang()) or ''
+        tools = (('Apple clang (xcode-select --install)', clang), ('Vulkan SDK (~/VulkanSDK or VULKAN_SDK)', vkh),
+                 ('SDL3 (brew install sdl3, or SDL3_ROOT)', os.path.join(T.sdl3()[0], 'SDL3', 'SDL.h')))
+    elif T.LINUX:                                     # docs/linux-port.md: the distribution's packages
+        import shutil
+        clang = shutil.which(T.clang()) or ''
+        tools = (('clang and lld (clang, lld)', clang), ('lld', shutil.which('ld.lld') or ''), ('Vulkan headers (vulkan-headers)', vkh),
+                 ('SDL3 (sdl3)', os.path.join(T.sdl3()[0], 'SDL3', 'SDL.h')), ('shaderc (shaderc)', '/usr/include/shaderc/shaderc.h'),
+                 ('FreeType (freetype2)', '/usr/include/freetype2/ft2build.h'), ('FFmpeg (ffmpeg)', '/usr/include/libavformat/avformat.h'),
+                 ('OpenSSL (openssl)', '/usr/include/openssl/md5.h'))
+    else:
+        clang = T.clang()
+        sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
+        wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
+        wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
+        tools = (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
+                 ('WebView2 SDK (WEBVIEW2_ROOT)', wv2))
+    for what, path in tools:
         found = bool(path) and os.path.exists(path)
         print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
         ok &= found
@@ -93,7 +108,7 @@ STEPS = [
      lambda a: [[PY, tool('lifter', 'gen_tables.py')], [PY, tool('lifter', 'gen_sdktest.py')]]),
     ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
-    ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
+    ('link', 'bin/' + T.EXE, None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
     ('check', 'difftest + linkcheck', None,
      lambda a: [[PY, tool('lifter', 'difftest.py'), 'all'], [PY, tool('lifter', 'linkcheck.py')]]),
 ]
@@ -146,7 +161,7 @@ def main():
                     raise SystemExit('[%s] failed (exit code %d); fix the cause and run setup again, it resumes here' % (name, r.returncode))
     if 'link' in todo:
         print('\nBuilt: %s. Start the game with: python scripts/run.py <run name> --seconds 300'
-              % os.path.relpath(T.build('bin', 'smo_native.exe'), REPO))
+              % os.path.relpath(T.build('bin', T.EXE), REPO))
 
 
 if __name__ == '__main__':

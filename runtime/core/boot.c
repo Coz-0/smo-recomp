@@ -3,9 +3,15 @@
  * other modules it asks for, in order. Unimplemented imports return 0. */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <math.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -127,9 +133,17 @@ static DWORD WINAPI profiler(LPVOID arg) {
         return 0;
     }
     while (GetTickCount64() < end) {
-        CONTEXT ctx;
         uint64_t chain[64];
         int k = 0;
+#ifndef _WIN32
+        uint64_t pcs[400];
+        int npc = host_thread_backtrace(g_prof_target, pcs, 400);
+        for (int depth = 0; depth < npc && k < 64; depth++) {
+            uint64_t g = guest_function_of(pcs[depth]);
+            if (g && (k == 0 || chain[k - 1] != g)) chain[k++] = g;
+        }
+#else
+        CONTEXT ctx;
         memset(&ctx, 0, sizeof ctx);
         ctx.ContextFlags = CONTEXT_FULL;
         SuspendThread(g_prof_target);
@@ -145,6 +159,7 @@ static DWORD WINAPI profiler(LPVOID arg) {
             if (!ctx.Rip) break;
         }
         ResumeThread(g_prof_target);
+#endif
         samples++;
         for (int i = 0; i < k; i++) {
             uint64_t callee = chain[i], caller = i + 1 < k ? chain[i + 1] : 0;
@@ -242,6 +257,24 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     return 0;
 }
 
+/* The main thread waits for the guest's main thread. On macOS it pumps the window's events meanwhile: Cocoa windows belong
+ * to the main thread (display.c). */
+static DWORD wait_game(HANDLE t, DWORD ms) {
+#ifdef _WIN32
+    return WaitForSingleObject(t, ms);
+#else
+    void display_pump(void);
+    ULONGLONG end = ms == INFINITE ? ~0ull : GetTickCount64() + ms;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        DWORD slice = now >= end ? 0 : end - now > 8 ? 8 : (DWORD)(end - now);
+        DWORD r = WaitForSingleObject(t, slice);
+        display_pump();
+        if (r != WAIT_TIMEOUT || GetTickCount64() >= end) return r;
+    }
+#endif
+}
+
 int main(int argc, char **argv) {
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -287,13 +320,13 @@ int main(int argc, char **argv) {
     /* the lifted code uses the host stack for every guest call: give it plenty */
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("SMO_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
-    DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    DWORD wr = wait_game(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
     {   unsigned long long stage_list_started(void);     /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the limit counts from the start of the stage being played */
         for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > GetTickCount64(); )
-            wr = WaitForSingleObject(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
+            wr = wait_game(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
     }
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
-        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = wait_game(t, h - done);
     }
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());
@@ -308,6 +341,18 @@ int main(int argc, char **argv) {
             /* where is the main host thread really? sample its instruction pointer and unwind */
             for (int s = 0; s < 3; s++) {
                 Sleep(50);
+#ifndef _WIN32
+                uint64_t pcs[200];
+                int npc = host_thread_backtrace(t, pcs, 200);
+                printf("  host pc sample %d: pc=%p -> f_%llx |", s, npc ? (void *)(uintptr_t)pcs[0] : NULL, (unsigned long long)(npc ? guest_function_of(pcs[0]) : 0));
+                uint64_t last = 0;
+                for (int depth = 0, shown = 0; depth < npc && shown < 12; depth++) {
+                    uint64_t g = guest_function_of(pcs[depth]);
+                    if (g && g != last) { printf(" f_%llx", (unsigned long long)g); shown++; last = g; }
+                    else if (!g && depth == 0) printf(" [host %p]", (void *)(uintptr_t)pcs[0]);
+                }
+                printf("\n");
+#else
                 CONTEXT ctx;
                 memset(&ctx, 0, sizeof ctx);
                 ctx.ContextFlags = CONTEXT_FULL;
@@ -328,6 +373,7 @@ int main(int argc, char **argv) {
                 }
                 printf("\n");
                 ResumeThread(t);
+#endif
             }
             for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
                 Sleep(37);

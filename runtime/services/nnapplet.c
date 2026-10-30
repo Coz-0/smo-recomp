@@ -70,8 +70,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#include <spawn.h>
+#include <sys/wait.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+#endif
 #include "sdklift.h"
+#ifndef _WIN32
+#include "core_model.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -207,6 +219,7 @@ static int write_if_differs(const char *path, const char *data, size_t n) {
 }
 static void url_append(char *url, size_t cap, const char *s) {      /* a path as a file URL: forward slashes, %XX escapes */
     size_t n = strlen(url);
+    if (n && url[n - 1] == '/' && (*s == '\\' || *s == '/')) s++;   /* "file:///" + "\\Users\\..." (macOS): one slash, not two */
     for (; *s && n + 4 < cap; s++) {
         unsigned char ch = (unsigned char)*s;
         if (ch == '\\') url[n++] = '/';
@@ -254,9 +267,25 @@ static int web_open_in_browser(const char *doc, const char *full, const char *q)
                       "<title>Super Mario Odyssey - Help</title><a href=\"%s\">Help</a>\n", url, url);
     if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
     if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }
+#ifdef _WIN32
     HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
     printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
     return (INT_PTR)r > 32;
+#else
+    char host[MAX_PATH * 2];                            /* macOS: open(1); Linux: xdg-open; the default browser for .html */
+    recomp_path(host, sizeof host, fwd);
+#ifdef __APPLE__
+    char *argv[] = {"/usr/bin/open", host, NULL};
+#else
+    char *argv[] = {"xdg-open", host, NULL};
+#endif
+    pid_t pid;
+    extern char **environ;
+    int opened = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) == 0;
+    if (opened) { int st; opened = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0; }
+    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, opened ? "" : ": FAILED");
+    return opened;
+#endif
 }
 /* 0: the document is not there or could not be shown; 1: shown and closed by the player (or opened in a web browser); 2: the
  * page went to a callback address, copied to callback. */
@@ -330,6 +359,97 @@ typedef struct {
     wchar_t text[SWKBD_MAX_CHARS + 2];
 } KbdDialog;
 
+#if defined(__linux__)
+/* Linux: kdialog (KDE) or zenity (GNOME and others) asks for the text, modal on the calling thread as the Windows dialog
+ * is; the first of the two found on PATH. A text shorter than the minimum asks again; a longer one is cut. Without
+ * either the answer is "cancelled", as on a console whose player backs out. */
+static int (*g_kbd_auto)(KbdDialog *k);                   /* self-test: answers in place of the player */
+static int kbd_run_dialog(KbdDialog *k) {
+    if (g_kbd_auto) return g_kbd_auto(k);
+    char info[2400], init[SWKBD_MAX_CHARS * 4 + 4];
+    wchar_t winfo[600];
+    swprintf(winfo, 599, L"%ls%ls%ls%ls%ls", k->header, k->header[0] && k->sub[0] ? L"\n" : L"", k->sub,
+             (k->header[0] || k->sub[0]) && k->guide[0] ? L"\n" : L"", k->guide);
+    winfo[599] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, winfo[0] ? winfo : L"Enter text", -1, info, sizeof info, NULL, NULL)) info[0] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, k->initial, -1, init, sizeof init, NULL, NULL)) init[0] = 0;
+    for (;;) {
+        static const char *const title = "Software keyboard (smo-recomp)";
+        char *kd[] = {"kdialog", "--title", (char *)title, k->password ? "--password" : "--inputbox", info, k->password ? NULL : init, NULL};
+        char *zn[] = {"zenity", "--entry", "--title", (char *)title, "--text", info, k->password ? "--hide-text" : "--entry-text", k->password ? NULL : init, NULL};
+        int fd[2];
+        if (pipe(fd)) return 0;
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+        posix_spawn_file_actions_addclose(&fa, fd[0]);
+        extern char **environ;
+        pid_t pid;
+        int spawned = posix_spawnp(&pid, kd[0], &fa, NULL, kd, environ) == 0 || posix_spawnp(&pid, zn[0], &fa, NULL, zn, environ) == 0;
+        posix_spawn_file_actions_destroy(&fa);
+        close(fd[1]);
+        if (!spawned) { close(fd[0]); printf("nn::swkbd: neither kdialog nor zenity found; answered as cancelled\n"); return 0; }
+        char u[SWKBD_MAX_CHARS * 4 + 4];
+        size_t n = 0;
+        ssize_t r;
+        cm_block_begin();                                /* the player may take a while: the console core goes to another thread */
+        while (n < sizeof u - 1 && (r = read(fd[0], u + n, sizeof u - 1 - n)) != 0) { if (r < 0) { if (errno == EINTR) continue; break; } n += (size_t)r; }
+        close(fd[0]);
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        cm_block_end();
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 0;          /* Cancel, Escape or the window closed */
+        u[n] = 0;
+        if (n && u[n - 1] == '\n') u[n - 1] = 0;
+        MultiByteToWideChar(CP_UTF8, 0, u, -1, k->text, SWKBD_MAX_CHARS + 1);
+        k->text[SWKBD_MAX_CHARS] = 0;
+        if (k->max_len > 0 && (int)wcslen(k->text) > k->max_len) k->text[k->max_len] = 0;
+        if ((int)wcslen(k->text) < k->min_len) continue;
+        return 1;
+    }
+}
+#elif !defined(_WIN32)
+/* macOS: a CoreFoundation alert with a text field, modal on the calling thread as the Windows dialog is. A text shorter
+ * than the minimum beeps and asks again (the Windows dialog keeps its OK button from closing); a longer one is cut. */
+static int (*g_kbd_auto)(KbdDialog *k);                   /* self-test: answers in place of the player */
+static CFStringRef cf_of_w(const wchar_t *w) {
+    char u[SWKBD_MAX_CHARS * 4 + 600];
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL)) u[0] = 0;
+    return CFStringCreateWithCString(NULL, u, kCFStringEncodingUTF8);
+}
+static int kbd_run_dialog(KbdDialog *k) {
+    if (g_kbd_auto) return g_kbd_auto(k);
+    wchar_t info[600];
+    swprintf(info, 599, L"%ls%ls%ls%ls%ls", k->header, k->header[0] && k->sub[0] ? L"\n" : L"", k->sub,
+             (k->header[0] || k->sub[0]) && k->guide[0] ? L"\n" : L"", k->guide);
+    info[599] = 0;
+    for (;;) {
+        CFStringRef msg = cf_of_w(info[0] ? info : L"Enter text"), init = cf_of_w(k->initial);
+        CFStringRef titles[1] = {CFSTR("")}, values[1] = {init};
+        CFArrayRef ta = CFArrayCreate(NULL, (const void **)titles, 1, &kCFTypeArrayCallBacks), va = CFArrayCreate(NULL, (const void **)values, 1, &kCFTypeArrayCallBacks);
+        const void *keys[] = {kCFUserNotificationAlertHeaderKey, kCFUserNotificationAlertMessageKey, kCFUserNotificationTextFieldTitlesKey,
+                              kCFUserNotificationTextFieldValuesKey, kCFUserNotificationDefaultButtonTitleKey, kCFUserNotificationAlternateButtonTitleKey};
+        const void *vals[] = {CFSTR("Software keyboard (smo-recomp)"), msg, ta, va, CFSTR("OK"), CFSTR("Cancel")};
+        CFDictionaryRef d = CFDictionaryCreate(NULL, keys, vals, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        SInt32 err = 0;
+        CFUserNotificationRef n = CFUserNotificationCreate(NULL, 0, kCFUserNotificationPlainAlertLevel | (k->password ? CFUserNotificationSecureTextField(0) : 0), &err, d);
+        CFRelease(d); CFRelease(ta); CFRelease(va); CFRelease(msg); CFRelease(init);
+        if (!n) { printf("nn::swkbd: the text dialog could not be created (error %d); answered as cancelled\n", (int)err); return 0; }
+        CFOptionFlags resp = 0;
+        CFUserNotificationReceiveResponse(n, 0, &resp);
+        if ((resp & 3) != kCFUserNotificationDefaultResponse) { CFRelease(n); return 0; }
+        CFStringRef v = CFUserNotificationGetResponseValue(n, kCFUserNotificationTextFieldValuesKey, 0);
+        char u[SWKBD_MAX_CHARS * 4 + 4] = "";
+        if (v) CFStringGetCString(v, u, sizeof u, kCFStringEncodingUTF8);
+        CFRelease(n);
+        MultiByteToWideChar(CP_UTF8, 0, u, -1, k->text, SWKBD_MAX_CHARS + 1);
+        k->text[SWKBD_MAX_CHARS] = 0;
+        if (k->max_len > 0 && (int)wcslen(k->text) > k->max_len) k->text[k->max_len] = 0;
+        if ((int)wcslen(k->text) < k->min_len) { MessageBeep(MB_ICONWARNING); continue; }
+        return 1;
+    }
+}
+#else
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
 static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -393,6 +513,7 @@ static int kbd_run_dialog(KbdDialog *k) {
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
 }
+#endif
 static void copy_w(wchar_t *dst, uint64_t src, int max) {
     int i = 0;
     for (; i < max; i++) { uint16_t ch = rd16(src + (uint64_t)i * 2); if (!ch) break; dst[i] = ch; }
@@ -663,6 +784,18 @@ static ImportFn h(const char *name) {
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
 static volatile int g_kbd_test_initial_seen;
+#ifndef _WIN32
+static int g_kbd_test_round;
+static int kbd_test_answer(KbdDialog *k) {                /* macOS and Linux: the test's answers instead of the player's (see above) */
+    if (g_kbd_test_round++ == 0) {
+        static const wchar_t typed[] = {'Z', 0x30bc, 0};
+        g_kbd_test_initial_seen = wcscmp(k->initial, L"Mario") == 0;
+        wcscpy(k->text, typed);
+        return 1;
+    }
+    return 0;
+}
+#else
 static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     (void)arg;
     for (int round = 0; round < 2; round++) {
@@ -682,6 +815,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     }
     return 0;
 }
+#endif
 /* An amiibo held to the reader, in the order the game's NFC thread asks ([game] 0x95efa8): found at StartDetection with the
  * activate event signalled; Mount; TagInfo / ModelInfo; Unmount takes it away (deactivate event); searching again finds
  * nothing. Run by both self-tests (SMO_SDK_SELFTEST in nnapplet_selftest, SMO_IMPORT_SELFTEST in smo_selftest.c). */
@@ -772,15 +906,25 @@ int nnapplet_selftest(Ctx *c) {
     ok = ok && c->x[0] == SWKBD_RESULT_CANCELED;
     /* the real dialog: a helper thread types into it and presses OK, then a second run is cancelled */
     _putenv("SMO_SWKBD=dialog");
+#ifdef _WIN32
     HANDLE helper = CreateThread(NULL, 0, kbd_test_driver, NULL, 0, NULL);
+#else
+    g_kbd_test_round = 0; g_kbd_auto = kbd_test_answer;
+#endif
     memset(text, 0xee, string_size + 16);
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     int dialog_ok = c->x[0] == 0 && rd16(P(text)) == 'Z' && rd16(P(text) + 2) == 0x30bc && rd16(P(text) + 4) == 0 && g_kbd_test_initial_seen;
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     dialog_ok = dialog_ok && c->x[0] == SWKBD_RESULT_CANCELED;
+#ifdef _WIN32
     WaitForSingleObject(helper, 5000);
     CloseHandle(helper);
     printf("  swkbd: Win32 dialog shows the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
+#else
+    g_kbd_auto = NULL;
+    printf("  swkbd: the dialog's caller gets the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel "
+           "(the dialog itself is answered by the test, not driven): %s\n", dialog_ok ? "ok" : "FAILED");
+#endif
     bad += !dialog_ok;
     _putenv("SMO_SWKBD=");
     printf("  swkbd: sizes work 0x%llx string 0x%llx; SetInitialText in the work buffer; scripted answer \"Kirby\" (UTF-16) and cancel (0x29f): %s\n",

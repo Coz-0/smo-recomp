@@ -5,6 +5,9 @@
  *     -Ddyn_syms=(*game_dyn_syms_p) -Ddyn_sym_count=(*game_dyn_sym_count_p)
  * so the tables declared in runtime.h become pointers into the DLL, filled in here before main(). */
 #include "runtime.h"
+#ifndef _WIN32
+#include "win32_posix.h"       /* __declspec(dllexport / dllimport) */
+#endif
 
 typedef struct {
     void (*call_indirect)(Ctx *, uint64_t);

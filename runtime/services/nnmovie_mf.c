@@ -55,9 +55,10 @@
  * The game's movies are the 44 MP4 files of its RomFS's MovieData folder (the Help's play guides): H.264 video, 41 of
  * them with AAC sound, which Media Foundation decodes on every Windows PC.
  *
- * How this file maps the protocol onto IMFSourceReader: the extractor reads the whole file through the game's
+ * How this file maps the protocol onto a reader that demuxes AND decodes (nnmovie_src.h: IMFSourceReader on Windows,
+ * here; AVAssetReader on macOS, nnmovie_av.m): the extractor reads the whole file through the game's
  * ClientStreamReader into memory and opens it as an MF byte stream.  ReadSample(ANY_STREAM) demuxes AND decodes, so
- * the "compressed sample" handed to the game in Extractor::Read is only a token {magic, IMFSample*, time} written into
+ * the "compressed sample" handed to the game in Extractor::Read is only a token {magic, sample, time} written into
  * the decoder's input slot; Decoder::SendInputBufferForDecode moves that sample to the output queue, GetOutputBuffer
  * copies the decoded NV12 / PCM data into the game's buffer and ReleaseOutputBufferIndex frees the slot.
  *
@@ -65,17 +66,22 @@
  * reader returned; SMO_MOVIE_LOG=1 logs every decoder call. */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <shlwapi.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "nnmovie_src.h"
 
 void input_mark(const char *what);                       /* nnhid.c: anchor for scripted input */
 
@@ -96,7 +102,7 @@ void os_signal_event(uint64_t key);                   /* os_threads.c */
 #define ST_NO_INPUT 0x1011                             /* AcquireInputBufferIndex: nothing offered [subsdk 0x1fac8] */
 #define ST_NO_OUTPUT 0x100e                            /* AcquireOutputBufferIndex: nothing decoded [subsdk 0x1e8d0] */
 #define FLAG_EOS 4
-#define MAX_TRACKS 8
+#define MAX_TRACKS MV_MAX_TRACKS
 #define SLOT_BYTES 64
 #define GAME_DELETE GAME_SYM__ZdlPv              /* the game's operator delete(void *) */
 #define TOKEN_MAGIC 0x4d4f564945544f4bULL             /* "MOVIETOK" */
@@ -104,17 +110,6 @@ void os_signal_event(uint64_t key);                   /* os_threads.c */
 /* ---------------------------------------------------------------- small helpers */
 static int g_log;                                     /* SMO_MOVIE_LOG */
 static uint64_t g_alloc_fn, g_free_fn, g_alloc_user;  /* movie::SetAllocator */
-static volatile LONG g_mf_started;
-static __declspec(thread) int t_com_init;
-
-static void com_init(void) {
-    if (!t_com_init) { CoInitializeEx(NULL, COINIT_MULTITHREADED); t_com_init = 1; }
-    if (!g_mf_started && InterlockedCompareExchange(&g_mf_started, 1, 0) == 0) {
-        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        printf("movie: MFStartup %08lx\n", hr);
-    }
-}
-
 /* Call a guest function with up to five arguments; the caller's registers are preserved. */
 static uint64_t gcall(Ctx *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
     uint64_t save[9], lr = c->x[30], f = c->fn;
@@ -201,27 +196,25 @@ static void buf_SetRange(Ctx *c) { wr32(A0 + B_OFFSET, (uint32_t)A1); wr32(A0 + 
 static void buf_Size(Ctx *c) { RET(rd32(A0 + B_SIZE)); }
 static void buf_Offset(Ctx *c) { RET(rd32(A0 + B_OFFSET)); }
 
-/* ---------------------------------------------------------------- Media Foundation plumbing */
+/* ---------------------------------------------------------------- extractor and decoder state */
 typedef struct {
     int kind;                                         /* 0 video, 1 audio, 2 other */
     char mime[48];
     int w, h, rate, ch, selected, eos;
     double fps;
-    uint32_t fourcc;
-    int failed;                                       /* the source reader's decoder reported an error for this track */
+    int failed;                                       /* the reader's decoder reported an error for this track */
 } Track;
 
 typedef struct Ext {
     CRITICAL_SECTION cs;
-    IMFSourceReader *rd;
-    IMFByteStream *bs;
+    MvSrc *rd;                                        /* nnmovie_src.h */
     int ntracks;
     Track tr[MAX_TRACKS];
     int64_t duration_us;
     int have_pending, pend_track, pend_consumed, eos;
-    IMFSample *pending;
+    void *pending;
     int64_t pend_us;
-    struct { int have; IMFSample *s; int64_t us; } ahead[MAX_TRACKS];    /* next decoded sample of each selected track */
+    struct { int have; void *s; int64_t us; } ahead[MAX_TRACKS];    /* next decoded sample of each selected track */
     char path[260];
     unsigned long long samples_read;
     volatile uint64_t gen;                            /* bumped by SeekTo: samples read before it are refused by the decoders */
@@ -244,7 +237,7 @@ typedef struct Ext {
 #define MAX_OUT 64
 enum { IN_CODEC = 0, IN_OFFERED, IN_CLIENT, IN_DECODING };
 enum { OUT_FREE = 0, OUT_READY, OUT_CLIENT };
-typedef struct { int state; IMFSample *s; int64_t ts; uint32_t flags; } OutBuf;
+typedef struct { int state; void *s; int64_t ts; uint32_t flags; } OutBuf;
 
 typedef struct {
     CRITICAL_SECTION cs;
@@ -256,7 +249,7 @@ typedef struct {
     int nin, nout;
     unsigned char in_state[MAX_IN];
     int in_list[MAX_IN], in_n;                        /* offered input indices, oldest first */
-    struct { IMFSample *s; int64_t ts; uint32_t flags; } in_data[MAX_IN];   /* what an IN_DECODING buffer holds */
+    struct { void *s; int64_t ts; uint32_t flags; } in_data[MAX_IN];   /* what an IN_DECODING buffer holds */
     int dec_list[MAX_IN], dec_n;                      /* inputs waiting for a free output buffer, oldest first */
     OutBuf out[MAX_OUT];
     int out_list[MAX_OUT], out_n;                     /* decoded frames ready for the client, oldest first */
@@ -267,14 +260,7 @@ typedef struct {
     uint32_t last_error;                              /* DecoderImpl +0xd8 [subsdk 0x1fc80] */
 } Dec;
 
-typedef struct { uint64_t magic; IMFSample *s; int64_t ts; uint64_t gen; } Token;   /* gen = Ext::gen when it was read */
-
-static const GUID GUID_Vorbis = {0x8D2FD10B, 0x5841, 0x4a6b, {0x89, 0x05, 0x58, 0x8F, 0xEC, 0x1A, 0xDE, 0xD9}};
-static int is_mf_fourcc_guid(const GUID *g) {         /* {xxxxxxxx-0000-0010-8000-00AA00389B71} */
-    static const unsigned char tail[8] = {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
-    return g->Data2 == 0 && g->Data3 == 0x10 && memcmp(g->Data4, tail, 8) == 0;
-}
-#define FCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+typedef struct { uint64_t magic; void *s; int64_t ts; uint64_t gen; } Token;   /* gen = Ext::gen when it was read */
 
 static void signal_event(Dec *d, int which) {
     if (!d->events) return;
@@ -289,7 +275,7 @@ static Ext *ext_of(uint64_t guest) { return guest ? (Ext *)(uintptr_t)rd64(guest
 static Dec *dec_of(uint64_t guest) { return guest ? (Dec *)(uintptr_t)rd64(guest + 8) : NULL; }
 
 static void release_pending(Ext *e) {                 /* the current sample is done with (Advance) */
-    if (e->have_pending && !e->pend_consumed && e->pending) IMFSample_Release(e->pending);
+    if (e->have_pending && !e->pend_consumed && e->pending) mv_release(e->pending);
     if (e->have_pending) { e->ahead[e->pend_track].have = 0; e->ahead[e->pend_track].s = NULL; }
     e->have_pending = 0; e->pending = NULL; e->pend_consumed = 0;
 }
@@ -297,69 +283,21 @@ static void release_ahead(Ext *e, int track) {        /* track < 0: all */
     for (int i = 0; i < MAX_TRACKS; i++) {
         if (track >= 0 && i != track) continue;
         if (e->have_pending && e->pend_track == i) continue;                  /* owned by release_pending */
-        if (e->ahead[i].have && e->ahead[i].s) IMFSample_Release(e->ahead[i].s);
+        if (e->ahead[i].have && e->ahead[i].s) mv_release(e->ahead[i].s);
         e->ahead[i].have = 0; e->ahead[i].s = NULL;
     }
 }
 
 static int ext_open_bytes(Ext *e, unsigned char *data, size_t size) {
-    com_init();
-    HRESULT hr;
-    IStream *st = SHCreateMemStream(data, (UINT)size);
-    if (!st) { printf("movie: SHCreateMemStream failed (%zu bytes)\n", size); return 0; }
-    hr = MFCreateMFByteStreamOnStream(st, &e->bs);
-    IStream_Release(st);
-    if (FAILED(hr)) { printf("movie: MFCreateMFByteStreamOnStream %08lx\n", hr); return 0; }
-    IMFAttributes *ba = NULL;
-    if (SUCCEEDED(IMFByteStream_QueryInterface(e->bs, &IID_IMFAttributes, (void **)&ba))) {
-        const char *ext = strrchr(e->path, '.');
-        const WCHAR *ctype = ext && _stricmp(ext, ".mp4") == 0 ? L"video/mp4" : ext && _stricmp(ext, ".mkv") == 0 ? L"video/x-matroska" : L"video/webm";
-        IMFAttributes_SetString(ba, &MF_BYTESTREAM_CONTENT_TYPE, ctype);
-        WCHAR name[64]; swprintf(name, 64, L"movie%hs", ext ? ext : ".webm");
-        IMFAttributes_SetString(ba, &MF_BYTESTREAM_ORIGIN_NAME, name);
-        IMFAttributes_Release(ba);
-    }
-    hr = MFCreateSourceReaderFromByteStream(e->bs, NULL, &e->rd);
-    if (FAILED(hr)) { printf("movie: MFCreateSourceReaderFromByteStream %08lx\n", hr); return 0; }
-
-    PROPVARIANT var; PropVariantInit(&var);
-    if (SUCCEEDED(IMFSourceReader_GetPresentationAttribute(e->rd, (DWORD)MF_SOURCE_READER_MEDIASOURCE, &MF_PD_DURATION, &var)) && var.vt == VT_UI8)
-        e->duration_us = (int64_t)(var.uhVal.QuadPart / 10);
-    PropVariantClear(&var);
-    IMFSourceReader_SetStreamSelection(e->rd, (DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);   /* the game selects what it decodes */
-    e->ntracks = 0;
-    for (DWORD i = 0; i < MAX_TRACKS; i++) {
-        IMFMediaType *t = NULL;
-        if (FAILED(IMFSourceReader_GetNativeMediaType(e->rd, i, 0, &t))) break;
-        Track *tr = &e->tr[e->ntracks++];
+    MvTrack t[MAX_TRACKS];
+    int n = 0;
+    e->rd = mv_open(data, size, e->path, &e->duration_us, t, &n);
+    if (!e->rd) return 0;
+    e->ntracks = n;
+    for (int i = 0; i < n; i++) {
+        Track *tr = &e->tr[i];
         memset(tr, 0, sizeof *tr);
-        GUID major, sub;
-        IMFMediaType_GetGUID(t, &MF_MT_MAJOR_TYPE, &major);
-        IMFMediaType_GetGUID(t, &MF_MT_SUBTYPE, &sub);
-        uint32_t fcc = is_mf_fourcc_guid(&sub) ? sub.Data1 : 0;
-        tr->fourcc = fcc;
-        if (IsEqualGUID(&major, &MFMediaType_Video)) {
-            UINT64 fs = 0, fr = 0;
-            tr->kind = 0;
-            IMFMediaType_GetUINT64(t, &MF_MT_FRAME_SIZE, &fs);
-            IMFMediaType_GetUINT64(t, &MF_MT_FRAME_RATE, &fr);
-            tr->w = (int)(fs >> 32); tr->h = (int)(uint32_t)fs;
-            tr->fps = (uint32_t)fr ? (double)(fr >> 32) / (double)(uint32_t)fr : 0.0;
-            strcpy(tr->mime, fcc == FCC('V', 'P', '9', '0') ? "video/x-vnd.on2.vp9" : fcc == FCC('V', 'P', '8', '0') ? "video/x-vnd.on2.vp8" :
-                             fcc == FCC('H', '2', '6', '4') || fcc == FCC('A', 'V', 'C', '1') ? "video/avc" : fcc == FCC('H', 'E', 'V', 'C') ? "video/hevc" : "video/unknown");
-        } else if (IsEqualGUID(&major, &MFMediaType_Audio)) {
-            UINT32 rate = 0, ch = 0;
-            tr->kind = 1;
-            IMFMediaType_GetUINT32(t, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
-            IMFMediaType_GetUINT32(t, &MF_MT_AUDIO_NUM_CHANNELS, &ch);
-            tr->rate = (int)rate; tr->ch = (int)ch;
-            strcpy(tr->mime, IsEqualGUID(&sub, &GUID_Vorbis) ? "audio/vorbis" : fcc == 0x704F ? "audio/opus" : fcc == 0x1610 ? "audio/mp4a-latm" :
-                             fcc == 0x55 ? "audio/mpeg" : fcc == 1 ? "audio/raw" : "audio/unknown");
-        } else {
-            tr->kind = 2;
-            strcpy(tr->mime, "application/octet-stream");
-        }
-        IMFMediaType_Release(t);
+        tr->kind = t[i].kind; strcpy(tr->mime, t[i].mime); tr->w = t[i].w; tr->h = t[i].h; tr->rate = t[i].rate; tr->ch = t[i].ch; tr->fps = t[i].fps;
     }
     printf("movie: opened %s: %zu bytes, %.1f s, %d tracks:", e->path, size, e->duration_us / 1e6, e->ntracks);
     for (int i = 0; i < e->ntracks; i++) {
@@ -375,48 +313,17 @@ static int ext_open_bytes(Ext *e, unsigned char *data, size_t size) {
 static int ext_select(Ext *e, int i, int on) {
     if (!e->rd || i < 0 || i >= e->ntracks) return ST_INVALID;
     Track *tr = &e->tr[i];
-    HRESULT hr = IMFSourceReader_SetStreamSelection(e->rd, (DWORD)i, on ? TRUE : FALSE);
-    if (on && SUCCEEDED(hr) && tr->kind != 2) {
-        IMFMediaType *t = NULL;
-        MFCreateMediaType(&t);
-        if (tr->kind == 0) {
-            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFVideoFormat_NV12);
-        } else {
-            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
-            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
-            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_SAMPLES_PER_SECOND, (UINT32)tr->rate);
-            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_NUM_CHANNELS, (UINT32)tr->ch);
-        }
-        hr = IMFSourceReader_SetCurrentMediaType(e->rd, (DWORD)i, NULL, t);
-        IMFMediaType_Release(t);
-        if (FAILED(hr) && tr->kind == 1) {            /* let the reader pick the PCM layout */
-            MFCreateMediaType(&t);
-            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
-            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
-            hr = IMFSourceReader_SetCurrentMediaType(e->rd, (DWORD)i, NULL, t);
-            IMFMediaType_Release(t);
-        }
-        if (SUCCEEDED(hr)) {
-            IMFMediaType *cur = NULL;
-            if (SUCCEEDED(IMFSourceReader_GetCurrentMediaType(e->rd, (DWORD)i, &cur))) {
-                if (tr->kind == 0) { UINT64 fs = 0; IMFMediaType_GetUINT64(cur, &MF_MT_FRAME_SIZE, &fs); if (fs) { tr->w = (int)(fs >> 32); tr->h = (int)(uint32_t)fs; } }
-                else { UINT32 v = 0; if (SUCCEEDED(IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &v))) tr->rate = (int)v; if (SUCCEEDED(IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_NUM_CHANNELS, &v))) tr->ch = (int)v; }
-                IMFMediaType_Release(cur);
-            }
-        } else {
-            printf("movie: track %d (%s): no Media Foundation decoder path to %s (%08lx); track left unselected\n", i, tr->mime, tr->kind == 0 ? "NV12" : "PCM", hr);
-            IMFSourceReader_SetStreamSelection(e->rd, (DWORD)i, FALSE);
-            return ST_UNSUPPORTED;
-        }
-    }
+    MvTrack t = {tr->kind, "", tr->w, tr->h, tr->rate, tr->ch, tr->fps};
+    strcpy(t.mime, tr->mime);
+    int r = mv_select(e->rd, i, on, &t);
+    if (r == -1) return ST_UNSUPPORTED;
+    if (r == 0 && on) { tr->w = t.w; tr->h = t.h; tr->rate = t.rate; tr->ch = t.ch; }
     if (e->have_pending && e->pend_track == i) release_pending(e);
     release_ahead(e, i);
-    tr->selected = on && SUCCEEDED(hr);
+    tr->selected = on && r == 0;
     tr->eos = 0;
-    printf("movie: %s track %d (%s)%s\n", on ? "selected" : "unselected", i, tr->mime, SUCCEEDED(hr) ? "" : " FAILED");
-    return SUCCEEDED(hr) ? ST_OK : ST_FAILED;
+    printf("movie: %s track %d (%s)%s\n", on ? "selected" : "unselected", i, tr->mime, r == 0 ? "" : " FAILED");
+    return r == 0 ? ST_OK : ST_FAILED;
 }
 
 /* The current sample of the extractor, as NuMediaExtractor defines it: the one with the SMALLEST TIMESTAMP among the
@@ -439,25 +346,20 @@ static int ext_fill(Ext *e) {
     for (int i = 0; i < e->ntracks; i++) {
         Track *tr = &e->tr[i];
         if (!tr->selected) continue;
-        for (int guard = 0; !e->ahead[i].have && !tr->eos && guard < 256; guard++) {
-            DWORD idx = 0, flags = 0; LONGLONG ts = 0; IMFSample *s = NULL;
-            HRESULT hr = IMFSourceReader_ReadSample(e->rd, (DWORD)i, 0, &idx, &flags, &ts, &s);
+        if (!e->ahead[i].have && !tr->eos) {
+            void *s = NULL; int64_t us = 0;
+            int r = mv_read(e->rd, i, &s, &us);
             {   /* test: SMO_MOVIE_FAIL_AT=<n> makes the read after n samples fail */
                 static int fail_at = -1;
                 if (fail_at < 0) { const char *v = getenv("SMO_MOVIE_FAIL_AT"); fail_at = v ? atoi(v) : 0; }
-                if (fail_at > 0 && e->samples_read >= (unsigned long long)fail_at) { if (s) { IMFSample_Release(s); s = NULL; } hr = E_FAIL; }
+                if (fail_at > 0 && e->samples_read >= (unsigned long long)fail_at) { if (r == 1) mv_release(s); r = -1; }
             }
-            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) {
+            if (r < 0) {
                 tr->failed = 1;                           /* the decoder of this track reports it: dec_error_check */
-                printf("movie: ReadSample(track %d) failed (%08lx, flags %lx) after %llu samples: treating as its end\n", i, hr, flags, e->samples_read);
-                if (s) IMFSample_Release(s);
+                printf("movie: reading track %d failed after %llu samples: treating as its end\n", i, e->samples_read);
                 tr->eos = 1;
-                break;
-            }
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (s) IMFSample_Release(s); tr->eos = 1; break; }
-            if (!s) continue;                             /* a tick or a format change without data */
-            e->ahead[i].have = 1; e->ahead[i].s = s; e->ahead[i].us = ts / 10;
-            e->samples_read++;
+            } else if (r == 0) tr->eos = 1;
+            else if (r == 1) { e->ahead[i].have = 1; e->ahead[i].s = s; e->ahead[i].us = us; e->samples_read++; }
         }
         if (e->ahead[i].have && (best < 0 || e->ahead[i].us < e->ahead[best].us)) best = i;
     }
@@ -473,9 +375,8 @@ static void ext_dtor_common(Ctx *c, int deleting) {
         ext_lock(e);
         release_pending(e);
         release_ahead(e, -1);
-        if (e->rd) IMFSourceReader_Release(e->rd);
-        if (e->bs) IMFByteStream_Release(e->bs);
-        e->rd = NULL; e->bs = NULL;
+        if (e->rd) mv_close(e->rd);
+        e->rd = NULL;
         ext_unlock(e);
         DeleteCriticalSection(&e->cs);
         printf("movie: Extractor destroyed (%llu samples read)\n", e->samples_read);
@@ -591,14 +492,12 @@ static void ext_SeekTo(Ctx *c) {                      /* (int64 timeUs) */
     release_pending(e);
     release_ahead(e, -1);
     e->gen++;
-    PROPVARIANT var; PropVariantInit(&var);
-    var.vt = VT_I8; var.hVal.QuadPart = (LONGLONG)A1 * 10;
-    HRESULT hr = IMFSourceReader_SetCurrentPosition(e->rd, &GUID_NULL, &var);
+    int r = mv_seek(e->rd, (int64_t)A1);
     e->eos = 0;
     for (int i = 0; i < e->ntracks; i++) e->tr[i].eos = 0;
     ext_unlock(e);
-    printf("movie: SeekTo(%.3f s) %08lx\n", (int64_t)A1 / 1e6, hr);
-    RET(SUCCEEDED(hr) ? ST_OK : ST_FAILED);
+    printf("movie: SeekTo(%.3f s)%s\n", (int64_t)A1 / 1e6, r ? " FAILED" : "");
+    RET(r == 0 ? ST_OK : ST_FAILED);
 }
 
 static void ext_GetTrackIndexForAvailableData(Ctx *c) {   /* (size_t *track) */
@@ -683,17 +582,17 @@ static void dlog(Dec *d, const char *fmt, ...) {      /* SMO_MOVIE_LOG: one line
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-    printf("movie[%5lu %8llu] %c %s\n", GetCurrentThreadId(), (unsigned long long)GetTickCount64(), d->is_video ? 'V' : 'A', line);
+    printf("movie[%5lu %8llu] %c %s\n", (unsigned long)GetCurrentThreadId(), (unsigned long long)GetTickCount64(), d->is_video ? 'V' : 'A', line);
 }
 
 /* Frees every sample the decoder holds and empties all lists (caller holds the lock). */
 static void dec_release_all(Dec *d) {
-    for (int i = 0; i < d->nout; i++) { if (d->out[i].s) IMFSample_Release(d->out[i].s); memset(&d->out[i], 0, sizeof d->out[i]); }
+    for (int i = 0; i < d->nout; i++) { if (d->out[i].s) mv_release(d->out[i].s); memset(&d->out[i], 0, sizeof d->out[i]); }
     for (int i = 0; i < d->nin; i++) {
-        if (d->in_state[i] == IN_DECODING && d->in_data[i].s) IMFSample_Release(d->in_data[i].s);
+        if (d->in_state[i] == IN_DECODING && d->in_data[i].s) mv_release(d->in_data[i].s);
         Token t;                                      /* a sample read into the buffer but not sent yet */
         memcpy(&t, d->mem + (size_t)i * SLOT_BYTES, sizeof t);
-        if (t.magic == TOKEN_MAGIC && t.s) IMFSample_Release(t.s);
+        if (t.magic == TOKEN_MAGIC && t.s) mv_release(t.s);
         memset(d->mem + (size_t)i * SLOT_BYTES, 0, SLOT_BYTES);
         memset(&d->in_data[i], 0, sizeof d->in_data[i]);
         d->in_state[i] = IN_CODEC;
@@ -898,7 +797,7 @@ static void dec_SendInputBufferForDecode(Ctx *c) {    /* (int index, int offset,
     if (!d || i < 0 || i >= d->nin) { RET(ST_INVALID); return; }
     dec_lock(d);
     dec_error_check(d);
-    IMFSample *sample = NULL;
+    void *sample = NULL;
     int stale = 0;
     Token t;
     memcpy(&t, d->mem + (size_t)i * SLOT_BYTES, sizeof t);
@@ -912,7 +811,7 @@ static void dec_SendInputBufferForDecode(Ctx *c) {    /* (int index, int offset,
         printf("movie: Decoder(%s): input buffer %d holds no sample token (size %d): dropped\n", d->is_video ? "video" : "audio", i, size);
     }
     if (d->in_state[i] != IN_CLIENT || stale) {       /* an index voided by Flush, or data from before the seek: the codec refuses it */
-        if (sample) IMFSample_Release(sample);
+        if (sample) mv_release(sample);
         d->dropped++;
         int was = d->in_state[i];
         int ev = 0;
@@ -974,39 +873,12 @@ static void dec_AcquireOutputBufferIndex(Ctx *c) {    /* (int *index, int64 *tim
 /* Copies the decoded sample of slot i into the game's buffer; returns the number of bytes written. */
 static size_t copy_sample(Dec *d, OutBuf *s, unsigned char *dst, size_t cap) {
     if (!s->s) return 0;
-    IMFMediaBuffer *mb = NULL;
-    if (FAILED(IMFSample_ConvertToContiguousBuffer(s->s, &mb)) || !mb) return 0;
-    BYTE *data = NULL; DWORD len = 0;
-    size_t written = 0;
-    if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &data, NULL, &len)) && data) {
-        if (d->is_video) {
-            int w = d->w, h = d->h;
-            size_t ysize = (size_t)w * (size_t)h, uvrows = (size_t)((h + 1) / 2), need = ysize + (size_t)w * uvrows;
-            long pitch = w;
-            IMF2DBuffer *b2 = NULL; BYTE *scan = NULL; LONG p2 = 0;
-            if (len != need && h > 0 && SUCCEEDED(IMFMediaBuffer_QueryInterface(mb, &IID_IMF2DBuffer, (void **)&b2))) {
-                if (SUCCEEDED(IMF2DBuffer_Lock2D(b2, &scan, &p2)) && scan && p2 > 0) { data = scan; pitch = p2; }
-                else { IMF2DBuffer_Release(b2); b2 = NULL; }
-            }
-            if (!b2 && len != need && h > 0) pitch = (long)((len * 2 / 3) / (size_t)h);    /* tightly packed rows of another stride */
-            if (pitch < w) pitch = w;
-            if (cap < need) { if (!d->warned_small) { d->warned_small = 1; printf("movie: game buffer of %zu bytes is smaller than a %dx%d NV12 frame (%zu)\n", cap, w, h, need); } }
-            else {
-                const unsigned char *src = data;
-                for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, src + (size_t)y * pitch, (size_t)w);
-                const unsigned char *uv = src + (size_t)pitch * h;
-                for (size_t y = 0; y < uvrows; y++) memcpy(dst + ysize + y * (size_t)w, uv + y * (size_t)pitch, (size_t)w);
-                written = need;
-            }
-            if (b2) { IMF2DBuffer_Unlock2D(b2); IMF2DBuffer_Release(b2); }
-        } else {
-            written = len < cap ? len : cap;
-            memcpy(dst, data, written);
-            if (len > cap && !d->warned_small) { d->warned_small = 1; printf("movie: game audio buffer of %zu bytes is smaller than a decoded block (%lu)\n", cap, len); }
-        }
-        IMFMediaBuffer_Unlock(mb);
+    size_t need = 0, written = mv_copy(s->s, d->is_video, d->w, d->h, dst, cap, &need);
+    if (need > cap && !d->warned_small) {
+        d->warned_small = 1;
+        if (d->is_video) printf("movie: game buffer of %zu bytes is smaller than a %dx%d NV12 frame (%zu)\n", cap, d->w, d->h, need);
+        else printf("movie: game audio buffer of %zu bytes is smaller than a decoded block (%zu)\n", cap, need);
     }
-    IMFMediaBuffer_Release(mb);
     return written;
 }
 
@@ -1060,7 +932,7 @@ static void dec_ReleaseOutputBufferIndex(Ctx *c) {    /* (int index) */
     OutBuf *s = &d->out[i];
     int ev = 0, ok = s->state == OUT_CLIENT;
     if (ok) {
-        if (s->s) IMFSample_Release(s->s);
+        if (s->s) mv_release(s->s);
         memset(s, 0, sizeof *s);
         ev = dec_pump(d);                             /* a waiting input can now be decoded into this buffer */
     }
@@ -1112,7 +984,12 @@ static void extractor_ctor(Ctx *c) {                  /* Extractor(ContainerType
     wr64(A0, (uint64_t)(uintptr_t)g_ext_vtable);
     wr64(A0 + 8, (uint64_t)(uintptr_t)e);
     input_mark("movie");
-    printf("movie: Extractor created (container type %u: %s) on Media Foundation\n", (unsigned)A1, A1 == 1 ? "mp4" : A1 == 2 ? "mkv" : A1 == 3 ? "webm" : "?");
+    printf("movie: Extractor created (container type %u: %s) on %s\n", (unsigned)A1, A1 == 1 ? "mp4" : A1 == 2 ? "mkv" : A1 == 3 ? "webm" : "?",
+#ifdef _WIN32
+           "Media Foundation");
+#else
+           "AVFoundation");
+#endif
 }
 
 static void decoder_ctor(Ctx *c) {                    /* Decoder(DecoderType, DecoderOutputFormat, DecoderMode, int) */
@@ -1179,3 +1056,197 @@ void register_movie_mf_imports(void) {
     InitializeCriticalSection(&g_init_lock);
     register_imports(movie_mf_imports, (int)(sizeof movie_mf_imports / sizeof movie_mf_imports[0]));
 }
+
+#ifdef _WIN32
+/* ---------------------------------------------------------------- the reader on Media Foundation (nnmovie_src.h) */
+struct MvSrc { IMFSourceReader *rd; IMFByteStream *bs; };
+static volatile LONG g_mf_started;
+static __declspec(thread) int t_com_init;
+
+static void com_init(void) {
+    if (!t_com_init) { CoInitializeEx(NULL, COINIT_MULTITHREADED); t_com_init = 1; }
+    if (!g_mf_started && InterlockedCompareExchange(&g_mf_started, 1, 0) == 0) {
+        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        printf("movie: MFStartup %08lx\n", hr);
+    }
+}
+static const GUID GUID_Vorbis = {0x8D2FD10B, 0x5841, 0x4a6b, {0x89, 0x05, 0x58, 0x8F, 0xEC, 0x1A, 0xDE, 0xD9}};
+static int is_mf_fourcc_guid(const GUID *g) {         /* {xxxxxxxx-0000-0010-8000-00AA00389B71} */
+    static const unsigned char tail[8] = {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+    return g->Data2 == 0 && g->Data3 == 0x10 && memcmp(g->Data4, tail, 8) == 0;
+}
+#define FCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+MvSrc *mv_open(const unsigned char *data, size_t size, const char *path, int64_t *duration_us, MvTrack *tracks, int *ntracks) {
+    com_init();
+    HRESULT hr;
+    MvSrc *e = calloc(1, sizeof *e);
+    IStream *st = SHCreateMemStream(data, (UINT)size);
+    if (!st) { printf("movie: SHCreateMemStream failed (%zu bytes)\n", size); free(e); return NULL; }
+    hr = MFCreateMFByteStreamOnStream(st, &e->bs);
+    IStream_Release(st);
+    if (FAILED(hr)) { printf("movie: MFCreateMFByteStreamOnStream %08lx\n", hr); free(e); return NULL; }
+    IMFAttributes *ba = NULL;
+    if (SUCCEEDED(IMFByteStream_QueryInterface(e->bs, &IID_IMFAttributes, (void **)&ba))) {
+        const char *ext = strrchr(path, '.');
+        const WCHAR *ctype = ext && _stricmp(ext, ".mp4") == 0 ? L"video/mp4" : ext && _stricmp(ext, ".mkv") == 0 ? L"video/x-matroska" : L"video/webm";
+        IMFAttributes_SetString(ba, &MF_BYTESTREAM_CONTENT_TYPE, ctype);
+        WCHAR name[64]; swprintf(name, 64, L"movie%hs", ext ? ext : ".webm");
+        IMFAttributes_SetString(ba, &MF_BYTESTREAM_ORIGIN_NAME, name);
+        IMFAttributes_Release(ba);
+    }
+    hr = MFCreateSourceReaderFromByteStream(e->bs, NULL, &e->rd);
+    if (FAILED(hr)) { printf("movie: MFCreateSourceReaderFromByteStream %08lx\n", hr); IMFByteStream_Release(e->bs); free(e); return NULL; }
+
+    PROPVARIANT var; PropVariantInit(&var);
+    *duration_us = 0;
+    if (SUCCEEDED(IMFSourceReader_GetPresentationAttribute(e->rd, (DWORD)MF_SOURCE_READER_MEDIASOURCE, &MF_PD_DURATION, &var)) && var.vt == VT_UI8)
+        *duration_us = (int64_t)(var.uhVal.QuadPart / 10);
+    PropVariantClear(&var);
+    IMFSourceReader_SetStreamSelection(e->rd, (DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);   /* the game selects what it decodes */
+    *ntracks = 0;
+    for (DWORD i = 0; i < MV_MAX_TRACKS; i++) {
+        IMFMediaType *t = NULL;
+        if (FAILED(IMFSourceReader_GetNativeMediaType(e->rd, i, 0, &t))) break;
+        MvTrack *tr = &tracks[(*ntracks)++];
+        memset(tr, 0, sizeof *tr);
+        GUID major, sub;
+        IMFMediaType_GetGUID(t, &MF_MT_MAJOR_TYPE, &major);
+        IMFMediaType_GetGUID(t, &MF_MT_SUBTYPE, &sub);
+        uint32_t fcc = is_mf_fourcc_guid(&sub) ? sub.Data1 : 0;
+        if (IsEqualGUID(&major, &MFMediaType_Video)) {
+            UINT64 fs = 0, fr = 0;
+            tr->kind = 0;
+            IMFMediaType_GetUINT64(t, &MF_MT_FRAME_SIZE, &fs);
+            IMFMediaType_GetUINT64(t, &MF_MT_FRAME_RATE, &fr);
+            tr->w = (int)(fs >> 32); tr->h = (int)(uint32_t)fs;
+            tr->fps = (uint32_t)fr ? (double)(fr >> 32) / (double)(uint32_t)fr : 0.0;
+            strcpy(tr->mime, fcc == FCC('V', 'P', '9', '0') ? "video/x-vnd.on2.vp9" : fcc == FCC('V', 'P', '8', '0') ? "video/x-vnd.on2.vp8" :
+                             fcc == FCC('H', '2', '6', '4') || fcc == FCC('A', 'V', 'C', '1') ? "video/avc" : fcc == FCC('H', 'E', 'V', 'C') ? "video/hevc" : "video/unknown");
+        } else if (IsEqualGUID(&major, &MFMediaType_Audio)) {
+            UINT32 rate = 0, ch = 0;
+            tr->kind = 1;
+            IMFMediaType_GetUINT32(t, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+            IMFMediaType_GetUINT32(t, &MF_MT_AUDIO_NUM_CHANNELS, &ch);
+            tr->rate = (int)rate; tr->ch = (int)ch;
+            strcpy(tr->mime, IsEqualGUID(&sub, &GUID_Vorbis) ? "audio/vorbis" : fcc == 0x704F ? "audio/opus" : fcc == 0x1610 ? "audio/mp4a-latm" :
+                             fcc == 0x55 ? "audio/mpeg" : fcc == 1 ? "audio/raw" : "audio/unknown");
+        } else {
+            tr->kind = 2;
+            strcpy(tr->mime, "application/octet-stream");
+        }
+        IMFMediaType_Release(t);
+    }
+    return e;
+}
+
+int mv_select(MvSrc *e, int i, int on, MvTrack *tr) {
+    HRESULT hr = IMFSourceReader_SetStreamSelection(e->rd, (DWORD)i, on ? TRUE : FALSE);
+    if (on && SUCCEEDED(hr) && tr->kind != 2) {
+        IMFMediaType *t = NULL;
+        MFCreateMediaType(&t);
+        if (tr->kind == 0) {
+            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFVideoFormat_NV12);
+        } else {
+            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
+            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_SAMPLES_PER_SECOND, (UINT32)tr->rate);
+            IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_NUM_CHANNELS, (UINT32)tr->ch);
+        }
+        hr = IMFSourceReader_SetCurrentMediaType(e->rd, (DWORD)i, NULL, t);
+        IMFMediaType_Release(t);
+        if (FAILED(hr) && tr->kind == 1) {            /* let the reader pick the PCM layout */
+            MFCreateMediaType(&t);
+            IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+            IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
+            hr = IMFSourceReader_SetCurrentMediaType(e->rd, (DWORD)i, NULL, t);
+            IMFMediaType_Release(t);
+        }
+        if (SUCCEEDED(hr)) {
+            IMFMediaType *cur = NULL;
+            if (SUCCEEDED(IMFSourceReader_GetCurrentMediaType(e->rd, (DWORD)i, &cur))) {
+                if (tr->kind == 0) { UINT64 fs = 0; IMFMediaType_GetUINT64(cur, &MF_MT_FRAME_SIZE, &fs); if (fs) { tr->w = (int)(fs >> 32); tr->h = (int)(uint32_t)fs; } }
+                else { UINT32 v = 0; if (SUCCEEDED(IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &v))) tr->rate = (int)v; if (SUCCEEDED(IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_NUM_CHANNELS, &v))) tr->ch = (int)v; }
+                IMFMediaType_Release(cur);
+            }
+        } else {
+            printf("movie: track %d (%s): no Media Foundation decoder path to %s (%08lx); track left unselected\n", i, tr->mime, tr->kind == 0 ? "NV12" : "PCM", hr);
+            IMFSourceReader_SetStreamSelection(e->rd, (DWORD)i, FALSE);
+            return -1;
+        }
+    }
+    return SUCCEEDED(hr) ? 0 : -2;
+}
+
+int mv_read(MvSrc *e, int i, void **sample, int64_t *us) {
+    for (int guard = 0; guard < 256; guard++) {
+        DWORD idx = 0, flags = 0; LONGLONG ts = 0; IMFSample *s = NULL;
+        HRESULT hr = IMFSourceReader_ReadSample(e->rd, (DWORD)i, 0, &idx, &flags, &ts, &s);
+        if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) {
+            printf("movie: ReadSample(track %d) failed (%08lx, flags %lx)\n", i, hr, flags);
+            if (s) IMFSample_Release(s);
+            return -1;
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (s) IMFSample_Release(s); return 0; }
+        if (!s) continue;                             /* a tick or a format change without data */
+        *sample = s; *us = ts / 10;
+        return 1;
+    }
+    return 2;                                         /* nothing yet */
+}
+
+int mv_seek(MvSrc *e, int64_t us) {
+    PROPVARIANT var; PropVariantInit(&var);
+    var.vt = VT_I8; var.hVal.QuadPart = (LONGLONG)us * 10;
+    HRESULT hr = IMFSourceReader_SetCurrentPosition(e->rd, &GUID_NULL, &var);
+    if (FAILED(hr)) printf("movie: SetCurrentPosition %08lx\n", hr);
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+void mv_release(void *s) { if (s) IMFSample_Release((IMFSample *)s); }
+
+size_t mv_copy(void *sample, int is_video, int w, int h, unsigned char *dst, size_t cap, size_t *need_out) {
+    IMFMediaBuffer *mb = NULL;
+    *need_out = 0;
+    if (FAILED(IMFSample_ConvertToContiguousBuffer((IMFSample *)sample, &mb)) || !mb) return 0;
+    BYTE *data = NULL; DWORD len = 0;
+    size_t written = 0;
+    if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &data, NULL, &len)) && data) {
+        if (is_video) {
+            size_t ysize = (size_t)w * (size_t)h, uvrows = (size_t)((h + 1) / 2), need = ysize + (size_t)w * uvrows;
+            long pitch = w;
+            IMF2DBuffer *b2 = NULL; BYTE *scan = NULL; LONG p2 = 0;
+            *need_out = need;
+            if (len != need && h > 0 && SUCCEEDED(IMFMediaBuffer_QueryInterface(mb, &IID_IMF2DBuffer, (void **)&b2))) {
+                if (SUCCEEDED(IMF2DBuffer_Lock2D(b2, &scan, &p2)) && scan && p2 > 0) { data = scan; pitch = p2; }
+                else { IMF2DBuffer_Release(b2); b2 = NULL; }
+            }
+            if (!b2 && len != need && h > 0) pitch = (long)((len * 2 / 3) / (size_t)h);    /* tightly packed rows of another stride */
+            if (pitch < w) pitch = w;
+            if (cap >= need) {
+                const unsigned char *src = data;
+                for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, src + (size_t)y * pitch, (size_t)w);
+                const unsigned char *uv = src + (size_t)pitch * h;
+                for (size_t y = 0; y < uvrows; y++) memcpy(dst + ysize + y * (size_t)w, uv + y * (size_t)pitch, (size_t)w);
+                written = need;
+            }
+            if (b2) { IMF2DBuffer_Unlock2D(b2); IMF2DBuffer_Release(b2); }
+        } else {
+            *need_out = len;
+            written = len < cap ? len : cap;
+            memcpy(dst, data, written);
+        }
+        IMFMediaBuffer_Unlock(mb);
+    }
+    IMFMediaBuffer_Release(mb);
+    return written;
+}
+
+void mv_close(MvSrc *e) {
+    if (e->rd) IMFSourceReader_Release(e->rd);
+    if (e->bs) IMFByteStream_Release(e->bs);
+    free(e);
+}
+#endif

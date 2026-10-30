@@ -24,7 +24,11 @@
  *   - Frames of the main executable are walked like any other but cannot be resumed: main is lifted without resume
  *     entries. A clean-up pad there is skipped with a warning; a handler there stops with a report.
  * Environment: SMO_UNWIND_LOG=1 prints every frame of every throw (the first 3 throws are always summarised). */
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -29,8 +29,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 #include "eh_runtime.h"
@@ -84,6 +88,16 @@ void cxxrt_guest_delete(Ctx *c, uint64_t p) {            /* the game's own opera
     c->x[0] = x0;
 }
 void cxxrt_print_guest_stack(void) {
+#ifndef _WIN32
+    uint64_t pcs[600];
+    int n = host_backtrace_here(pcs, 600);
+    printf("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    for (int depth = 0, shown = 0; depth < n && shown < 48; depth++) {
+        uint64_t g = guest_function_of(pcs[depth]);
+        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); trace_printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+    }
+#else
     CONTEXT ctx;
     RtlCaptureContext(&ctx);
     printf("guest call stack (innermost first):\n");
@@ -98,6 +112,7 @@ void cxxrt_print_guest_stack(void) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
         if (!ctx.Rip) break;
     }
+#endif
 }
 static void fatal(Ctx *c, const char *fmt, ...) {
     char msg[768];

@@ -21,7 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -148,6 +152,7 @@ static uint8_t *alloc_near(uint8_t *site) {
     return NULL;
 }
 
+#ifdef _WIN32                                      /* patches the game DLL's code (PE headers): Windows only, as the sort's */
 /* Every direct call of the lifted registerSampler_ in the game DLL's code goes to sampler_register (through one stub). */
 static void install_register(void) {
     g_lifted_register = host_fn_of(SYM_REGISTER);
@@ -200,6 +205,7 @@ static void install_register(void) {
     }
     printf("smo_fast: registerSampler_'s taken-slot answer in host code at %d of %d call sites (the free-slot search of registerSampler)\n", patched, sites);
 }
+#endif
 
 void smo_fast_install(void) {
     const char *e = getenv("SMO_FAST");
@@ -209,6 +215,13 @@ void smo_fast_install(void) {
         return;
     }
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
+#ifndef _WIN32
+    /* macOS: the game's code is in a signed library, and a written code page fails its signature check when it runs.
+     * The call cannot be redirected after loading; the sort runs as lifted (a hook made by the lifter is the way here). */
+    (void)host_fn_of; (void)g_lifted_sort;
+    printf("smo_fast: NOT installed on macOS (signed code cannot be patched): the game's sampler list sort runs as lifted\n");
+    return;
+#else
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);
     DWORD64 img = 0;
@@ -242,10 +255,11 @@ void smo_fast_install(void) {
     printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (SMO_FAST=0: the game's own code%s)\n",
            g_check ? "; SMO_FAST_CHECK=1: every sort compared with the game's" : ", SMO_FAST_CHECK=1: compare with it");
     install_register();
+#endif
 }
 
 void smo_fast_report(FILE *out) {
-    if (g_reg_skipped) fprintf(out, "smo_fast: registerSampler's free-slot walk: %lld taken slots jumped over\n", g_reg_skipped);
+    if (g_reg_skipped) fprintf(out, "smo_fast: registerSampler's free-slot walk: %lld taken slots jumped over\n", (long long)g_reg_skipped);
     if (g_reg_taken || g_reg_free) fprintf(out, "smo_fast: registerSampler_ calls: %lld on a taken slot answered in host code, %lld on a free slot passed to the game's code\n",
                                             (long long)g_reg_taken, (long long)g_reg_free);
     if (!g_sorts && !g_other) return;
