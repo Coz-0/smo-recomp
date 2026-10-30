@@ -1744,11 +1744,15 @@ static const char *const k_prelude =
 /* IPA "multiply" by 1 / w undoes the * w of IPA "pass": every read of a perspective varying is emitted as
  * f = attr; f *= gl_FragCoord.w; f *= F(rK) with rK = 1.0 / gl_FragCoord[3] (the shader's MUFU.RCP of the position's
  * IPA), two multiplies the driver cannot fold (w * (1 / w) is not 1 in floats). Measured over the game's 20,436
- * fragment stages: 262,424 such reads in 19,091 of them. Both multiplies are dropped where rK surely holds 1 / w: within
- * one run of unconditional instruction lines (each emitted as "{ ... }"; any other line is control flow or predicated
- * and forgets everything), after a line that set rK to the reciprocal of a register set to gl_FragCoord[3], and before
- * the next write of rK. The varying is then the value Vulkan interpolated, as on the console up to rounding; the same
- * fold as Savage Wind's glsl_fold_ipa_w (-8 % ACO instructions there). */
+ * fragment stages: 262,424 such reads in 19,091 of them. Both multiplies are dropped where rK surely holds 1 / w: after
+ * a line that set rK to the reciprocal of a register set to gl_FragCoord[3], and before the next write of rK, along
+ * lines that only fall through: unconditional instruction lines ("{ ... }"), predicated ones ("if (pN) { ... }", which
+ * forget what they may write; a predicated jump or discard only means the lines after it run on the other path), and
+ * the "if (go == 0u) {" / "}" around them, and a jump target ("if (go == N) go = 0u;") before any jump. A later jump
+ * target, a return or anything else forgets everything but an rK set before the first jump, up to its next write: with
+ * only forward jumps the lines run in text order, so every path from there has gone through that line. A loop ("for",
+ * "continue") forgets that too. The varying is then the value Vulkan interpolated, as on the console up to
+ * rounding; the same fold as Savage Wind's glsl_fold_ipa_w (-8 % ACO instructions there). */
 static int fold_reg_after(const char *p, const char *pre) {       /* "<pre>rN" at p: N, else -1 */
     size_t n = strlen(pre);
     if (strncmp(p, pre, n)) return -1;
@@ -1756,9 +1760,14 @@ static int fold_reg_after(const char *p, const char *pre) {       /* "<pre>rN" a
     if (*p != 'r' || p[1] < '0' || p[1] > '9') return -1;
     return atoi(p + 1);
 }
+static int fold_target(const char *line, size_t n) {          /* "if (go == N) go = 0u;": where a jump lands */
+    return n > 19 && !strncmp(line, "if (go == ", 10) && !strncmp(line + n - 9, " go = 0u;", 9);
+}
 static void fold_ipa_w(char *s, size_t *len) {
     unsigned char st[256];                                    /* 0 unknown, 1 gl_FragCoord.w, 2 1 / gl_FragCoord.w */
-    memset(st, 0, sizeof st);
+    unsigned char keep[256];                                  /* 1 / w on every path to here: set before any jump */
+    memset(st, 0, sizeof st); memset(keep, 0, sizeof keep);
+    int entry = 1;                                             /* no jump or jump target seen yet */
     char *w = s;
     for (char *line = s; *line;) {
         char *eol = strchr(line, '\n');
@@ -1766,10 +1775,24 @@ static void fold_ipa_w(char *s, size_t *len) {
         char *start = w;
         memmove(w, line, n); w += n;
         line += n;
-        if (start[0] != '{') { memset(st, 0, sizeof st); continue; }
-        start[w - start - (start[w - start - 1] == '\n')] = 0;  /* the line as a string while it is looked at */
+        size_t body = n - (eol != NULL);
+        if ((body == 1 && start[0] == '}') || (body == 15 && !strncmp(start, "if (go == 0u) {", 15))) continue;
+        if (entry && fold_target(start, body)) continue;       /* no jump to it yet */
+        int pred = !strncmp(start, "if (p", 5) || !strncmp(start, "if (!p", 6);
+        char last = start[body];
+        start[body] = 0;                                        /* the line as a string while it is looked at */
+        if ((start[0] != '{' && !pred) || strstr(start, "continue") || strstr(start, "break") || strstr(start, "return")) {
+            int fwd = fold_target(start, body) ||
+                      ((strstr(start, "return") || strstr(start, "break")) && !strstr(start, "continue") && !strstr(start, "for ("));
+            for (int r = 0; r < 256; r++) st[r] = (keep[r] &= fwd) ? 2 : 0;    /* a loop runs lines again: no more */
+            entry = 0;
+            start[body] = last;
+            continue;
+        }
+        if (strstr(start, "go = ")) entry = 0;
         int set = -1, kind = 0, k;
-        if ((k = fold_reg_after(start, "{ float f = F(U(gl_FragCoord[3])); ")) >= 0) { set = k; kind = 1; }
+        if (pred) {}
+        else if ((k = fold_reg_after(start, "{ float f = F(U(gl_FragCoord[3])); ")) >= 0) { set = k; kind = 1; }
         else if (!strncmp(start, "{ float f = (1.0 / (F(r", 23)) {
             int src = atoi(start + 23);
             const char *q = strstr(start, "))); ");
@@ -1783,15 +1806,15 @@ static void fold_ipa_w(char *s, size_t *len) {
                 memmove(m, m + cut, strlen(m + cut) + 1);
             } else m++;
         }
+        size_t kept = strlen(start);
         for (char *m = start; (m = strstr(m, " r"));) {          /* every register this line writes: "rN = " */
             m += 2;
             if (*m < '0' || *m > '9') continue;
             int r = atoi(m);
             while (*m >= '0' && *m <= '9') m++;
-            if (m[0] == ' ' && m[1] == '=' && m[2] != '=' && r < 256) st[r] = r == set ? (unsigned char)kind : 0;
+            if (m[0] == ' ' && m[1] == '=' && m[2] != '=' && r < 256) { st[r] = r == set ? (unsigned char)kind : 0; keep[r] = r == set && kind == 2 && entry; }
         }
-        size_t keep = strlen(start);
-        w = start + keep;
+        w = start + kept;
         if (eol) *w++ = '\n';
     }
     *w = 0;
