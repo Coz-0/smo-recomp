@@ -89,6 +89,7 @@ typedef struct {
     uint8_t image_type[8];           /* the type each used image is declared with: 0 1D, 1 buffer, 2 1D array, 3 2D, 4 2D array, 5 3D */
     uint32_t int_dep;                /* which bits of int_attrs / int_tex influenced the code (vertex: attrs, fragment: textures) */
     int insns, blocks, uses_alpha;
+    int uses_warp;                   /* target 1: warp operations, written for a warp of 32 lanes inside any subgroup of 32 or more (the back end asks for 32 where it can) */
     /* target 1: the samplers the text declares in set 1 (the back end binds a view of that type, or a dummy of that type) */
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64];
     int nsmp;

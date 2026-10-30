@@ -39,7 +39,7 @@ typedef struct {
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
     unsigned smem_words;
     int uses_smem;
-    int uses_fcs, uses_tf, uses_shfl;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
+    int uses_fcs, uses_tf, uses_shfl, uses_warp;         /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped; uses_warp: MxOut */
     uint32_t images, images_read, images_written;
     uint16_t image_fmt[8]; uint8_t image_type[8];
     uint32_t *jt;                             /* static jump target of SYNC / BRK / CONT */
@@ -787,9 +787,10 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     }
     case MXOP_S2R: {
         unsigned sr = MXB(i, 20, 8);
+        const int vk = e->in->target == 1;
         const char *v;
         switch (sr) {
-        case 0x00: v = "gl_SubGroupInvocationARB"; break;
+        case 0x00: v = vk ? "(gl_SubgroupInvocationID & 31u)" : "gl_SubGroupInvocationARB"; break;      /* Vulkan: the lane in its warp (see MXOP_SHFL) */
         case 0x11: v = e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL ? "uint(gl_InvocationID)" : "0u"; break;
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
@@ -806,15 +807,16 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x25: v = "MX_GID_X"; break;
         case 0x26: v = "gl_WorkGroupID.y"; break;
         case 0x27: v = "gl_WorkGroupID.z"; break;
-        case 0x38: v = "uint(gl_SubGroupEqMaskARB)"; break;
-        case 0x39: v = "uint(gl_SubGroupLtMaskARB)"; break;
-        case 0x3a: v = "uint(gl_SubGroupLeMaskARB)"; break;
-        case 0x3b: v = "uint(gl_SubGroupGtMaskARB)"; break;
-        case 0x3c: v = "uint(gl_SubGroupGeMaskARB)"; break;
+        case 0x38: v = vk ? "gl_SubgroupEqMask[gl_SubgroupInvocationID >> 5]" : "uint(gl_SubGroupEqMaskARB)"; break;
+        case 0x39: v = vk ? "gl_SubgroupLtMask[gl_SubgroupInvocationID >> 5]" : "uint(gl_SubGroupLtMaskARB)"; break;
+        case 0x3a: v = vk ? "gl_SubgroupLeMask[gl_SubgroupInvocationID >> 5]" : "uint(gl_SubGroupLeMaskARB)"; break;
+        case 0x3b: v = vk ? "gl_SubgroupGtMask[gl_SubgroupInvocationID >> 5]" : "uint(gl_SubGroupGtMaskARB)"; break;
+        case 0x3c: v = vk ? "gl_SubgroupGeMask[gl_SubgroupInvocationID >> 5]" : "uint(gl_SubGroupGeMaskARB)"; break;
         case 0x50: case 0x52: v = "0u"; break;                   /* clocks */
         default: v = NULL; break;
         }
         if (!v) { fail(e, "S2R", "special register 0x%x", sr); break; }
+        if (sr == 0x00 || (sr >= 0x38 && sr <= 0x3c)) e->uses_warp = 1;
         if (sr >= 0x20 && sr <= 0x27 && e->in->stage != MX_COMPUTE) v = "0u";
         emit(e, "%s = %s;", DST, v);
         break;
@@ -822,6 +824,13 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     case MXOP_VOTE: {
         const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), *f = MXB(i, 48, 2) == 0 ? "allInvocationsARB" : MXB(i, 48, 2) == 1 ? "anyInvocationARB" : "allInvocationsEqualARB";
         emit(e, "bool vp = %s;", p);
+        if (e->in->target == 1) {                                  /* Vulkan: over the lanes of this warp only (see MXOP_SHFL) */
+            e->uses_warp = 1;
+            emit(e, " uint vw = subgroupBallot(vp)[gl_SubgroupInvocationID >> 5], va = subgroupBallot(true)[gl_SubgroupInvocationID >> 5];");
+            if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s;", PD(e, MXB(i, 45, 3)), MXB(i, 48, 2) == 0 ? "vw == va" : MXB(i, 48, 2) == 1 ? "vw != 0u" : "vw == 0u || vw == va");
+            if (MXB(i, 0, 8) != 255) emit(e, " %s = vw;", DST);
+            break;
+        }
         if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s(vp);", PD(e, MXB(i, 45, 3)), f);
         if (MXB(i, 0, 8) != 255) emit(e, " %s = uint(ballotARB(vp));", DST);
         break;
@@ -1235,17 +1244,21 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         /* fields (decoded from SMO's own SHFL.DOWN r10, r8, 1, 0x1f; [doc] yuzu warp_shuffle.cpp): mode bits 30-31 (0 IDX, 1 UP,
          * 2 DOWN, 3 BFLY), lane operand b = imm bits 20-24 when bit 28 is set else register bits 20-27, clamp/segment
          * operand c = imm bits 34-46 when bit 29 is set else register bits 39-46, predicate out bits 48-50. Lane rules as
-         * PTX shfl: maxLane = (lane & seg) | (c & ~seg), minLane = lane & seg, seg = c bits 8-12; out of range: own value. */
+         * PTX shfl: maxLane = (lane & seg) | (c & ~seg), minLane = lane & seg, seg = c bits 8-12; out of range: own value.
+         * A Maxwell warp is 32 lanes; a host subgroup may be 64 or 128 (AMD, RADV's default for compute and fragment): each
+         * run of 32 invocations is then one warp, its lane gl_SubgroupInvocationID & 31 and its first invocation wb, as
+         * Ryujinx does (HelperFunctionManager.cs, MIT). VOTE, the lane id and the lane masks read the warp's 32-bit word of
+         * the subgroup's ballot the same way. The back end asks for subgroups of 32 where the driver lets it (stage_warp32). */
         if (e->in->target != 1) { fail(e, "SHFL", "warp shuffle in the OpenGL text"); break; }
         unsigned mode = MXB(i, 30, 2), pd = MXB(i, 48, 3);
         const char *b = MXB(i, 28, 1) ? S(e, "%uu", MXB(i, 20, 5)) : R20, *cc = MXB(i, 29, 1) ? S(e, "%uu", MXB(i, 34, 13)) : X(e, MXB(i, 39, 8));
-        e->uses_shfl = 1;
-        emit(e, "uint ln = gl_SubgroupInvocationID, bv = (%s) & 31u, cv = (%s) & 31u, sg = ((%s) >> 8) & 31u, mx = (ln & sg) | (cv & ~sg), j; bool pv;", b, cc, cc);
+        e->uses_shfl = e->uses_warp = 1;
+        emit(e, "uint ln = gl_SubgroupInvocationID & 31u, wb = gl_SubgroupInvocationID - ln, bv = (%s) & 31u, cv = (%s) & 31u, sg = ((%s) >> 8) & 31u, mx = (ln & sg) | (cv & ~sg), j; bool pv;", b, cc, cc);
         if (mode == 0) emit(e, " j = (ln & sg) | (bv & ~sg); pv = j <= mx;");
         else if (mode == 1) emit(e, " j = ln - bv; pv = int(j) >= int(mx);");
         else if (mode == 2) emit(e, " j = ln + bv; pv = j <= mx;");
         else emit(e, " j = ln ^ bv; pv = j <= mx;");
-        emit(e, " if (!pv) j = ln; uint sv = subgroupShuffle(%s, j);", A8);
+        emit(e, " if (!pv) j = ln; uint sv = subgroupShuffle(%s, wb + j);", A8);
         if (MXB(i, 0, 8) != 255) emit(e, " %s = sv;", DST);
         if (pd != 7) emit(e, " %s = pv;", PD(e, pd));
         break;
@@ -1844,6 +1857,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
         if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SHFL */
+        if (vk && e->uses_warp) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_ballot : require\n");      /* VOTE, lane masks */
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* */
         else if (vk && in->stage == MX_VERTEX && e->uses_psize) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* mx_fcs: 0 = unscaled pass */
@@ -1969,7 +1983,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
     out->ssbos = e->ssbos; out->ssbo_written = e->uses_gstore ? e->ssbos : 0;
     out->images = e->images; out->images_read = e->images_read; out->images_written = e->images_written;
     memcpy(out->image_gl_format, e->image_fmt, sizeof out->image_gl_format); memcpy(out->image_type, e->image_type, sizeof out->image_type);
-    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha;
+    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha; out->uses_warp = e->uses_warp;
     out->nsmp = e->nsmp; memcpy(out->smp, e->smp, sizeof out->smp);
 done:
     free(e->s); free(e->reach); free(e->leader); free(e->loop_end); free(e->jt); free(e->stk_of); free(e->stks);

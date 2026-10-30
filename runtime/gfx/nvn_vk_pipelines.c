@@ -19,7 +19,7 @@ typedef struct VStage {
     int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
     int gprim;                                     /* a geometry stage: the primitive class of the draws it serves (MxIn.gs_in_prim; part of hb) */
     uint32_t images_w; uint16_t img_fmt[8]; uint8_t img_type[8];      /* a compute stage's images (MxOut): written ones, declared format and type */
-    uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly;      /* fragonly: handed over by a program without a vertex stage */
+    uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, uses_warp, nsmp, cp_recorded, from_rec, fragonly;      /* uses_warp: MxOut; fragonly: handed over by a program without a vertex stage */
     VkPipeline cp; VkPipelineLayout cl; VkDescriptorSetLayout cdl[2];      /* compute stage: its pipeline */
     uint32_t local[3];
     VSmp smp[64];
@@ -27,8 +27,8 @@ typedef struct VStage {
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
-#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
-typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
+#define MX_VK_VERSION 11u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp, uses_warp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
 typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* geometry stage, as VStage */ } SSrc;
@@ -223,8 +223,19 @@ static void stage_mod_releasable(VStage *v) {      /* its library or compute pip
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
     v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo; v->spv = r->spv;
     v->cbufs = r->cbufs; v->ssbos = r->ssbos; v->ssbo_w = r->ssbo_w; v->images = r->images; v->dep = r->dep; v->tex_units = r->tex_units; v->in_attr = r->in_attr; v->out_attr = r->out_attr;
-    v->uses_alpha = r->uses_alpha; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp);
+    v->uses_alpha = r->uses_alpha; v->uses_warp = r->uses_warp; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp);
     v->mod = mod; v->ok = 1;
+}
+/* A stage with warp operations runs in subgroups of 32 lanes, a Maxwell warp, where the driver lets the stage's subgroup
+ * size be set (Vulkan 1.3 subgroupSizeControl; D.warp32_stages): that is the only way on a GPU whose subgroups can be
+ * smaller (Intel: 8 to 32). Elsewhere its text still works on any subgroup of 32 or more (mx_translate.c, MXOP_SHFL). A
+ * compute stage whose work group width is a multiple of 32 also gets full subgroups, as a warp on the console. */
+static void stage_warp32(VkPipelineShaderStageCreateInfo *st, const VStage *v) {
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sz = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, 32};
+    if (!v || !v->uses_warp || !(D.warp32_stages & st->stage)) return;
+    st->pNext = &sz;
+    if (st->stage == VK_SHADER_STAGE_COMPUTE_BIT && D.f13.computeFullSubgroups && v->local[0] % 32 == 0 && mx_split_x(v->local, 0) == 1)      /* a split group's width is another */
+        st->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
 }
 static int key_fits(int s, const uint32_t *want, const uint32_t *have, uint32_t dep, uint32_t tex) {
     uint32_t da = s == 0 ? dep : 0;
@@ -299,7 +310,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             v->spv = on_disk ? spv_hash : 0;       /* no SPIR-V file: the module is kept (stage_mod_releasable) */
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->images_w = out.images_written; memcpy(v->img_fmt, out.image_gl_format, sizeof v->img_fmt); memcpy(v->img_type, out.image_type, sizeof v->img_type);
-            v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
+            v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->uses_warp = out.uses_warp; v->nsmp = out.nsmp;
             for (int i = 0; i < out.nsmp && i < 64; i++) {
                 const char *ty = out.smp[i].type;
                 int arr = strstr(ty, "Array") != NULL, dim = strstr(ty, "Cube") ? (arr ? DIM_CUBEA : DIM_CUBE) : strstr(ty, "3D") ? DIM_3D : strstr(ty, "1D") ? (arr ? DIM_1DA : DIM_1D) : (arr ? DIM_2DA : DIM_2D);
@@ -316,7 +327,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 memset(&r, 0, sizeof r);
                 r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
                 r.cbufs = v->cbufs; r.ssbos = v->ssbos; r.ssbo_w = v->ssbo_w; r.images = v->images; r.dep = v->dep; r.tex_units = v->tex_units; r.in_attr = v->in_attr; r.out_attr = v->out_attr;
-                r.uses_alpha = v->uses_alpha; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp);
+                r.uses_alpha = v->uses_alpha; r.uses_warp = v->uses_warp; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp);
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.st", vkc_dir(), s, (unsigned long long)v->h);
                 if ((fp = fopen(path, "wb")) != NULL) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
                 memset(&e, 0, sizeof e);
@@ -511,6 +522,7 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = stage_mod_get(vs); st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? stage_mod_get(fs) : NULL; st[1].pName = "main";
+    stage_warp32(&st[0], vs); stage_warp32(&st[1], fs);
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1; vp.pNext = vk_vp_next();
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -654,6 +666,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     int isfs = v->stage == 1;
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     st.stage = isfs ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT; st.module = stage_mod_get(v); st.pName = "main";
+    stage_warp32(&st, v);
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1; vp.pNext = vk_vp_next();
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -817,6 +830,7 @@ static double pipe_build(Pipe *p) {
     st[nst].stage = VK_SHADER_STAGE_VERTEX_BIT; st[nst].module = stage_mod_get(vs); st[nst++].pName = "main";
     if (p->gs) { st[nst].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[nst].module = stage_mod_get(p->gs); st[nst++].pName = "main"; }
     if (fs) { st[nst].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[nst].module = stage_mod_get(fs); if (p->gs && g_gs_dbg_fs) st[nst].module = g_gs_dbg_fs; st[nst++].pName = "main"; }
+    stage_warp32(&st[0], vs); if (p->gs) stage_warp32(&st[1], p->gs); if (fs && !(p->gs && g_gs_dbg_fs)) stage_warp32(&st[nst - 1], fs);
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
