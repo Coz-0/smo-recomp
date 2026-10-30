@@ -519,7 +519,9 @@ void nnpad_poll(int force) {
     g_last_poll = t;
     poll_devices();
     check_config(force);
-    InterlockedExchange(&g_icon_style, icon_style_now());
+    {   int st = icon_style_now();
+        if (InterlockedExchange(&g_icon_style, st) != st) printf("nn::pad: button icons: %s\n", st == GLYPH_ICONS_XBOX ? "Xbox" : st == GLYPH_ICONS_PLAYSTATION ? "PlayStation" : "Nintendo");
+    }
     unlock();
 }
 

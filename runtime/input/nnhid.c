@@ -796,6 +796,8 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
     if (id > 7 || !style_is_fullkey) return;                  /* every controller here is a full-key (Pro) controller */
     if (id == 0) seq_tick();                                  /* the input sequence advances one step per poll of player 1 */
+    if (id == 0 && sdl_on()) nnpad_poll(0);                  /* pads, controllers.ini and the button icon style kept current even while
+                                                              * player 1 is the keyboard or a script, whose state never asks SDL */
     if (id == 0) { static int was; int on = scripted(VK_AMIIBO_MENU) || script_key(VK_AMIIBO_MENU) || seq_key(VK_AMIIBO_MENU); if (on && !was) amiibo_menu_request(); was = on; }
     if (!player_connected(id)) return;
     uint64_t buttons = 0;

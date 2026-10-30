@@ -848,7 +848,9 @@ static void glyph_sheet_hook(Tex *t, int levels, int l, int layer, uint8_t *lin)
 }
 static void glyph_sheet_recheck(void) {
     Tex *t = g_glyph_tex;
+    static int asked = -1;
     if (!t || t->dead || glyph_icons_style() == g_glyph_style) return;
+    if (asked != glyph_icons_style()) { asked = glyph_icons_style(); printf("nvn: button glyph sheet: read again for the new icon style\n"); }
     t->uploaded = 0; t->checked = 0;               /* read out of its memory again at its next use, with the new style */
 }
 static void tex_upload_memory(Tex *t, const Fmt *f) {
