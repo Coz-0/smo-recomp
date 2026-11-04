@@ -19,7 +19,18 @@ typedef struct { uint16_t internal, format, type; uint8_t bpb, bw, bh, kind; } F
 enum { K_TEX = 0x5854564e, K_PROG = 0x5250564e, K_CMD = 0x4443564e, K_TPOOL = 0x5054564e, K_SPOOL = 0x5053564e, K_WIN = 0x4e57564e };
 enum { K_SYNC = 0x5953564e, K_QUEUE = 0x5551564e };
 
-typedef struct { uint8_t min, mag, ws, wt, wr, cmode, cfunc, reduction; float lodmin, lodmax, bias, aniso, border[4]; uint8_t border_kind, pad[3]; float lod_snap; } SamplerParams;   /* 48 bytes = NVNsampler (0x30); border_kind: 0 float, 1 unsigned, 2 signed integers in border[] */
+/* NVNsamplerBuilder (0x60) and NVNsampler (0x30) both hold a SamplerParams at offset 8 (SAMPLER_PARAMS_AT), as NVN does:
+ * the sampler is the leading part of its builder. agl's sampler cache (agl::driver::NVNMgr, the caller of
+ * registerSampler_) keeps copies of NVNsamplerBuilder, registers those copies as samplers, finds a registered one by a
+ * hash of bytes 8..0x60 of the builder and confirms it with nvnSamplerCompare. With the parameters at offset 0 the
+ * filters (bytes 0..7) fall outside the hash, and with stack garbage after them the hash differs every time: the cache
+ * misses and registers the same sampler again and again. 40 bytes, so that 8 + the parameters fit NVNsampler: the
+ * anisotropy (1..16) and the LOD snap (in 1/255) take a byte each. border_kind: 0 float, 1 unsigned, 2 signed
+ * integers in border[]. */
+typedef struct { uint8_t min, mag, ws, wt, wr, cmode, cfunc, reduction; float lodmin, lodmax, bias, border[4]; uint8_t border_kind, aniso, lod_snap, pad; } SamplerParams;
+#define SAMPLER_PARAMS_AT 8
+#define SAMPLER_BUILDER_SIZE 0x60
+_Static_assert(sizeof(SamplerParams) == 40 && SAMPLER_PARAMS_AT + sizeof(SamplerParams) <= 0x30, "SamplerParams fits NVNsampler at offset 8");
 typedef struct { uint8_t set, target, dsmode, pad; uint16_t format; int16_t lvl0, nlvl, lay0, nlay; uint8_t swz[4]; } View;               /* fits NVNtextureView (0x28) */
 typedef struct {                                                                                                                       /* fits NVNtextureBuilder (0x80) */
     int32_t flags, target, format, width, height, depth, levels, samples, dsmode, has_layout;
