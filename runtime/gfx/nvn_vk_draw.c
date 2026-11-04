@@ -1389,7 +1389,7 @@ static VkSampler sampler_get(const SamplerParams *p) {
     ci.mipLodBias = p->bias; ci.minLod = p->lodmin < 0 ? 0 : p->lodmin; ci.maxLod = p->lodmax;
     if (minf < 2) { ci.minLod = 0; ci.maxLod = 0.25f; }      /* no mip maps: level 0 only (the Vulkan specification's own mapping of GL_NEAREST / GL_LINEAR) */
     if (ci.maxLod < ci.minLod) ci.maxLod = ci.minLod;
-    float aniso = p->aniso;
+    float aniso = (float)p->aniso;
     {   /* anisotropic_filtering in graphics.ini = at least that on samplers that filter linearly between mip levels (not shadow-compare samplers) */
         static LONG64 raised;
         float want = (float)gfx_options()->aniso;
@@ -1420,7 +1420,7 @@ static VkSampler sampler_get(const SamplerParams *p) {
         if (!D.f12.samplerFilterMinmax) nvn_vk_missing("a min / max reduction sampler on a GPU without samplerFilterMinmax");
         else { red.reductionMode = p->reduction == 1 ? VK_SAMPLER_REDUCTION_MODE_MIN : VK_SAMPLER_REDUCTION_MODE_MAX; red.pNext = ci.pNext; ci.pNext = &red; }
     }
-    if (p->lod_snap != 0.0f) nvn_vk_missing("a sampler with LOD snap");
+    if (p->lod_snap) nvn_vk_missing("a sampler with LOD snap");
     VkSampler s;
     VKC(vkCreateSampler(V.device, &ci, NULL, &s));
     if (g_nsmp == 2048) vkd_fail("more than 2048 distinct samplers");

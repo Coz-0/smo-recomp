@@ -1011,7 +1011,7 @@ static GLuint sampler_gl(const SamplerParams *p) {
             if (p->border_kind == 1) glSamplerParameterIuiv(s, GL_TEXTURE_BORDER_COLOR, (const GLuint *)bi); else glSamplerParameterIiv(s, GL_TEXTURE_BORDER_COLOR, bi);
         } else glSamplerParameterfv(s, GL_TEXTURE_BORDER_COLOR, b);
     }
-    if (p->aniso > 1.0f) glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY_, p->aniso);
+    if (p->aniso > 1) glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY_, (float)p->aniso);
     if (p->reduction == 1 || p->reduction == 2) glSamplerParameteri(s, 0x9366 /* TEXTURE_REDUCTION_MODE_ARB */, p->reduction == 1 ? 0x8007 : 0x8008);   /* min / max instead of average */
     if (p->cmode == 1) {
         glSamplerParameteri(s, GL_TEXTURE_COMPARE_MODE_, GL_COMPARE_REF_TO_TEXTURE_);
@@ -4262,21 +4262,21 @@ static void prog_set_shaders_(Ctx *c) {
 }
 
 /* ---- samplers */
-static void smpb_defaults(Ctx *c) {
-    SamplerParams p;
-    memset(&p, 0, sizeof p);
-    p.min = 1; p.mag = 1; p.ws = p.wt = p.wr = 7; p.lodmax = 1000.0f; p.aniso = 1.0f; p.cfunc = 2;
-    memcpy(P(A0), &p, sizeof p);
+#define SMP_AT(a) ((SamplerParams *)((uint8_t *)P(a) + SAMPLER_PARAMS_AT))
+static void smpb_defaults(Ctx *c) {                    /* the whole builder, as NVN does: agl hashes its bytes 8..0x60 */
+    memset(P(A0), 0, SAMPLER_BUILDER_SIZE);
+    SamplerParams *p = SMP_AT(A0);
+    p->min = 1; p->mag = 1; p->ws = p->wt = p->wr = 7; p->lodmax = 1000.0f; p->aniso = 1; p->cfunc = 2;
 }
-#define SMP ((SamplerParams *)P(A0))
+#define SMP SMP_AT(A0)
 static void smpb_minmag(Ctx *c) { SMP->min = (uint8_t)A1; SMP->mag = (uint8_t)A2; }
 static void smpb_wrap(Ctx *c) { SMP->ws = (uint8_t)A1; SMP->wt = (uint8_t)A2; SMP->wr = (uint8_t)A3; }
 static void smpb_lodclamp(Ctx *c) { SMP->lodmin = F0; SMP->lodmax = F1; }
 static void smpb_lodbias(Ctx *c) { SMP->bias = F0; }
 static void smpb_compare(Ctx *c) { SMP->cmode = (uint8_t)A1; SMP->cfunc = (uint8_t)A2; }
-static void smpb_aniso(Ctx *c) { SMP->aniso = F0; }
+static void smpb_aniso(Ctx *c) { float a = F0; SMP->aniso = (uint8_t)(a >= 16.0f ? 16 : a > 1.0f ? (int)(a + 0.5f) : 1); }
 static void smpb_reduction(Ctx *c) { SMP->reduction = (uint8_t)A1; }
-static void smp_initialize(Ctx *c) { memcpy(P(A0), P(A1), sizeof(SamplerParams)); RET(1); }
+static void smp_initialize(Ctx *c) { memset(P(A0), 0, SAMPLER_PARAMS_AT); memcpy(SMP_AT(A0), SMP_AT(A1), sizeof(SamplerParams)); RET(1); }
 static void spool_initialize(Ctx *c) {                 /* (pool, memoryPool, offset, numDescriptors) */
     SamplerPool *sp = hnew(A0, K_SPOOL, sizeof *sp);
     sp->count = (int)A3 > 0 ? (int)A3 : 0; sp->mempool = A1; sp->offset = A2;
@@ -4289,7 +4289,7 @@ static void spool_register(Ctx *c) {                   /* (pool, id, sampler) or
     SamplerPool *sp = hobj(A0, K_SPOOL);
     if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) return;
     AcquireSRWLockExclusive(&g_pool_lock);
-    memcpy(&sp->e[(uint32_t)A1], P(A2), sizeof(SamplerParams));
+    memcpy(&sp->e[(uint32_t)A1], SMP_AT(A2), sizeof(SamplerParams));
     sp->used[(uint32_t)A1] = 1;
     ReleaseSRWLockExclusive(&g_pool_lock);
 }
@@ -5102,17 +5102,17 @@ static void vstream_get_divisor(Ctx *c) { RET(rd32(A0 + 4)); }
 /* ---- samplers: NVNsamplerBuilder and NVNsampler both hold a SamplerParams */
 static void smpb_border_i(Ctx *c) { if (A1) { memcpy(SMP->border, P(A1), 16); SMP->border_kind = strstr(hostfn_current_name(), "ui") ? 1 : 2; } }
 static void smpb_border_f(Ctx *c) { if (A1) { memcpy(SMP->border, P(A1), 16); SMP->border_kind = 0; } }
-static void smpb_lod_snap(Ctx *c) { SMP->lod_snap = F0; }
+static void smpb_lod_snap(Ctx *c) { float v = F0; SMP->lod_snap = (uint8_t)(v <= 0.0f ? 0 : v >= 1.0f ? 255 : (int)(v * 255.0f + 0.5f)); }
 static void smp_get_minmag(Ctx *c) { if (A1) wr32(A1, SMP->min); if (A2) wr32(A2, SMP->mag); }
 static void smp_get_wrap(Ctx *c) { if (A1) wr32(A1, SMP->ws); if (A2) wr32(A2, SMP->wt); if (A3) wr32(A3, SMP->wr); }
 static void smp_get_lodclamp(Ctx *c) { if (A1) memcpy(P(A1), &SMP->lodmin, 4); if (A2) memcpy(P(A2), &SMP->lodmax, 4); }
 static void smp_get_lodbias(Ctx *c) { F0 = SMP->bias; }
 static void smp_get_compare(Ctx *c) { if (A1) wr32(A1, SMP->cmode); if (A2) wr32(A2, SMP->cfunc); }
 static void smp_get_border(Ctx *c) { if (A1) memcpy(P(A1), SMP->border, 16); }
-static void smp_get_aniso(Ctx *c) { F0 = SMP->aniso; }
+static void smp_get_aniso(Ctx *c) { F0 = (float)SMP->aniso; }
 static void smp_get_reduction(Ctx *c) { RET(SMP->reduction); }
-static void smp_get_lod_snap(Ctx *c) { F0 = SMP->lod_snap; }
-static void smp_compare(Ctx *c) { RET(A0 && A1 && !memcmp(P(A0), P(A1), sizeof(SamplerParams))); }
+static void smp_get_lod_snap(Ctx *c) { F0 = SMP->lod_snap / 255.0f; }
+static void smp_compare(Ctx *c) { RET(A0 && A1 && !memcmp(SMP_AT(A0), SMP_AT(A1), sizeof(SamplerParams))); }
 static void smp_finalize(Ctx *c) { nvn_label_drop(A0); }      /* the parameters live in the guest object; OpenGL sampler objects are shared by value */
 static void spool_finalize(Ctx *c) {
     gl_barrier();
